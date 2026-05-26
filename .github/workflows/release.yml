@@ -1,0 +1,55 @@
+name: Create GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract changelog section
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          notes=""
+          if [[ -f CHANGELOG.md ]]; then
+            notes=$(awk -v v="$version" '
+              $0 ~ "^## \\[" v "\\]" {flag=1; next}
+              flag && /^## \[/ {exit}
+              flag {print}
+            ' CHANGELOG.md)
+          fi
+
+          if [[ -z "${notes//[[:space:]]/}" ]]; then
+            echo "no CHANGELOG entry for $version, falling back to auto-generated notes" >&2
+            echo "body=" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<__EOF__"
+              echo "$notes"
+              echo "__EOF__"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          NOTES: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$NOTES" ]]; then
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
