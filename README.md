@@ -50,13 +50,19 @@ ln -s "$PWD/review-prs/review-prs" /usr/local/bin/review-prs
 Run from inside any GitHub repo:
 
 ```sh
-review-prs            # open, non-draft, unapproved PRs
-review-prs --all      # also include PRs already marked APPROVED
-review-prs --help     # usage
+review-prs              # open, non-draft, unapproved PRs (excludes yours + bots)
+review-prs --all        # also include PRs already marked APPROVED
+review-prs --dependabot # also include Dependabot PRs (shown dimmed)
+review-prs --help       # usage
 ```
 
 In the picker: `space` toggles a PR, `enter` confirms. Each selected PR opens in
 a fresh tab.
+
+Your own PRs are always excluded — this tool is for reviewing others' work.
+Dependabot PRs are hidden by default; pass `--dependabot` to include them, where
+they appear dimmed to mark them as lower-priority. (The bot match is a single
+anchored regex in the script — extend it as more AI coding bots show up.)
 
 ## Columns
 
