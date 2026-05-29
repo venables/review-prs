@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# review-prs: pick open non-draft PRs in the current repo and fan out
-# `review <num>` into a new terminal tab per selection.
+# review-prs: pick open non-draft PRs in the current repo and fan out a
+# review command into a new terminal tab per selection.
+#
+# Per-tab command:
+#   Each selected PR opens a tab that `cd`s to the repo root and runs the
+#   review command (see $REVIEW_PRS_CMD below) with the PR number. By default
+#   that is a non-interactive Claude Code panel review; override it to plug in
+#   any reviewer (a shell function, another CLI, etc.).
 #
 # Display columns:
 #   #NUM   ENGAGEMENT   REVIEW      TIME      AUTHOR   TITLE
@@ -22,13 +28,19 @@ include_approved=0
 include_dependabot=0
 print_help() {
   cat <<'EOF'
-review-prs: pick open non-draft, unapproved PRs and fan out `review N`.
+review-prs: pick open non-draft, unapproved PRs and fan out a review per PR.
 
 Usage: review-prs [--all] [--dependabot] [--help]
 
   --all, -a         Include PRs already marked APPROVED (default: exclude).
   --dependabot, -d  Include Dependabot PRs (default: hidden; shown dimmed).
   --help, -h        Show this help.
+
+Each selected PR opens a tab that cd's to the repo root and runs a review
+command. Override the default via $REVIEW_PRS_CMD (the PR number replaces the
+first "{}", or is appended if absent):
+  REVIEW_PRS_CMD='claude --dangerously-skip-permissions "panel review {}"'  (default)
+  REVIEW_PRS_CMD='review'                                                   (append form)
 
 Your own PRs are always hidden -- this tool is for reviewing others' work.
 EOF
@@ -42,6 +54,16 @@ while [[ $# -gt 0 ]]; do
     *)               printf 'unknown arg: %s\n' "$1" >&2; print_help >&2; exit 1 ;;
   esac
 done
+
+# Command run in each spawned tab to review a PR. The PR number is substituted
+# for the first "{}" placeholder, or appended if no placeholder is present.
+# Override to use your own reviewer, e.g.
+#   REVIEW_PRS_CMD='review' review-prs                 # a shell function/alias
+#   REVIEW_PRS_CMD='gh pr checkout {} && my-review' ...  # placeholder form
+# (Set via a conditional, not "${VAR:-default}", since a literal "}" in the
+# default's {} placeholder would prematurely close the parameter expansion.)
+review_cmd="${REVIEW_PRS_CMD:-}"
+[[ -z "$review_cmd" ]] && review_cmd='claude --dangerously-skip-permissions "panel review {}"'
 
 # Author logins treated as bots: hidden unless --dependabot, dimmed when shown.
 # Extend this anchored alternation as more AI coding bots appear, e.g.
@@ -277,7 +299,12 @@ fi
 
 for n in "${numbers[@]}"; do
   echo "spawning tab for PR #$n via $spawner"
-  cmd="cd $(printf '%q' "$repo_root") && review $n"
+  if [[ "$review_cmd" == *"{}"* ]]; then
+    invocation="${review_cmd//\{\}/$n}"
+  else
+    invocation="$review_cmd $n"
+  fi
+  cmd="cd $(printf '%q' "$repo_root") && $invocation"
   case "$spawner" in
     cmux)    spawn_in_cmux    "$cmd" ;;
     ghostty) spawn_in_ghostty "$cmd"; sleep 0.3 ;;

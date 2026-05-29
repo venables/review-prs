@@ -1,8 +1,11 @@
 # review-prs
 
 Pick open GitHub PRs from a multi-select list and fan each one out into its own
-terminal tab running `review <number>`. Built for batch-reviewing a repo's open
-pull requests without manually opening tabs and typing commands.
+terminal tab running a review command per PR. Built for batch-reviewing a repo's
+open pull requests without manually opening tabs and typing commands.
+
+Pairs nicely with the [`panel-review`](https://github.com/catena-labs/dev-skills)
+skill, which is the default review command each tab runs.
 
 ## What it does
 
@@ -10,21 +13,14 @@ pull requests without manually opening tabs and typing commands.
 2. Annotates each with an engagement badge, a review-state flag, and a relative
    "last activity" time, then sorts the most actionable ones to the top.
 3. Lets you multi-select with [gum](https://github.com/charmbracelet/gum).
-4. Opens a new terminal tab per selection, `cd`s to the repo root, and runs
-   `review <number>` in each.
+4. Opens a new terminal tab per selection, `cd`s to the repo root, and runs the
+   review command (see [Review command](#review-command)) for each PR.
 
 ## Requirements
 
 - [`gh`](https://cli.github.com) — authenticated (`gh auth login`)
 - [`gum`](https://github.com/charmbracelet/gum) — the interactive picker
 - [`jq`](https://jqlang.github.io/jq/) — JSON processing
-- A `review` command on your `PATH` — each spawned tab runs `review <number>`.
-  This is typically a shell function or alias, e.g.:
-
-  ```sh
-  review() { claude --dangerously-skip-permissions "panel review $*"; }
-  ```
-
 - A supported terminal for spawning tabs:
   - [cmux](https://cmux.io) (preferred; detected via `CMUX_SURFACE_ID`), or
   - [Ghostty](https://ghostty.org) 1.3+ on macOS (detected via `TERM_PROGRAM`,
@@ -58,6 +54,32 @@ review-prs --help       # usage
 
 In the picker: `space` toggles a PR, `enter` confirms. Each selected PR opens in
 a fresh tab.
+
+## Review command
+
+Each spawned tab `cd`s to the repo root and runs a review command for the PR.
+By default that is a non-interactive [Claude Code](https://claude.com/claude-code)
+panel review:
+
+```sh
+claude --dangerously-skip-permissions "panel review <number>"
+```
+
+Override it with the `REVIEW_PRS_CMD` environment variable. The PR number is
+substituted for the first `{}` placeholder, or appended if there is no
+placeholder:
+
+```sh
+# Append form — runs `review 123` in each tab (e.g. a shell function/alias):
+REVIEW_PRS_CMD='review' review-prs
+
+# Placeholder form — substitute the number anywhere in the command:
+REVIEW_PRS_CMD='gh pr checkout {} && my-reviewer' review-prs
+```
+
+Note that `REVIEW_PRS_CMD` must be on the spawned tab's `PATH` (or be a shell
+function/alias defined in its startup files) — the command runs in a fresh
+shell, not the one you launched `review-prs` from.
 
 Your own PRs are always excluded — this tool is for reviewing others' work.
 Dependabot PRs are hidden by default; pass `--dependabot` to include them, where
