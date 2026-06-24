@@ -20,18 +20,26 @@
 #
 # Sort: NEW first, UPDATED next, SEEN last; tie-break by most-recent activity.
 # Terminal target is auto-detected: cmux (preferred) or Ghostty.
+#
+# --auto skips the picker: it fans out every NEW/UPDATED PR, running
+# $REVIEW_PRS_AUTO_CMD (an "auto panel review" by default) instead of the
+# normal review command in each tab.
 
 set -euo pipefail
 
 # --- Args ----------------------------------------------------------------
 include_approved=0
 include_dependabot=0
+auto=0
 print_help() {
   cat <<'EOF'
 review-prs: pick open non-draft, unapproved PRs and fan out a review per PR.
 
-Usage: review-prs [--all] [--dependabot] [--help]
+Usage: review-prs [--auto] [--all] [--dependabot] [--help]
 
+  --auto, -A        Skip the picker; fan out every NEW/UPDATED PR, running
+                    $REVIEW_PRS_AUTO_CMD (default: an "auto panel review")
+                    instead of $REVIEW_PRS_CMD in each tab.
   --all, -a         Include PRs already marked APPROVED (default: exclude).
   --dependabot, -d  Include Dependabot PRs (default: hidden; shown dimmed).
   --help, -h        Show this help.
@@ -48,6 +56,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --auto|-A)       auto=1; shift ;;
     --all|-a)        include_approved=1; shift ;;
     --dependabot|-d) include_dependabot=1; shift ;;
     --help|-h)       print_help; exit 0 ;;
@@ -64,6 +73,11 @@ done
 # default's {} placeholder would prematurely close the parameter expansion.)
 review_cmd="${REVIEW_PRS_CMD:-}"
 [[ -z "$review_cmd" ]] && review_cmd='claude --dangerously-skip-permissions "panel review {}"'
+
+# Command run in each spawned tab under --auto (see below). Same "{}"/append
+# substitution as $REVIEW_PRS_CMD; override via $REVIEW_PRS_AUTO_CMD.
+auto_review_cmd="${REVIEW_PRS_AUTO_CMD:-}"
+[[ -z "$auto_review_cmd" ]] && auto_review_cmd='claude --dangerously-skip-permissions "auto panel review {}"'
 
 # Author logins treated as bots: hidden unless --dependabot, dimmed when shown.
 # Extend this anchored alternation as more AI coding bots appear, e.g.
@@ -206,49 +220,69 @@ sorted="$(jq -r --arg me "$me" --arg now "$now_iso" --arg botre "$bot_login_re" 
   | "\($rank)\t\(.updatedAt)\t\($bot)\t#\(.number)\t\($engage)\t\($review)\t\(rel(.updatedAt))\t@\(.author.login // "ghost")\t\(.title)"
 ' <<<"$prs_json" | sort -t $'\t' -k1,1n -k2,2r | cut -f3-)"
 
-# Surviving columns: "BOT\t#NUM\t...\tTITLE". Align everything but the BOT flag,
-# then dim bot rows (256-color gray 245) so they read as lower-priority noise.
-# paste re-zips the flags with the aligned rows, preserving order.
-dim=$'\033[38;5;245m'
-reset=$'\033[0m'
-aligned="$(cut -f2- <<<"$sorted" | column -t -s $'\t')"
-display="$(paste -d $'\t' <(cut -f1 <<<"$sorted") <(printf '%s\n' "$aligned") \
-  | while IFS=$'\t' read -r bot row; do
-      if [[ "$bot" == "1" ]]; then
-        printf '%s%s%s\n' "$dim" "$row" "$reset"
-      else
-        printf '%s\n' "$row"
-      fi
-    done)"
+# --- Auto mode: no picker -------------------------------------------------
+# Fan out every NEW/UPDATED PR, running $auto_review_cmd per tab. SEEN PRs are
+# skipped on purpose -- nothing has changed since you last engaged, so an
+# automated sweep has no reason to re-review them. $sorted columns are
+# tab-separated: 1=bot 2=#NUM 3=engage 4=review 5=time 6=author 7=title.
+if [[ "$auto" -eq 1 ]]; then
+  review_cmd="$auto_review_cmd"
+  numbers=()
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    numbers+=("$n")
+  done < <(awk -F'\t' '$3=="NEW" || $3=="UPDATED" { sub(/^#/, "", $2); print $2 }' <<<"$sorted")
 
-# --- Picker ---------------------------------------------------------------
-legend_text='NEW = unreviewed by you   UPDATED = activity since your last comment   SEEN = nothing new   CHANGES = changes requested'
-[[ "$include_dependabot" -eq 1 ]] && legend_text+='   (dimmed = Dependabot)'
-legend="$(gum style --foreground 240 "$legend_text")"
-
-selected="$(printf '%s\n' "$display" \
-  | gum choose --no-limit \
-      --header "Pick PRs to review (space toggles, enter confirms)
-$legend" \
-      --height 20 \
-  || true)"
-
-if [[ -z "${selected// /}" ]]; then
-  echo "no PRs selected"
-  exit 0
-fi
-
-numbers=()
-while IFS= read -r line; do
-  [[ -z "$line" ]] && continue
-  if [[ "$line" =~ \#([0-9]+) ]]; then
-    numbers+=("${BASH_REMATCH[1]}")
+  if [[ "${#numbers[@]}" -eq 0 ]]; then
+    echo "no NEW or UPDATED PRs to auto-review"
+    exit 0
   fi
-done <<<"$selected"
+  printf 'auto-reviewing %d PR(s): %s\n' "${#numbers[@]}" "$(printf '#%s ' "${numbers[@]}")"
+else
+  # Surviving columns: "BOT\t#NUM\t...\tTITLE". Align everything but the BOT
+  # flag, then dim bot rows (256-color gray 245) so they read as lower-priority
+  # noise. paste re-zips the flags with the aligned rows, preserving order.
+  dim=$'\033[38;5;245m'
+  reset=$'\033[0m'
+  aligned="$(cut -f2- <<<"$sorted" | column -t -s $'\t')"
+  display="$(paste -d $'\t' <(cut -f1 <<<"$sorted") <(printf '%s\n' "$aligned") \
+    | while IFS=$'\t' read -r bot row; do
+        if [[ "$bot" == "1" ]]; then
+          printf '%s%s%s\n' "$dim" "$row" "$reset"
+        else
+          printf '%s\n' "$row"
+        fi
+      done)"
 
-if [[ "${#numbers[@]}" -eq 0 ]]; then
-  echo "error: could not parse PR numbers from selection" >&2
-  exit 1
+  # --- Picker -------------------------------------------------------------
+  legend_text='NEW = unreviewed by you   UPDATED = activity since your last comment   SEEN = nothing new   CHANGES = changes requested'
+  [[ "$include_dependabot" -eq 1 ]] && legend_text+='   (dimmed = Dependabot)'
+  legend="$(gum style --foreground 240 "$legend_text")"
+
+  selected="$(printf '%s\n' "$display" \
+    | gum choose --no-limit \
+        --header "Pick PRs to review (space toggles, enter confirms)
+$legend" \
+        --height 20 \
+    || true)"
+
+  if [[ -z "${selected// /}" ]]; then
+    echo "no PRs selected"
+    exit 0
+  fi
+
+  numbers=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ \#([0-9]+) ]]; then
+      numbers+=("${BASH_REMATCH[1]}")
+    fi
+  done <<<"$selected"
+
+  if [[ "${#numbers[@]}" -eq 0 ]]; then
+    echo "error: could not parse PR numbers from selection" >&2
+    exit 1
+  fi
 fi
 
 # --- Terminal detection + spawn ------------------------------------------

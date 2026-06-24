@@ -47,6 +47,7 @@ Run from inside any GitHub repo:
 
 ```sh
 review-prs              # open, non-draft, unapproved PRs (excludes yours + bots)
+review-prs --auto       # skip the picker; auto-review every NEW/UPDATED PR
 review-prs --all        # also include PRs already marked APPROVED
 review-prs --dependabot # also include Dependabot PRs (shown dimmed)
 review-prs --help       # usage
@@ -80,6 +81,21 @@ REVIEW_PRS_CMD='gh pr checkout {} && my-reviewer' review-prs
 Note that `REVIEW_PRS_CMD` must be on the spawned tab's `PATH` (or be a shell
 function/alias defined in its startup files) — the command runs in a fresh
 shell, not the one you launched `review-prs` from.
+
+### Auto mode
+
+`--auto` skips the picker entirely: it fans out **every `NEW` and `UPDATED` PR**
+(the actionable ones) and runs an auto-review command in each tab. `SEEN` PRs
+are skipped on purpose — nothing has changed since you last engaged, so there's
+no reason to re-review them. Combine with `--all` / `--dependabot` to widen the
+set.
+
+The per-tab command is `REVIEW_PRS_AUTO_CMD` (same `{}`/append substitution as
+`REVIEW_PRS_CMD`), defaulting to a non-interactive "auto panel review":
+
+```sh
+claude --dangerously-skip-permissions "auto panel review <number>"
+```
 
 Your own PRs are always excluded — this tool is for reviewing others' work.
 Dependabot PRs are hidden by default; pass `--dependabot` to include them, where
