@@ -287,10 +287,10 @@ fi
 
 # --- Terminal detection + spawn ------------------------------------------
 spawn_in_herdr() {
-  local cmd="$1"
+  local cmd="$1" label="$2"
   local out pane
   # tab create prints JSON; the new pane's id is at .result.root_pane.pane_id.
-  out="$(herdr tab create --no-focus --label review 2>&1)"
+  out="$(herdr tab create --no-focus --label "$label" 2>&1)"
   pane="$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)"
   if [[ -z "$pane" ]]; then
     echo "error: could not parse herdr pane id from output: $out" >&2
@@ -355,7 +355,7 @@ for n in "${numbers[@]}"; do
   fi
   cmd="cd $(printf '%q' "$repo_root") && $invocation"
   case "$spawner" in
-    herdr)   spawn_in_herdr   "$cmd" ;;
+    herdr)   spawn_in_herdr   "$cmd" "review #$n" ;;
     cmux)    spawn_in_cmux    "$cmd" ;;
     ghostty) spawn_in_ghostty "$cmd"; sleep 0.3 ;;
   esac
