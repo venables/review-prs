@@ -19,7 +19,7 @@
 #   APPROVED - shown only with --all (otherwise filtered out)
 #
 # Sort: NEW first, UPDATED next, SEEN last; tie-break by most-recent activity.
-# Terminal target is auto-detected: cmux (preferred) or Ghostty.
+# Terminal target is auto-detected: herdr (preferred), cmux, or Ghostty.
 #
 # --auto skips the picker: it fans out every NEW/UPDATED PR, running
 # $REVIEW_PRS_AUTO_CMD (an "auto panel review" by default) instead of the
@@ -286,6 +286,19 @@ $legend" \
 fi
 
 # --- Terminal detection + spawn ------------------------------------------
+spawn_in_herdr() {
+  local cmd="$1"
+  local out pane
+  # tab create prints JSON; the new pane's id is at .result.root_pane.pane_id.
+  out="$(herdr tab create --no-focus --label review 2>&1)"
+  pane="$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)"
+  if [[ -z "$pane" ]]; then
+    echo "error: could not parse herdr pane id from output: $out" >&2
+    return 1
+  fi
+  herdr pane run "$pane" "$cmd"
+}
+
 spawn_in_cmux() {
   local cmd="$1"
   local out surface
@@ -316,7 +329,9 @@ spawn_in_ghostty() {
     -- "$cmd" >/dev/null
 }
 
-if [[ -n "${CMUX_SURFACE_ID:-}" ]] && command -v cmux >/dev/null 2>&1; then
+if [[ "${HERDR_ENV:-}" == "1" ]] && command -v herdr >/dev/null 2>&1; then
+  spawner="herdr"
+elif [[ -n "${CMUX_SURFACE_ID:-}" ]] && command -v cmux >/dev/null 2>&1; then
   spawner="cmux"
 elif [[ "${TERM_PROGRAM:-}" == "ghostty" ]]; then
   if [[ "$(uname)" != "Darwin" ]]; then
@@ -326,8 +341,8 @@ elif [[ "${TERM_PROGRAM:-}" == "ghostty" ]]; then
   spawner="ghostty"
 else
   echo "error: no supported terminal detected" >&2
-  echo "  expected CMUX_SURFACE_ID or TERM_PROGRAM=ghostty" >&2
-  echo "  TERM_PROGRAM=${TERM_PROGRAM:-<unset>} CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-<unset>}" >&2
+  echo "  expected HERDR_ENV=1, CMUX_SURFACE_ID, or TERM_PROGRAM=ghostty" >&2
+  echo "  HERDR_ENV=${HERDR_ENV:-<unset>} CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-<unset>} TERM_PROGRAM=${TERM_PROGRAM:-<unset>}" >&2
   exit 1
 fi
 
@@ -340,6 +355,7 @@ for n in "${numbers[@]}"; do
   fi
   cmd="cd $(printf '%q' "$repo_root") && $invocation"
   case "$spawner" in
+    herdr)   spawn_in_herdr   "$cmd" ;;
     cmux)    spawn_in_cmux    "$cmd" ;;
     ghostty) spawn_in_ghostty "$cmd"; sleep 0.3 ;;
   esac

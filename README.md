@@ -22,7 +22,9 @@ skill, which is the default review command each tab runs.
 - [`gum`](https://github.com/charmbracelet/gum) — the interactive picker
 - [`jq`](https://jqlang.github.io/jq/) — JSON processing
 - A supported terminal for spawning tabs:
-  - [cmux](https://cmux.io) (preferred; detected via `CMUX_SURFACE_ID`), or
+  - [Herdr](https://herdr.dev) (preferred; detected via `HERDR_ENV`, drives new
+    tabs over its socket API via the `herdr` CLI), or
+  - [cmux](https://cmux.io) (detected via `CMUX_SURFACE_ID`), or
   - [Ghostty](https://ghostty.org) 1.3+ on macOS (detected via `TERM_PROGRAM`,
     drives new tabs through AppleScript — needs Accessibility permission)
 
