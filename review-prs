@@ -19,7 +19,9 @@
 #   APPROVED - shown only with --all (otherwise filtered out)
 #
 # Sort: NEW first, UPDATED next, SEEN last; tie-break by most-recent activity.
-# Terminal target is auto-detected: herdr (preferred), cmux, or Ghostty.
+# Terminal target is auto-detected: herdr (preferred), cmux, or Ghostty. Under
+# herdr/cmux the enclosing workspace is renamed to $REVIEW_PRS_WORKSPACE
+# (default "pr reviews") so review sessions are easy to spot.
 #
 # --auto skips the picker: it fans out every NEW/UPDATED PR, running
 # $REVIEW_PRS_AUTO_CMD (an "auto panel review" by default) instead of the
@@ -329,6 +331,22 @@ spawn_in_ghostty() {
     -- "$cmd" >/dev/null
 }
 
+# Rename the enclosing workspace so review sessions stand out in the tab/session
+# switcher. Best-effort: a rename failure must never abort the fan-out, and
+# Ghostty has no workspace concept, so it is skipped.
+rename_workspace() {
+  local label="${REVIEW_PRS_WORKSPACE:-pr reviews}"
+  case "$spawner" in
+    herdr)
+      [[ -n "${HERDR_WORKSPACE_ID:-}" ]] || return 0
+      herdr workspace rename "$HERDR_WORKSPACE_ID" "$label" >/dev/null 2>&1 || true
+      ;;
+    cmux)
+      cmux workspace-action --action rename --title "$label" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
 if [[ "${HERDR_ENV:-}" == "1" ]] && command -v herdr >/dev/null 2>&1; then
   spawner="herdr"
 elif [[ -n "${CMUX_SURFACE_ID:-}" ]] && command -v cmux >/dev/null 2>&1; then
@@ -345,6 +363,8 @@ else
   echo "  HERDR_ENV=${HERDR_ENV:-<unset>} CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-<unset>} TERM_PROGRAM=${TERM_PROGRAM:-<unset>}" >&2
   exit 1
 fi
+
+rename_workspace
 
 for n in "${numbers[@]}"; do
   echo "spawning tab for PR #$n via $spawner"
