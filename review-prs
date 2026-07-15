@@ -24,8 +24,17 @@
 # (default "pr reviews") so review sessions are easy to spot.
 #
 # --auto skips the picker: it fans out every NEW/UPDATED PR, running
-# $REVIEW_PRS_AUTO_CMD (an "auto panel review" by default) instead of the
-# normal review command in each tab.
+# $REVIEW_PRS_AUTO_CMD instead of the normal review command in each tab. By
+# default that invokes the `pr-review-tab` skill, which runs an auto-review
+# and, when the PR is approved, closes the tab so a finished review cleans up
+# after itself.
+#
+# --babysit turns on re-checking: a PR that doesn't come back approvable keeps
+# its tab open and re-checks on an interval (default 30m, --babysit=MINUTES)
+# until it can be approved, then closes the tab. It uses the same unattended
+# command as --auto, so it works with the picker too (pick PRs, then babysit
+# each). The close/loop behavior lives in the pr-review-tab skill, not here --
+# this script only seeds the command into each tab.
 
 set -euo pipefail
 
@@ -33,18 +42,24 @@ set -euo pipefail
 include_approved=0
 include_dependabot=0
 auto=0
+babysit=0
 print_help() {
   cat <<'EOF'
 review-prs: pick open non-draft, unapproved PRs and fan out a review per PR.
 
-Usage: review-prs [--auto] [--all] [--dependabot] [--help]
+Usage: review-prs [--auto] [--babysit[=MINUTES]] [--all] [--dependabot] [--help]
 
-  --auto, -A        Skip the picker; fan out every NEW/UPDATED PR, running
-                    $REVIEW_PRS_AUTO_CMD (default: an "auto panel review")
-                    instead of $REVIEW_PRS_CMD in each tab.
-  --all, -a         Include PRs already marked APPROVED (default: exclude).
-  --dependabot, -d  Include Dependabot PRs (default: hidden; shown dimmed).
-  --help, -h        Show this help.
+  --auto, -A          Skip the picker; fan out every NEW/UPDATED PR, running
+                      $REVIEW_PRS_AUTO_CMD (default: the pr-review-tab skill,
+                      which auto-reviews and closes the tab on approval)
+                      instead of $REVIEW_PRS_CMD in each tab.
+  --babysit[=MIN], -b Re-check any PR that doesn't come back approvable every
+                      MIN minutes (default 30, or $REVIEW_PRS_BABYSIT_INTERVAL)
+                      until it can be approved, then close its tab. Uses the
+                      unattended command, so it works with the picker too.
+  --all, -a           Include PRs already marked APPROVED (default: exclude).
+  --dependabot, -d    Include Dependabot PRs (default: hidden; shown dimmed).
+  --help, -h          Show this help.
 
 Each selected PR opens a tab that cd's to the repo root and runs a review
 command. Override the default via $REVIEW_PRS_CMD (the PR number replaces the
@@ -56,9 +71,21 @@ Your own PRs are always hidden -- this tool is for reviewing others' work.
 EOF
 }
 
+# Normalize a babysit interval to a /loop-style duration: a bare number is
+# minutes ("30" -> "30m"); an already-suffixed value ("30m", "1h") passes
+# through untouched.
+normalize_interval() {
+  local v="$1"
+  [[ "$v" =~ ^[0-9]+$ ]] && v="${v}m"
+  printf '%s' "$v"
+}
+babysit_interval="$(normalize_interval "${REVIEW_PRS_BABYSIT_INTERVAL:-30}")"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --auto|-A)       auto=1; shift ;;
+    --babysit|-b)    babysit=1; shift ;;
+    --babysit=*)     babysit=1; babysit_interval="$(normalize_interval "${1#*=}")"; shift ;;
     --all|-a)        include_approved=1; shift ;;
     --dependabot|-d) include_dependabot=1; shift ;;
     --help|-h)       print_help; exit 0 ;;
@@ -76,10 +103,19 @@ done
 review_cmd="${REVIEW_PRS_CMD:-}"
 [[ -z "$review_cmd" ]] && review_cmd='claude --dangerously-skip-permissions "panel review {}"'
 
-# Command run in each spawned tab under --auto (see below). Same "{}"/append
-# substitution as $REVIEW_PRS_CMD; override via $REVIEW_PRS_AUTO_CMD.
+# Command run in each spawned tab when reviewing unattended (--auto and/or
+# --babysit). Same "{}"/append substitution as $REVIEW_PRS_CMD; override via
+# $REVIEW_PRS_AUTO_CMD. The default seeds the `pr-review-tab` skill, passing the
+# PR number and (under --babysit) the re-check interval as its documented args
+# `pr-review-tab <PR> [--babysit <interval>]`. That skill runs the auto-review,
+# closes the tab on approval, and loops recheck-pr when babysitting -- none of
+# that lifecycle logic lives in this script.
 auto_review_cmd="${REVIEW_PRS_AUTO_CMD:-}"
-[[ -z "$auto_review_cmd" ]] && auto_review_cmd='claude --dangerously-skip-permissions "auto panel review {}"'
+if [[ -z "$auto_review_cmd" ]]; then
+  babysit_arg=""
+  [[ "$babysit" -eq 1 ]] && babysit_arg=" --babysit $babysit_interval"
+  auto_review_cmd="claude --dangerously-skip-permissions \"pr-review-tab {}${babysit_arg}\""
+fi
 
 # Author logins treated as bots: hidden unless --dependabot, dimmed when shown.
 # Extend this anchored alternation as more AI coding bots appear, e.g.
@@ -222,13 +258,19 @@ sorted="$(jq -r --arg me "$me" --arg now "$now_iso" --arg botre "$bot_login_re" 
   | "\($rank)\t\(.updatedAt)\t\($bot)\t#\(.number)\t\($engage)\t\($review)\t\(rel(.updatedAt))\t@\(.author.login // "ghost")\t\(.title)"
 ' <<<"$prs_json" | sort -t $'\t' -k1,1n -k2,2r | cut -f3-)"
 
-# --- Auto mode: no picker -------------------------------------------------
-# Fan out every NEW/UPDATED PR, running $auto_review_cmd per tab. SEEN PRs are
-# skipped on purpose -- nothing has changed since you last engaged, so an
-# automated sweep has no reason to re-review them. $sorted columns are
-# tab-separated: 1=bot 2=#NUM 3=engage 4=review 5=time 6=author 7=title.
-if [[ "$auto" -eq 1 ]]; then
+# Command choice is independent of how PRs are selected: any unattended run
+# (--auto sweep OR --babysit picker) uses $auto_review_cmd so the tab self-
+# closes on approval; a plain picker run keeps the interactive $review_cmd.
+if [[ "$auto" -eq 1 || "$babysit" -eq 1 ]]; then
   review_cmd="$auto_review_cmd"
+fi
+
+# --- Auto mode: no picker -------------------------------------------------
+# Fan out every NEW/UPDATED PR per tab. SEEN PRs are skipped on purpose --
+# nothing has changed since you last engaged, so an automated sweep has no
+# reason to re-review them. $sorted columns are tab-separated:
+# 1=bot 2=#NUM 3=engage 4=review 5=time 6=author 7=title.
+if [[ "$auto" -eq 1 ]]; then
   numbers=()
   while IFS= read -r n; do
     [[ -z "$n" ]] && continue

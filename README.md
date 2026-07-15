@@ -50,6 +50,8 @@ Run from inside any GitHub repo:
 ```sh
 review-prs              # open, non-draft, unapproved PRs (excludes yours + bots)
 review-prs --auto       # skip the picker; auto-review every NEW/UPDATED PR
+review-prs --babysit    # re-check non-approvable PRs on an interval until approved
+review-prs --babysit=15 # ...every 15 minutes (default 30)
 review-prs --all        # also include PRs already marked APPROVED
 review-prs --dependabot # also include Dependabot PRs (shown dimmed)
 review-prs --help       # usage
@@ -93,11 +95,32 @@ no reason to re-review them. Combine with `--all` / `--dependabot` to widen the
 set.
 
 The per-tab command is `REVIEW_PRS_AUTO_CMD` (same `{}`/append substitution as
-`REVIEW_PRS_CMD`), defaulting to a non-interactive "auto panel review":
+`REVIEW_PRS_CMD`), defaulting to the
+[`pr-review-tab`](https://github.com/catena-labs/dev-skills) skill:
 
 ```sh
-claude --dangerously-skip-permissions "auto panel review <number>"
+claude --dangerously-skip-permissions "pr-review-tab <number>"
 ```
+
+That skill runs an auto-review and, **when the PR is approved, closes its tab**
+so a finished review cleans up after itself. (Tabs are closed via the enclosing
+multiplexer — `herdr tab close` / `cmux close-surface` — from inside the tab,
+which is why the behavior lives in the skill, not this script.)
+
+### Babysit mode
+
+`--babysit` keeps a not-yet-approvable PR's tab open and **re-checks it on an
+interval until it can be approved**, then closes the tab — so a fix pushed
+overnight gets stamped without you re-running anything. The interval defaults to
+30 minutes; set it with `--babysit=MINUTES` or `$REVIEW_PRS_BABYSIT_INTERVAL`.
+
+It uses the same unattended command as `--auto`, so it composes with both the
+sweep (`review-prs --auto --babysit`) and the picker (`review-prs --babysit`,
+then choose which PRs to babysit). Under the hood the `pr-review-tab` skill
+starts an in-session `/loop` that re-runs the
+[`recheck-pr`](https://github.com/catena-labs/dev-skills) skill each interval;
+`recheck-pr`'s fast path makes a no-change cycle cheap, and the loop ends when
+the tab closes on approval.
 
 Your own PRs are always excluded — this tool is for reviewing others' work.
 Dependabot PRs are hidden by default; pass `--dependabot` to include them, where
