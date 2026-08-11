@@ -12,7 +12,7 @@ jobs:
       - name: Checkout tap
         uses: actions/checkout@v4
         with:
-          repository: venables/homebrew-tap
+          repository: venabots/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
       - name: Update formula
@@ -21,7 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          tarball="https://github.com/venables/review-prs/archive/refs/tags/${TAG}.tar.gz"
+          tarball="https://github.com/venabots/review-prs/archive/refs/tags/${TAG}.tar.gz"
 
           # Retry: GitHub occasionally serves the archive a few seconds after
           # the tag push event arrives.

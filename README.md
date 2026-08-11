@@ -33,13 +33,13 @@ skill, which is the default review command each tab runs.
 ### Homebrew
 
 ```sh
-brew install venables/tap/review-prs
+brew install venabots/tap/review-prs
 ```
 
 ### Manual
 
 ```sh
-git clone git@github.com:venables/review-prs.git
+git clone git@github.com:venabots/review-prs.git
 ln -s "$PWD/review-prs/review-prs" /usr/local/bin/review-prs
 ```
 
