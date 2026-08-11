@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# Shared harness for the review-prs tests.
+#
+# Each test runs the real script against fake `gh`, `gum` and `cmux` binaries on
+# PATH, inside a throwaway git repo, with $CLAUDE_CONFIG_DIR pointed at a
+# throwaway session store. Nothing here touches your real repos, your real
+# Claude Code sessions, or GitHub.
+
+set -euo pipefail
+
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REVIEW_PRS="$TESTS_DIR/../review-prs"
+
+pass_count=0
+fail_count=0
+
+ok() {
+  printf '  ok    %s\n' "$1"
+  pass_count=$((pass_count + 1))
+}
+
+not_ok() {
+  printf '  FAIL  %s\n' "$1"
+  printf '        %s\n' "$2"
+  fail_count=$((fail_count + 1))
+}
+
+assert_contains() {
+  local desc="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    ok "$desc"
+  else
+    not_ok "$desc" "expected to find: $needle"
+    printf '        in: %s\n' "$haystack"
+  fi
+}
+
+assert_not_contains() {
+  local desc="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    ok "$desc"
+  else
+    not_ok "$desc" "expected NOT to find: $needle"
+    printf '        in: %s\n' "$haystack"
+  fi
+}
+
+assert_equals() {
+  local desc="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    ok "$desc"
+  else
+    not_ok "$desc" "expected: $expected"
+    printf '        actual:   %s\n' "$actual"
+  fi
+}
+
+# --- Sandbox --------------------------------------------------------------
+
+setup_sandbox() {
+  SANDBOX="$(mktemp -d)"
+  export SANDBOX
+  mkdir -p "$SANDBOX/bin" "$SANDBOX/repo" "$SANDBOX/claude/projects" \
+    "$SANDBOX/fixtures" "$SANDBOX/out"
+
+  git -C "$SANDBOX/repo" init -q
+  git -C "$SANDBOX/repo" commit -q --allow-empty -m init
+
+  write_fake_gh
+  write_fake_gum
+  write_fake_cmux
+
+  export PATH="$SANDBOX/bin:$PATH"
+  export CLAUDE_CONFIG_DIR="$SANDBOX/claude"
+  export FAKE_GH_LOGIN="me"
+  export SPAWN_LOG="$SANDBOX/out/spawned"
+
+  # Force the cmux spawner: it is the only one that is fully scriptable. Herdr
+  # detection and the Ghostty AppleScript path are out of scope here.
+  export CMUX_SURFACE_ID="test-surface"
+  unset HERDR_ENV TERM_PROGRAM REVIEW_PRS_CMD REVIEW_PRS_AUTO_CMD || true
+  # Leave the workspace title alone; the fake cmux ignores it either way.
+  export REVIEW_PRS_WORKSPACE=""
+
+  default_prs
+}
+
+teardown_sandbox() {
+  [[ -n "${SANDBOX:-}" && -d "$SANDBOX" ]] && rm -rf "$SANDBOX"
+}
+
+reset_spawn_log() {
+  : >"$SPAWN_LOG"
+  : >"$SPAWN_LOG.labels"
+  : >"$SANDBOX/out/header"
+}
+
+# The command the script sent to the tab for PR $1 (first match wins).
+spawned_cmd() {
+  grep -m1 -- "\b$1\b" "$SPAWN_LOG" 2>/dev/null || true
+}
+
+spawned_labels() {
+  cat "$SPAWN_LOG.labels" 2>/dev/null || true
+}
+
+picker_header() {
+  cat "$SANDBOX/out/header" 2>/dev/null || true
+}
+
+# --- Fakes ----------------------------------------------------------------
+
+write_fake_gh() {
+  cat >"$SANDBOX/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sub="${1:-}"; shift || true
+case "$sub" in
+  repo)
+    cat "$SANDBOX/fixtures/repo.json"
+    ;;
+  api)
+    target="${1:-}"; shift || true
+    jq_filter=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --jq) jq_filter="${2:-}"; shift 2 ;;
+        *)    shift ;;
+      esac
+    done
+    case "$target" in
+      user)
+        printf '%s\n' "${FAKE_GH_LOGIN:-me}"
+        ;;
+      graphql)
+        if [[ -n "$jq_filter" ]]; then
+          jq -r "$jq_filter" "$SANDBOX/fixtures/prs.json"
+        else
+          cat "$SANDBOX/fixtures/prs.json"
+        fi
+        ;;
+      *)
+        echo "fake gh: unhandled api target: $target" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "fake gh: unhandled subcommand: $sub" >&2
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$SANDBOX/bin/gh"
+}
+
+write_fake_gum() {
+  cat >"$SANDBOX/bin/gum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sub="${1:-}"; shift || true
+case "$sub" in
+  style)
+    # Echo the text argument so the caller can embed it.
+    printf '%s\n' "${@: -1}"
+    ;;
+  choose)
+    header=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --header) header="${2:-}"; shift 2 ;;
+        *)        shift ;;
+      esac
+    done
+    printf '%s\n' "$header" >"$SANDBOX/out/header"
+    # Select the row the test asked for, else nothing.
+    if [[ -n "${FAKE_GUM_PICK:-}" ]]; then
+      grep -F -- "$FAKE_GUM_PICK" || true
+    else
+      cat >/dev/null
+    fi
+    ;;
+  *)
+    echo "fake gum: unhandled subcommand: $sub" >&2
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$SANDBOX/bin/gum"
+}
+
+write_fake_cmux() {
+  cat >"$SANDBOX/bin/cmux" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sub="${1:-}"; shift || true
+case "$sub" in
+  new-surface)
+    echo "surface:1"
+    ;;
+  rename-tab)
+    while [[ $# -gt 1 && "$1" == --* ]]; do shift 2; done
+    printf '%s\n' "${1:-}" >>"$SPAWN_LOG.labels"
+    ;;
+  send)
+    [[ "${FAKE_CMUX_FAIL_SEND:-0}" == "1" ]] && exit 1
+    while [[ $# -gt 1 && "$1" == --* ]]; do shift 2; done
+    printf '%s\n' "${1:-}" >>"$SPAWN_LOG"
+    ;;
+  send-key|workspace-action)
+    :
+    ;;
+  *)
+    echo "fake cmux: unhandled subcommand: $sub" >&2
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$SANDBOX/bin/cmux"
+}
+
+# --- Fixtures -------------------------------------------------------------
+
+# Three open PRs by other people, one draft, one of yours, one Dependabot.
+# PR 9 and 8 are NEW (no engagement by "me"); 6 is SEEN (you commented last).
+default_prs() {
+  cat >"$SANDBOX/fixtures/repo.json" <<'EOF'
+{"owner":{"login":"acme"},"name":"widgets"}
+EOF
+
+  cat >"$SANDBOX/fixtures/prs.json" <<'EOF'
+{"data":{"repository":{"pullRequests":{"nodes":[
+  {"number":9,"title":"Add retry logic","isDraft":false,
+   "updatedAt":"2026-08-10T10:00:00Z","reviewDecision":null,
+   "author":{"login":"alice"},
+   "comments":{"nodes":[]},"reviews":{"nodes":[]},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-10T10:00:00Z","author":{"user":{"login":"alice"}}}}]}},
+
+  {"number":8,"title":"Fix typo","isDraft":false,
+   "updatedAt":"2026-08-09T10:00:00Z","reviewDecision":"CHANGES_REQUESTED",
+   "author":{"login":"bob"},
+   "comments":{"nodes":[]},"reviews":{"nodes":[]},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-09T10:00:00Z","author":{"user":{"login":"bob"}}}}]}},
+
+  {"number":6,"title":"Refactor client","isDraft":false,
+   "updatedAt":"2026-08-08T10:00:00Z","reviewDecision":null,
+   "author":{"login":"carol"},
+   "comments":{"nodes":[{"author":{"login":"me"},"updatedAt":"2026-08-08T10:00:00Z"}]},
+   "reviews":{"nodes":[]},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-07T10:00:00Z","author":{"user":{"login":"carol"}}}}]}},
+
+  {"number":5,"title":"Approved already","isDraft":false,
+   "updatedAt":"2026-08-06T10:00:00Z","reviewDecision":"APPROVED",
+   "author":{"login":"dave"},
+   "comments":{"nodes":[]},"reviews":{"nodes":[]},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-06T10:00:00Z","author":{"user":{"login":"dave"}}}}]}},
+
+  {"number":4,"title":"My own work","isDraft":false,
+   "updatedAt":"2026-08-05T10:00:00Z","reviewDecision":null,
+   "author":{"login":"me"},
+   "comments":{"nodes":[]},"reviews":{"nodes":[]},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-05T10:00:00Z","author":{"user":{"login":"me"}}}}]}},
+
+  {"number":3,"title":"Bump lodash","isDraft":false,
+   "updatedAt":"2026-08-04T10:00:00Z","reviewDecision":null,
+   "author":{"login":"dependabot"},
+   "comments":{"nodes":[]},"reviews":{"nodes":[]},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-04T10:00:00Z","author":{"user":{"login":"dependabot"}}}}]}},
+
+  {"number":2,"title":"Work in progress","isDraft":true,
+   "updatedAt":"2026-08-03T10:00:00Z","reviewDecision":null,
+   "author":{"login":"erin"},
+   "comments":{"nodes":[]},"reviews":{"nodes":[]},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-03T10:00:00Z","author":{"user":{"login":"erin"}}}}]}}
+]}}}}
+EOF
+}
+
+# Run review-prs inside the sandbox repo. Stdout and stderr are combined and
+# echoed, so callers usually wrap this in `$(...)` -- which runs it in a
+# subshell, so the exit status goes to a file rather than a variable. Read it
+# back with last_status.
+run_review_prs() {
+  reset_spawn_log
+  set +e
+  ( cd "$SANDBOX/repo" && "$REVIEW_PRS" "$@" 2>&1 )
+  local status=$?
+  set -e
+  printf '%s' "$status" >"$SANDBOX/out/status"
+}
+
+last_status() {
+  cat "$SANDBOX/out/status" 2>/dev/null || printf 'unset'
+}
+
+# Create the session file that makes $1 look like an existing session.
+make_session() {
+  mkdir -p "$CLAUDE_CONFIG_DIR/projects/-fake-project"
+  touch "$CLAUDE_CONFIG_DIR/projects/-fake-project/$1.jsonl"
+}
+
+# Pull the session id out of a spawned command, whichever flag carries it.
+session_id_from() {
+  printf '%s\n' "$1" \
+    | grep -oE -- '--(session-id|resume) [0-9a-f-]{36}' \
+    | head -1 | awk '{print $2}'
+}
+
+finish() {
+  printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
+  [[ "$fail_count" -eq 0 ]]
+}

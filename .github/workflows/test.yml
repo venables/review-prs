@@ -1,0 +1,32 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is the primary target and ships bash 3.2, so it is the one that
+        # catches bashisms the script must not use. Linux runs md5sum instead of
+        # md5, which exercises the other branch of the hash helper.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck and jq
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install shellcheck jq
+          else
+            sudo apt-get update
+            sudo apt-get install -y shellcheck jq
+          fi
+
+      - name: Run tests
+        run: bash tests/run.sh
