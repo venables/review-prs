@@ -9,7 +9,7 @@
 #   any reviewer (a shell function, another CLI, etc.).
 #
 # Display columns:
-#   #NUM   ENGAGEMENT   REVIEW      TIME      AUTHOR   TITLE
+#   #NUM   ENGAGEMENT   REVIEW   SESSION   TIME   AUTHOR   TITLE
 # Engagement:
 #   NEW     - you have not commented or reviewed
 #   UPDATED - new comments / reviews / commits since your last engagement
@@ -17,11 +17,20 @@
 # Review:
 #   CHANGES  - reviewDecision == CHANGES_REQUESTED
 #   APPROVED - shown only with --all (otherwise filtered out)
+# Session:
+#   RESUMABLE - an earlier review session exists; --continue reopens it
+#   (the whole column is hidden when no PR is resumable)
 #
 # Sort: NEW first, UPDATED next, SEEN last; tie-break by most-recent activity.
 # Terminal target is auto-detected: herdr (preferred), cmux, or Ghostty. Under
 # herdr/cmux the enclosing workspace is renamed to $REVIEW_PRS_WORKSPACE
-# (default "pr reviews") so review sessions are easy to spot.
+# (default "pr reviews"; set it empty to opt out) and each tab is named for its
+# PR and mode ("PR 27 Review", "PR 27 Auto-Review", "PR 27 Recheck",
+# "PR 27 Babysit") so review sessions are easy to spot. Both names are sticky,
+# surviving the title escapes
+# the review command emits as it runs. Ghostty tabs are left unnamed: it has no
+# sticky-title API, and any title we set would be overwritten by the review
+# command within seconds.
 #
 # --auto skips the picker: it fans out every NEW/UPDATED PR, running
 # $REVIEW_PRS_AUTO_CMD instead of the normal review command in each tab. By
@@ -30,11 +39,20 @@
 # after itself.
 #
 # --babysit turns on re-checking: a PR that doesn't come back approvable keeps
-# its tab open and re-checks on an interval (default 30m, --babysit=MINUTES)
-# until it can be approved, then closes the tab. It uses the same unattended
+# its tab open and re-checks on an interval (default 30m, --babysit=MINUTES; a
+# bare number is minutes, and 30m/1h/2d also work) until it can be approved,
+# then closes the tab. It uses the same unattended
 # command as --auto, so it works with the picker too (pick PRs, then babysit
 # each). The close/loop behavior lives in the pr-review-tab skill, not here --
 # this script only seeds the command into each tab.
+#
+# Session continuity: each PR gets a session id derived from the repo directory
+# plus owner/name#NUM, so the same PR in the same checkout maps to the same
+# Claude Code session on every run. A first review pins that id with
+# --session-id; --continue reopens it with --resume, and the tab re-checks the
+# PR against the review already in that session instead of starting over.
+# Sessions are local to this machine, and to the checkout the tab cd's into: a
+# second clone or a git worktree of the same repo keeps its own sessions.
 
 set -euo pipefail
 
@@ -43,11 +61,13 @@ include_approved=0
 include_dependabot=0
 auto=0
 babysit=0
+continue_sessions=0
 print_help() {
   cat <<'EOF'
 review-prs: pick open non-draft, unapproved PRs and fan out a review per PR.
 
-Usage: review-prs [--auto] [--babysit[=MINUTES]] [--all] [--dependabot] [--help]
+Usage: review-prs [--auto] [--babysit[=MINUTES]] [--continue] [--all]
+                  [--dependabot] [--help]
 
   --auto, -A          Skip the picker; fan out every NEW/UPDATED PR, running
                       $REVIEW_PRS_AUTO_CMD (default: the pr-review-tab skill,
@@ -57,15 +77,28 @@ Usage: review-prs [--auto] [--babysit[=MINUTES]] [--all] [--dependabot] [--help]
                       MIN minutes (default 30, or $REVIEW_PRS_BABYSIT_INTERVAL)
                       until it can be approved, then close its tab. Uses the
                       unattended command, so it works with the picker too.
+                      A bare number is minutes; 30m/1h/2d also work.
+  --continue, -C      Resume this machine's earlier review session for a PR
+                      instead of reviewing it from scratch. PRs with a session
+                      are marked RESUMABLE in the picker.
   --all, -a           Include PRs already marked APPROVED (default: exclude).
   --dependabot, -d    Include Dependabot PRs (default: hidden; shown dimmed).
   --help, -h          Show this help.
 
 Each selected PR opens a tab that cd's to the repo root and runs a review
-command. Override the default via $REVIEW_PRS_CMD (the PR number replaces the
-first "{}", or is appended if absent):
-  REVIEW_PRS_CMD='claude --dangerously-skip-permissions "panel review {}"'  (default)
-  REVIEW_PRS_CMD='review'                                                   (append form)
+command. The built-in commands are:
+  claude --dangerously-skip-permissions --session-id UUID "panel review N"
+  claude --dangerously-skip-permissions --resume     UUID "recheck-pr N"   (-C)
+where UUID is derived from the repo directory plus owner/name#N, so the same PR
+in this checkout always maps to the same session. Override via $REVIEW_PRS_CMD
+(the PR number replaces the first "{}", or is appended if absent):
+  REVIEW_PRS_CMD='review'                              (append form)
+  REVIEW_PRS_CMD='gh pr checkout {} && my-review {}'   (placeholder form)
+An overridden command owns its own session handling; it receives the id as
+$REVIEW_PRS_SESSION_ID and a 0/1 $REVIEW_PRS_SESSION_RESUME.
+
+Under herdr/cmux the enclosing workspace is renamed to $REVIEW_PRS_WORKSPACE
+(default "pr reviews"); set it empty to leave your workspace title alone.
 
 Your own PRs are always hidden -- this tool is for reviewing others' work.
 EOF
@@ -73,19 +106,34 @@ EOF
 
 # Normalize a babysit interval to a /loop-style duration: a bare number is
 # minutes ("30" -> "30m"); an already-suffixed value ("30m", "1h") passes
-# through untouched.
+# through untouched. Anything else is rejected here rather than silently seeded
+# into the spawned tab: "0" would re-check with no delay (a hot loop running
+# recheck-pr under --dangerously-skip-permissions), and "soon" or a bare
+# "--babysit=" would reach /loop as an unparseable duration. Sub-minute units
+# are refused for the same hot-loop reason -- re-checking a PR every second is
+# never what you meant.
 normalize_interval() {
   local v="$1"
   [[ "$v" =~ ^[0-9]+$ ]] && v="${v}m"
+  # Leading zeros are fine ("05" is plainly five), but a value of zero is not --
+  # the [1-9] keeps "0", "00" and "0m" rejected.
+  if [[ ! "$v" =~ ^0*[1-9][0-9]*[mhd]$ ]]; then
+    printf 'error: invalid babysit interval: "%s" (expected a positive duration, e.g. 30, 30m, 1h)\n' "$1" >&2
+    return 1
+  fi
   printf '%s' "$v"
 }
-babysit_interval="$(normalize_interval "${REVIEW_PRS_BABYSIT_INTERVAL:-30}")"
+# Kept raw until after arg parsing: validating here would make a bad
+# $REVIEW_PRS_BABYSIT_INTERVAL in your shell profile hard-fail every run,
+# including --help and ordinary picker runs that never babysit.
+babysit_interval_raw="${REVIEW_PRS_BABYSIT_INTERVAL:-30}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --auto|-A)       auto=1; shift ;;
     --babysit|-b)    babysit=1; shift ;;
-    --babysit=*)     babysit=1; babysit_interval="$(normalize_interval "${1#*=}")"; shift ;;
+    --babysit=*)     babysit=1; babysit_interval_raw="${1#*=}"; shift ;;
+    --continue|-C)   continue_sessions=1; shift ;;
     --all|-a)        include_approved=1; shift ;;
     --dependabot|-d) include_dependabot=1; shift ;;
     --help|-h)       print_help; exit 0 ;;
@@ -93,28 +141,31 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Command run in each spawned tab to review a PR. The PR number is substituted
-# for the first "{}" placeholder, or appended if no placeholder is present.
-# Override to use your own reviewer, e.g.
-#   REVIEW_PRS_CMD='review' review-prs                 # a shell function/alias
-#   REVIEW_PRS_CMD='gh pr checkout {} && my-review' ...  # placeholder form
-# (Set via a conditional, not "${VAR:-default}", since a literal "}" in the
-# default's {} placeholder would prematurely close the parameter expansion.)
-review_cmd="${REVIEW_PRS_CMD:-}"
-[[ -z "$review_cmd" ]] && review_cmd='claude --dangerously-skip-permissions "panel review {}"'
+# Now that --help and arg errors are out of the way, validate the interval --
+# but only when babysitting is actually on, so an unrelated bad env var never
+# blocks a plain review run.
+babysit_interval=""
+if [[ "$babysit" -eq 1 ]]; then
+  babysit_interval="$(normalize_interval "$babysit_interval_raw")" || exit 1
+fi
 
-# Command run in each spawned tab when reviewing unattended (--auto and/or
-# --babysit). Same "{}"/append substitution as $REVIEW_PRS_CMD; override via
-# $REVIEW_PRS_AUTO_CMD. The default seeds the `pr-review-tab` skill, passing the
-# PR number and (under --babysit) the re-check interval as its documented args
-# `pr-review-tab <PR> [--babysit <interval>]`. That skill runs the auto-review,
-# closes the tab on approval, and loops recheck-pr when babysitting -- none of
-# that lifecycle logic lives in this script.
+# Command run in each spawned tab to review a PR, and its unattended twin for
+# --auto / --babysit. Both are empty by default, which means "use the built-in
+# claude invocation" -- see builtin_invocation, which needs the PR number and
+# the session state to pick its flags and prompt, so it cannot be flattened into
+# a template string here. A non-empty value is a user override: the PR number
+# replaces the first "{}", or is appended if no placeholder is present, e.g.
+#   REVIEW_PRS_CMD='review' review-prs                   # a shell function/alias
+#   REVIEW_PRS_CMD='gh pr checkout {} && my-review' ...  # placeholder form
+review_cmd="${REVIEW_PRS_CMD:-}"
 auto_review_cmd="${REVIEW_PRS_AUTO_CMD:-}"
-if [[ -z "$auto_review_cmd" ]]; then
-  babysit_arg=""
-  [[ "$babysit" -eq 1 ]] && babysit_arg=" --babysit $babysit_interval"
-  auto_review_cmd="claude --dangerously-skip-permissions \"pr-review-tab {}${babysit_arg}\""
+
+if [[ -n "$auto_review_cmd" && "$babysit" -eq 1 ]]; then
+  # An overridden unattended command owns its own re-check behavior and has no
+  # documented slot for the interval, so --babysit=MIN cannot reach it. Say so
+  # rather than let the flag look effective.
+  printf 'note: $REVIEW_PRS_AUTO_CMD is set; --babysit interval (%s) is not passed to it\n' \
+    "$babysit_interval" >&2
 fi
 
 # Author logins treated as bots: hidden unless --dependabot, dimmed when shown.
@@ -148,9 +199,10 @@ owner="$(jq -r '.owner.login' <<<"$repo_json")"
 name="$(jq -r '.name' <<<"$repo_json")"
 repo_root="$(git rev-parse --show-toplevel)"
 
-# A `gh api` failure inside `me="$(...)"` does NOT trip `set -e` (command
-# substitution in a simple assignment is exempt). An empty `$me` would then
-# silently mislabel every PR's engagement, so check explicitly.
+# `gh api` can exit 0 and still hand back an empty login, which would silently
+# mislabel every PR's engagement -- so check both the status and the value. The
+# `if !` is also what makes a genuine failure reportable here: a bare
+# `me="$(...)"` assignment would trip `set -e` and exit before the message.
 if ! me="$(gh api user --jq .login 2>&1)"; then
   echo "error: failed to fetch current GitHub user" >&2
   echo "$me" >&2
@@ -158,6 +210,59 @@ if ! me="$(gh api user --jq .login 2>&1)"; then
 fi
 if [[ -z "$me" ]]; then
   echo "error: gh api user returned empty login" >&2
+  exit 1
+fi
+
+# --- Session continuity ---------------------------------------------------
+# A PR's review session id is derived from the repo directory plus owner/name#NUM
+# rather than recorded in a state file: the mapping is then stable across runs
+# with nothing to keep in sync, and nothing to go stale when a PR is closed.
+#
+# $repo_root is in the hash on purpose, and it is what makes the whole scheme
+# safe. Claude Code stores a session under the directory it ran in, and each tab
+# cd's to $repo_root -- so a session belongs to one checkout. Hashing the path
+# in gives a second clone or a git worktree of the same repo its own id for the
+# same PR. Leave it out and both checkouts derive one id: the second would mark
+# the first's session RESUMABLE, resume it (which succeeds, and quietly carries
+# the other checkout's context), and -- worse -- would never pin a --session-id
+# of its own, so it could never become resumable.
+#
+# md5 on macOS, md5sum elsewhere. A box with neither still reviews fine -- it
+# just loses session continuity, so degrade instead of failing the run. This is
+# a naming hash, not a security one; collisions across PRs of one repo are the
+# only thing that matters, and 128 bits is far past enough for that.
+if command -v md5 >/dev/null 2>&1; then
+  hash_hex() { md5 -q; }
+elif command -v md5sum >/dev/null 2>&1; then
+  hash_hex() { md5sum | cut -d' ' -f1; }
+else
+  hash_hex() { printf ''; }
+fi
+
+# Shape the digest into a v5-form UUID: claude --session-id rejects anything
+# else. Byte 6's high nibble is the version (5) and byte 8's is the variant (a
+# => 10xx), which is why those two nibbles are literals rather than digest hex.
+pr_session_id() {
+  local h
+  h="$(printf 'review-prs:%s:%s/%s#%s' "$repo_root" "$owner" "$name" "$1" | hash_hex)"
+  [[ ${#h} -ge 32 ]] || return 0
+  printf '%s-%s-5%s-a%s-%s' \
+    "${h:0:8}" "${h:8:4}" "${h:13:3}" "${h:17:3}" "${h:20:12}"
+}
+
+# True when a session with this id already exists locally. Sessions live under a
+# directory named for the escaped cwd, but that escaping is undocumented and has
+# changed before -- so glob every project directory instead of rebuilding the
+# name. Searching wider than $repo_root is safe because the id already encodes
+# the checkout: only this checkout's session can carry this id.
+claude_projects_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+session_exists() {
+  [[ -n "$1" && -d "$claude_projects_dir" ]] || return 1
+  compgen -G "$claude_projects_dir/*/$1.jsonl" >/dev/null 2>&1
+}
+
+if [[ "$continue_sessions" -eq 1 && -z "$(pr_session_id 0)" ]]; then
+  echo "error: --continue needs md5 or md5sum to derive session ids; neither found" >&2
   exit 1
 fi
 
@@ -259,8 +364,9 @@ sorted="$(jq -r --arg me "$me" --arg now "$now_iso" --arg botre "$bot_login_re" 
 ' <<<"$prs_json" | sort -t $'\t' -k1,1n -k2,2r | cut -f3-)"
 
 # Command choice is independent of how PRs are selected: any unattended run
-# (--auto sweep OR --babysit picker) uses $auto_review_cmd so the tab self-
-# closes on approval; a plain picker run keeps the interactive $review_cmd.
+# (--auto sweep OR --babysit picker) takes the unattended override, so the tab
+# self-closes on approval; a plain picker run keeps the interactive one. From
+# here on $review_cmd is "the override to run", and empty means "built-in".
 if [[ "$auto" -eq 1 || "$babysit" -eq 1 ]]; then
   review_cmd="$auto_review_cmd"
 fi
@@ -283,6 +389,34 @@ if [[ "$auto" -eq 1 ]]; then
   fi
   printf 'auto-reviewing %d PR(s): %s\n' "${#numbers[@]}" "$(printf '#%s ' "${numbers[@]}")"
 else
+  # Mark the PRs that already have a local review session, so you can see what
+  # --continue would resume before you pick. The marker goes in after REVIEW,
+  # leaving the columns the auto branch reads (2=#NUM, 3=engage) where they are.
+  # The column only appears when something is resumable: on a repo you have
+  # never reviewed, every row would read "-" and buy nothing. This loop runs in
+  # the current shell, not a subshell, so $resumable_any survives it.
+  #
+  # Marking costs one hash and one glob per PR, so skip the whole loop when no
+  # session store exists -- there is nothing to find, and a box without Claude
+  # Code should not pay for the lookup on every picker run.
+  resumable_any=0
+  if [[ -d "$claude_projects_dir" ]]; then
+    marked=""
+    while IFS=$'\t' read -r bot num engage review rest; do
+      [[ -n "$num" ]] || continue
+      if session_exists "$(pr_session_id "${num#\#}")"; then
+        mark="RESUMABLE"
+        resumable_any=1
+      else
+        mark="-"
+      fi
+      marked+="$bot"$'\t'"$num"$'\t'"$engage"$'\t'"$review"$'\t'"$mark"$'\t'"$rest"$'\n'
+    done <<<"$sorted"
+    if [[ "$resumable_any" -eq 1 ]]; then
+      sorted="${marked%$'\n'}"
+    fi
+  fi
+
   # Surviving columns: "BOT\t#NUM\t...\tTITLE". Align everything but the BOT
   # flag, then dim bot rows (256-color gray 245) so they read as lower-priority
   # noise. paste re-zips the flags with the aligned rows, preserving order.
@@ -300,6 +434,13 @@ else
 
   # --- Picker -------------------------------------------------------------
   legend_text='NEW = unreviewed by you   UPDATED = activity since your last comment   SEEN = nothing new   CHANGES = changes requested'
+  if [[ "$resumable_any" -eq 1 ]]; then
+    if [[ "$continue_sessions" -eq 1 ]]; then
+      legend_text+='   RESUMABLE = earlier review session, resumed by -C'
+    else
+      legend_text+='   RESUMABLE = earlier review session; pass -C to resume it'
+    fi
+  fi
   [[ "$include_dependabot" -eq 1 ]] && legend_text+='   (dimmed = Dependabot)'
   legend="$(gum style --foreground 240 "$legend_text")"
 
@@ -333,27 +474,65 @@ fi
 spawn_in_herdr() {
   local cmd="$1" label="$2"
   local out pane
-  # tab create prints JSON; the new pane's id is at .result.root_pane.pane_id.
-  out="$(herdr tab create --no-focus --label "$label" 2>&1)"
-  pane="$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)"
+  # tab create prints JSON on stdout; the new pane's id is at
+  # .result.root_pane.pane_id. Two things this must not do: merge stderr into
+  # $out (herdr noise would corrupt the JSON and fail the jq parse below), or
+  # leave a failing command unreported. The spawn loop calls this function with
+  # `||`, which switches errexit off for this entire body -- nothing in here
+  # fails loudly on its own, so every step is checked explicitly.
+  #
+  # --workspace pins the tab to the workspace we renamed; without it herdr may
+  # place tabs in whichever workspace the UI happens to have focused.
+  if ! out="$(herdr tab create ${HERDR_WORKSPACE_ID:+--workspace "$HERDR_WORKSPACE_ID"} \
+                --no-focus --label "$label")"; then
+    echo "error: herdr tab create failed for '$label' (see herdr output above)" >&2
+    return 1
+  fi
+  pane="$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null || true)"
   if [[ -z "$pane" ]]; then
     echo "error: could not parse herdr pane id from output: $out" >&2
     return 1
   fi
-  herdr pane run "$pane" "$cmd"
+  # Guarded for the same reason as the cmux path (errexit is off inside this
+  # body). Report the orphan explicitly: the tab exists and is labelled, so a
+  # bare "skipped" would understate what got left behind.
+  if ! herdr pane run "$pane" "$cmd" >/dev/null; then
+    echo "error: herdr pane run failed for '$label'; tab was created but is empty" >&2
+    return 1
+  fi
 }
 
 spawn_in_cmux() {
-  local cmd="$1"
+  local cmd="$1" label="$2"
   local out surface
-  out="$(cmux new-surface)"
-  surface="$(printf '%s' "$out" | grep -oE 'surface:[0-9]+' | head -1)"
+  # Guarded for the same reason as the herdr path: errexit is off inside this
+  # body, so a failing `cmux new-surface` would otherwise fall through to the
+  # parse below and report a confusing "could not parse" instead of the truth.
+  if ! out="$(cmux new-surface)"; then
+    echo "error: cmux new-surface failed for '$label' (see cmux output above)" >&2
+    return 1
+  fi
+  surface="$(printf '%s' "$out" | grep -oE 'surface:[0-9]+' | head -1 || true)"
   if [[ -z "$surface" ]]; then
     echo "error: could not parse cmux surface from output: $out" >&2
     return 1
   fi
-  cmux send --surface "$surface" "$cmd"
-  cmux send-key --surface "$surface" Return
+  # Best-effort, like the workspace rename: a naming failure must not abort the
+  # fan-out. Renaming before the command runs means the tab is labelled from the
+  # first frame rather than flashing an untitled tab.
+  cmux rename-tab --surface "$surface" "$label" >/dev/null 2>&1 || true
+  # Guard each command explicitly. The spawn loop calls this function with `||`,
+  # which disables errexit for the entire body -- so a bare `cmux send` failure
+  # would be masked by the send-key after it, and an empty tab would be reported
+  # as a successful spawn.
+  if ! cmux send --surface "$surface" "$cmd"; then
+    echo "error: cmux send failed for '$label'" >&2
+    return 1
+  fi
+  if ! cmux send-key --surface "$surface" Return; then
+    echo "error: cmux send-key failed for '$label'" >&2
+    return 1
+  fi
 }
 
 spawn_in_ghostty() {
@@ -373,11 +552,54 @@ spawn_in_ghostty() {
     -- "$cmd" >/dev/null
 }
 
+# The built-in claude invocation for one PR: which session flag to use, and the
+# prompt that goes with it. Resuming and reviewing from scratch are different
+# jobs, so they get different prompts -- a resumed session already holds the
+# earlier review, which is exactly what recheck-pr needs and what a fresh
+# panel-review would throw away.
+#   $2 is the session flag ("--session-id UUID", "--resume UUID", or empty),
+#   $3 is 1 when that flag resumes an existing session.
+builtin_invocation() {
+  local n="$1" session_flag="$2" resume="$3" prompt
+  if [[ "$auto" -eq 1 || "$babysit" -eq 1 ]]; then
+    # Unattended: always the pr-review-tab skill, so the tab still self-closes
+    # on approval and still loops under --babysit. --recheck tells it to pick up
+    # the review in the resumed session instead of running a fresh auto-review.
+    prompt="pr-review-tab $n"
+    [[ "$resume"  -eq 1 ]] && prompt+=" --recheck"
+    [[ "$babysit" -eq 1 ]] && prompt+=" --babysit $babysit_interval"
+  elif [[ "$resume" -eq 1 ]]; then
+    prompt="recheck-pr $n"
+  else
+    prompt="panel review $n"
+  fi
+  printf 'claude --dangerously-skip-permissions %s"%s"' \
+    "${session_flag:+$session_flag }" "$prompt"
+}
+
+# Name each tab for its PR and what that tab is actually doing, e.g.
+# "PR 27 Review" / "PR 27 Babysit". Babysit wins over auto when both are set:
+# it is the more specific behavior (re-check on an interval until approvable).
+# Under herdr/cmux this name is sticky -- it survives the title escapes the
+# review command emits as it runs, which would otherwise overwrite it with a
+# generic agent-generated summary.
+tab_label() {
+  local n="$1" resume="$2"
+  if   [[ "$babysit" -eq 1 ]]; then printf 'PR %s Babysit'     "$n"
+  elif [[ "$resume"  -eq 1 ]]; then printf 'PR %s Recheck'     "$n"
+  elif [[ "$auto"    -eq 1 ]]; then printf 'PR %s Auto-Review' "$n"
+  else                              printf 'PR %s Review'      "$n"
+  fi
+}
+
 # Rename the enclosing workspace so review sessions stand out in the tab/session
 # switcher. Best-effort: a rename failure must never abort the fan-out, and
 # Ghostty has no workspace concept, so it is skipped.
 rename_workspace() {
-  local label="${REVIEW_PRS_WORKSPACE:-pr reviews}"
+  # `-` not `:-`: an explicitly empty REVIEW_PRS_WORKSPACE= opts out entirely,
+  # leaving the workspace you launched from with the title you gave it.
+  local label="${REVIEW_PRS_WORKSPACE-pr reviews}"
+  [[ -n "$label" ]] || return 0
   case "$spawner" in
     herdr)
       [[ -n "${HERDR_WORKSPACE_ID:-}" ]] || return 0
@@ -408,17 +630,88 @@ fi
 
 rename_workspace
 
+spawn_failures=0
+
 for n in "${numbers[@]}"; do
-  echo "spawning tab for PR #$n via $spawner"
-  if [[ "$review_cmd" == *"{}"* ]]; then
-    invocation="${review_cmd//\{\}/$n}"
-  else
-    invocation="$review_cmd $n"
+  # Decide this PR's session before anything else: the flag, the prompt and the
+  # tab label all follow from it.
+  sid="$(pr_session_id "$n")"
+  resume=0
+  session_flag=""
+  if session_exists "$sid"; then
+    # An earlier session exists. --continue reopens it; without --continue we
+    # pass no session flag at all and let claude allocate a fresh id, which
+    # keeps the default behavior unchanged -- reusing a taken id is a hard
+    # error, and quietly resuming would be a surprise.
+    #
+    # Refuse to resume a session another tab still holds. Claude Code treats an
+    # id as taken once the transcript file exists, so it does not stop a second
+    # process from reopening a live one -- two agents would then write one
+    # transcript. A babysit tab is long-lived by design, which makes this easy
+    # to hit. pgrep matches the id in the spawned command line; a false match
+    # only costs you a fresh review, so it fails safe.
+    if [[ "$continue_sessions" -eq 1 ]]; then
+      if pgrep -f -- "$sid" >/dev/null 2>&1; then
+        printf 'note: PR #%s has a review session open in another tab; reviewing fresh\n' "$n" >&2
+      else
+        resume=1
+        session_flag="--resume $sid"
+      fi
+    fi
+  elif [[ -n "$sid" ]]; then
+    session_flag="--session-id $sid"
   fi
-  cmd="cd $(printf '%q' "$repo_root") && $invocation"
+
+  if [[ "$resume" -eq 1 ]]; then
+    echo "spawning tab for PR #$n via $spawner (resuming earlier review)"
+  else
+    echo "spawning tab for PR #$n via $spawner"
+  fi
+
+  # Environment handed to an overridden command, as a statement that runs before
+  # the `cd` rather than a prefix on it. Two things this shape gets right that an
+  # assignment prefix does not: an override may be a compound command -- the help
+  # text documents `gh pr checkout {} && my-review {}` -- and a prefix reaches
+  # only the first command of it; and putting the `export` ahead of the `cd`
+  # keeps the `cd ... &&` guard covering the override itself, so a failed cd
+  # still stops the review from running in the wrong directory.
+  env_prefix=""
+  if [[ -n "$review_cmd" ]]; then
+    if [[ "$review_cmd" == *"{}"* ]]; then
+      invocation="${review_cmd//\{\}/$n}"
+    else
+      invocation="$review_cmd $n"
+    fi
+    # An overridden command owns its own session handling, so hand it the id and
+    # let it decide. These have to ride in the command string: the tab is a new
+    # shell spawned by the terminal, not a child of this process, so exporting
+    # them here would never reach it.
+    env_prefix="export REVIEW_PRS_SESSION_ID=$(printf '%q' "$sid") REVIEW_PRS_SESSION_RESUME=$resume; "
+  else
+    invocation="$(builtin_invocation "$n" "$session_flag" "$resume")"
+  fi
+
+  cmd="${env_prefix}cd $(printf '%q' "$repo_root") && $invocation"
+  label="$(tab_label "$n" "$resume")"
+  # A tab that fails to spawn must not take the rest of the sweep with it: warn
+  # and keep going, so one bad tab costs you one review, not all of them. The
+  # count is what the exit status reports -- see below.
+  spawned=0
   case "$spawner" in
-    herdr)   spawn_in_herdr   "$cmd" "review #$n" ;;
-    cmux)    spawn_in_cmux    "$cmd" ;;
-    ghostty) spawn_in_ghostty "$cmd"; sleep 0.3 ;;
+    herdr)   spawn_in_herdr   "$cmd" "$label" && spawned=1 ;;
+    cmux)    spawn_in_cmux    "$cmd" "$label" && spawned=1 ;;
+    ghostty) spawn_in_ghostty "$cmd"          && spawned=1; sleep 0.3 ;;
   esac
+  if [[ "$spawned" -eq 0 ]]; then
+    echo "warning: skipped PR #$n" >&2
+    spawn_failures=$((spawn_failures + 1))
+  fi
 done
+
+# Exit nonzero when any tab failed. A sweep that spawned nothing must not look
+# like a successful one to whatever ran it -- `review-prs --auto` in a script or
+# a cron job would otherwise report success having started no reviews.
+if [[ "$spawn_failures" -gt 0 ]]; then
+  printf 'error: %d of %d tab(s) failed to spawn\n' "$spawn_failures" "${#numbers[@]}" >&2
+  exit 1
+fi
