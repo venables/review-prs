@@ -95,7 +95,8 @@ setup_sandbox() {
         AUTOREVIEW_MAX_BUDGET_USD AUTOREVIEW_LOG_DIR \
         AUTOREVIEW_BABYSIT_INTERVAL || true
   unset FAKE_CLAUDE_FAIL FAKE_CLAUDE_IS_ERROR FAKE_CLAUDE_SLEEP \
-        FAKE_CLAUDE_GARBAGE FAKE_GH_APPROVED FAKE_GH_CLOSED || true
+        FAKE_CLAUDE_GARBAGE FAKE_CLAUDE_KILL_JOB \
+        FAKE_GH_APPROVED FAKE_GH_CLOSED || true
   # Leave the workspace title alone; the fake cmux ignores it either way.
   export REVIEW_PRS_WORKSPACE=""
 
@@ -333,6 +334,15 @@ fi
 
 printf 'end %s\n' "$n" >>"$CLAUDE_LOG.events"
 
+# Take the job subshell down with no status written -- what an OOM kill or a
+# stray pkill does to a running review. The parent here is the job itself.
+case " ${FAKE_CLAUDE_KILL_JOB:-} " in
+  *" $n "*)
+    kill -9 "$PPID" 2>/dev/null || true
+    sleep 5
+    ;;
+esac
+
 # A turn that dies mid-write, or an error printed as prose: asked for JSON and
 # given something else, with a zero exit.
 case " ${FAKE_CLAUDE_GARBAGE:-} " in
@@ -481,7 +491,11 @@ run_autoreview_watching() {
   ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" "$@" >"$out" 2>&1 ) &
   pid=$!
   while [[ "$waited" -lt "$((limit * 10))" ]]; do
-    seen="$(grep -cF -- "$needle" "$watch" 2>/dev/null || printf '0')"
+    # `grep -c` prints its count and still exits nonzero when that count is
+    # zero, so a `|| printf 0` fallback would append a second line and make the
+    # comparison below a syntax error rather than a false.
+    seen="$(grep -cF -- "$needle" "$watch" 2>/dev/null || true)"
+    [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
     if [[ "$seen" -ge "$want" ]]; then break; fi
     if ! kill -0 "$pid" 2>/dev/null; then break; fi
     sleep 0.1

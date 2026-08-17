@@ -276,6 +276,18 @@ if [[ -t 1 ]]; then tty=1; poll_interval=0.2; fi
 
 job_file() { printf '%s/pr-%s.%s' "$pass_dir" "${q_pr[$1]}" "$2"; }
 
+# True when a job is no longer running. `kill -0` alone cannot tell: a finished
+# child keeps answering it until this shell reaps it, and nothing reaps it until
+# finish_job waits -- which is what this decides. A dead-but-unreaped child is a
+# zombie, so ask for the process state as well.
+job_vanished() {
+  local pid="$1" state
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 0
+  state="$(ps -o state= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [[ "$state" == Z* ]]
+}
+
 fmt_dur() {
   local s="$1"
   if   [[ "$s" -ge 3600 ]]; then printf '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60))
@@ -392,12 +404,24 @@ start_job() {
     fresh=1
   fi
   if [[ "$prior_busy" -eq 1 || "$fresh" -eq 1 ]]; then
-    # Deliberately not falling back to the derived id. Where a recorded id
-    # exists at all it is this run's own review, and the derived one names
-    # something older -- resuming that is the stale re-check the recording
-    # exists to prevent. A fresh review is the honest answer.
-    q_sid[i]=""
-    q_flag[i]=""
+    # Deliberately not resuming. Where a recorded id exists at all it is this
+    # run's own review, and the derived one names something older -- resuming
+    # that is the stale re-check the recording exists to prevent.
+    #
+    # Pinning is a different question from resuming, though: a PR whose derived
+    # session does not exist yet still gets that id, so this review is reachable
+    # afterwards and an override still receives the id it is promised. Only
+    # where a transcript already exists is the id withheld, because pinning a
+    # taken id is a hard error.
+    local derived
+    derived="$(pr_session_id "${q_pr[i]}")"
+    if [[ -n "$derived" ]] && ! session_exists "$derived"; then
+      q_sid[i]="$derived"
+      q_flag[i]="--session-id $derived"
+    else
+      q_sid[i]=""
+      q_flag[i]=""
+    fi
     q_resume[i]=0
   elif [[ -n "$prior" ]]; then
     q_sid[i]="$prior"
@@ -601,6 +625,16 @@ flush_notes() {
 
 # Without a TTY -- a cron run, or output piped to a log -- there is no cursor to
 # move, so the in-place block is replaced by one line per state change.
+# How a failed job failed, in the words the reader needs: an exit status when
+# there was one, and otherwise the fact that the job left no result at all.
+job_outcome() {
+  if [[ "${q_status[$1]}" == "vanished" ]]; then
+    printf 'no result'
+  else
+    printf 'exit %s' "${q_status[$1]}"
+  fi
+}
+
 note_transition() {
   if [[ "$tty" -eq 1 ]]; then return 0; fi
   local i="$1" n="${q_pr[$1]}"
@@ -610,7 +644,7 @@ note_transition() {
   case "${q_state[i]}" in
     running) printf 'start   #%s\n' "$n" ;;
     done)    printf 'done    #%s (%s)\n' "$n" "$(fmt_dur $((q_end[i] - q_start[i])))" ;;
-    failed)  printf 'FAILED  #%s (exit %s, %s)\n' "$n" "${q_status[i]}" \
+    failed)  printf 'FAILED  #%s (%s, %s)\n' "$n" "$(job_outcome "$i")" \
                "$(fmt_dur $((q_end[i] - q_start[i])))" ;;
     timeout) printf 'TIMEOUT #%s (%s)\n' "$n" "$(fmt_dur $((q_end[i] - q_start[i])))" ;;
   esac
@@ -682,7 +716,7 @@ render() {
         mark="+"; label="done"
         elapsed="$(fmt_dur $((q_end[i] - q_start[i])))" ;;
       failed)
-        mark="x"; label="failed (exit ${q_status[i]})"
+        mark="x"; label="failed ($(job_outcome "$i"))"
         elapsed="$(fmt_dur $((q_end[i] - q_start[i])))" ;;
       timeout)
         mark="x"; label="timed out"
@@ -735,6 +769,12 @@ run_pass() {
       if [[ -f "$status_file" ]]; then
         finish_job "$i" "$now" "$(cat "$status_file")"
         running=$((running - 1))
+      elif job_vanished "${q_pid[i]}" && [[ ! -f "$status_file" ]]; then
+        # The job is gone but left no status: killed from outside, or it could
+        # not write. Without this the slot is held until --timeout, and
+        # --timeout 0 means the pass never ends at all.
+        finish_job "$i" "$now" "vanished"
+        running=$((running - 1))
       elif [[ "$timeout" -gt 0 && $((now - q_start[i])) -ge "$timeout" ]]; then
         stop_job "${q_pid[i]}"
         finish_job "$i" "$now" "timeout"
@@ -775,7 +815,7 @@ print_summary() {
     case "${q_state[i]}" in
       done)    result="done" ;;
       timeout) result="timed out" ;;
-      failed)  result="failed (exit ${q_status[i]})" ;;
+      failed)  result="failed ($(job_outcome "$i"))" ;;
       *)       result="${q_state[i]}" ;;
     esac
     rows+="#${q_pr[i]}"$'\t'"$result"$'\t'
@@ -834,6 +874,12 @@ on_signal() {
   printf '\n'
   echo "interrupted; stopping running reviews" >&2
   stop_running_jobs
+  # Interrupting is how a babysit loop is meant to end, and the reviews that
+  # already finished are still worth reopening -- so hand back their session
+  # ids rather than dropping them on the way out.
+  if [[ "${#q_pr[@]}" -gt 0 ]]; then
+    print_summary
+  fi
   show_cursor
   exit 130
 }

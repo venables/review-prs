@@ -108,6 +108,15 @@ sleep 0.5
 survivors="$(pgrep -f "$FAKE_SLEEP_TAG" 2>/dev/null | wc -l | tr -d ' ' || true)"
 assert_equals "...and leaves nothing behind either" "$survivors" "0"
 
+# A job killed from outside leaves no status behind, and the slot it holds must
+# not be held until the timeout -- with --timeout 0 that would be forever, which
+# is why this one runs with no timeout at all and is bounded by the helper.
+out="$(FAKE_CLAUDE_KILL_JOB="9" \
+  run_autoreview_until "reopen any review" 30 --auto --jobs 2 --timeout 0)"
+assert_contains "a job that dies without a status is reported" "$out" "FAILED  #9"
+assert_contains "...as having produced nothing" "$out" "no result"
+assert_contains "...and the pass still ends" "$out" "reopen any review"
+
 # --- Logs -----------------------------------------------------------------
 # Each run keeps its output under a directory of its own, so two runs sharing a
 # --log-dir cannot read each other's results.
