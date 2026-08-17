@@ -129,8 +129,10 @@ require_int() {
   fi
 }
 
-# A flag written as "--flag value" needs its value to exist; "--flag=value" is
-# unpacked by the caller before we get here.
+# Both spellings of a flag need a value: "--flag value" is checked before the
+# shift, "--flag=value" after unpacking. A bare "--budget=" would otherwise pass
+# silently for an empty cap and leave an unattended sweep spending uncapped,
+# while the same typo written "--budget ''" is refused -- one of them is wrong.
 require_value() {
   if [[ -z "${2:-}" ]]; then
     printf 'error: %s expects a value\n' "$1" >&2
@@ -150,13 +152,17 @@ while [[ $# -gt 0 ]]; do
     --babysit=*)     babysit=1; babysit_interval_raw="${1#*=}"; shift ;;
     --continue|-C)   continue_sessions=1; shift ;;
     --jobs|-j)       require_value "$1" "${2:-}"; jobs_max="$2"; shift 2 ;;
-    --jobs=*|-j=*)   jobs_max="${1#*=}"; shift ;;
+    --jobs=*|-j=*)   jobs_max="${1#*=}"
+                     require_value "--jobs" "$jobs_max"; shift ;;
     --timeout)       require_value "$1" "${2:-}"; timeout="$2"; shift 2 ;;
-    --timeout=*)     timeout="${1#*=}"; shift ;;
+    --timeout=*)     timeout="${1#*=}"
+                     require_value "--timeout" "$timeout"; shift ;;
     --budget)        require_value "$1" "${2:-}"; max_budget="$2"; shift 2 ;;
-    --budget=*)      max_budget="${1#*=}"; shift ;;
+    --budget=*)      max_budget="${1#*=}"
+                     require_value "--budget" "$max_budget"; shift ;;
     --log-dir)       require_value "$1" "${2:-}"; log_dir="$2"; shift 2 ;;
-    --log-dir=*)     log_dir="${1#*=}"; shift ;;
+    --log-dir=*)     log_dir="${1#*=}"
+                     require_value "--log-dir" "$log_dir"; shift ;;
     --all|-a)        include_approved=1; shift ;;
     --dependabot|-d) include_dependabot=1; shift ;;
     --help|-h)       print_help; exit 0 ;;
@@ -215,7 +221,14 @@ select_prs
 if [[ -z "$log_dir" ]]; then
   log_dir="$(mktemp -d "${TMPDIR:-/tmp}/autoreview.XXXXXX")"
 fi
-mkdir -p "$log_dir"
+# Everything this run writes goes under a directory of its own. A --log-dir is
+# a fixed path -- the point of passing one -- and the cron use this tool is for
+# makes overlapping runs ordinary, with the default hour-long timeout longer
+# than most intervals. Sharing the pass directory would have each run reading
+# the other's status files and reporting its results as though they were its
+# own, which would corrupt the exit status the tool exists to provide.
+run_dir="$log_dir/run-$$"
+mkdir -p "$run_dir"
 
 # --- Job pool -------------------------------------------------------------
 # Bash 3.2 -- still what macOS ships -- has no `wait -n`, and `kill -0` on a
@@ -322,11 +335,19 @@ run_job() {
 # PR number alone, so where a session already existed before the run, pass 1
 # left it untouched and reviewed under an id claude allocated -- and pass 2
 # would otherwise resume the older session and re-check findings nobody wrote.
+#
+# It sits in $log_dir rather than the per-run directory on purpose: it is a
+# fact about this checkout's PRs, not about one process, and two runs sharing a
+# log dir agreeing on which session a PR was reviewed in is right. Resuming a
+# live one is refused separately, in start_job.
 run_session_file() { printf '%s/session-%s.id' "$log_dir" "$1"; }
 
 start_job() {
-  local i="$1" prior=""
-  if [[ -f "$(run_session_file "${q_pr[i]}")" ]]; then
+  local i="$1" prior="" prior_busy=0
+  # Only consulted when resuming is on the table at all: without --continue this
+  # branch cannot be taken, and checking anyway would print a note about a
+  # session the run was never going to touch.
+  if [[ "$continue_sessions" -eq 1 && -f "$(run_session_file "${q_pr[i]}")" ]]; then
     prior="$(cat "$(run_session_file "${q_pr[i]}")")"
   fi
   # Same guard plan_session applies to a derived id: a session another process
@@ -336,8 +357,17 @@ start_job() {
   if [[ -n "$prior" ]] && session_in_use "$prior"; then
     queue_note "note: PR #${q_pr[i]} has its review session open elsewhere; reviewing fresh"
     prior=""
+    prior_busy=1
   fi
-  if [[ -n "$prior" && "$continue_sessions" -eq 1 ]]; then
+  if [[ "$prior_busy" -eq 1 ]]; then
+    # Deliberately not falling back to the derived id. Where a recorded id
+    # exists at all it is this run's own review, and the derived one names
+    # something older -- resuming that is the stale re-check the recording
+    # exists to prevent. A fresh review is the honest answer.
+    q_sid[i]=""
+    q_flag[i]=""
+    q_resume[i]=0
+  elif [[ -n "$prior" ]]; then
     q_sid[i]="$prior"
     q_flag[i]="--resume $prior"
     q_resume[i]=1
@@ -404,9 +434,12 @@ finish_job() {
   if [[ -n "$sid" ]]; then
     q_sid[i]="$sid"
     printf '%s' "$sid" >"$(run_session_file "${q_pr[i]}")"
-  elif [[ -z "${q_flag[i]}" ]]; then
-    # No envelope to read and no flag was sent, so nothing here knows which
-    # session the review landed in. Saying so beats naming the wrong one.
+  elif [[ -z "${q_flag[i]}" || -n "$review_cmd" ]]; then
+    # Nothing here knows which session this review landed in: either no flag was
+    # sent, or an override ran and owns its own session handling -- it was
+    # offered an id, and whether it used it is its business. The summary says to
+    # reopen the review with what this column holds, so an id nobody can promise
+    # exists does not belong in it.
     q_sid[i]=""
   fi
   if [[ "$raw" == "timeout" ]]; then
@@ -503,13 +536,16 @@ flush_notes() {
 # move, so the in-place block is replaced by one line per state change.
 note_transition() {
   if [[ "$tty" -eq 1 ]]; then return 0; fi
-  local i="$1" n="${q_pr[$1]}" took
-  took="$(fmt_dur $((q_end[i] - q_start[i])))"
+  local i="$1" n="${q_pr[$1]}"
+  # The duration is computed per branch, not up front: on the "running"
+  # transition there is no end time yet, and subtracting from zero would make a
+  # nonsense number that today is only unprinted by luck.
   case "${q_state[i]}" in
     running) printf 'start   #%s\n' "$n" ;;
-    done)    printf 'done    #%s (%s)\n' "$n" "$took" ;;
-    failed)  printf 'FAILED  #%s (exit %s, %s)\n' "$n" "${q_status[i]}" "$took" ;;
-    timeout) printf 'TIMEOUT #%s (%s)\n' "$n" "$took" ;;
+    done)    printf 'done    #%s (%s)\n' "$n" "$(fmt_dur $((q_end[i] - q_start[i])))" ;;
+    failed)  printf 'FAILED  #%s (exit %s, %s)\n' "$n" "${q_status[i]}" \
+               "$(fmt_dur $((q_end[i] - q_start[i])))" ;;
+    timeout) printf 'TIMEOUT #%s (%s)\n' "$n" "$(fmt_dur $((q_end[i] - q_start[i])))" ;;
   esac
 }
 
@@ -558,7 +594,11 @@ render() {
   fi
   shown=0
   if [[ "$rendered_lines" -gt 0 ]]; then
-    printf '\033[%dA' "$rendered_lines"
+    # Up, then erase everything below: the block can be one line shorter than
+    # last time -- the "N more waiting" line disappears as the window reaches
+    # the end of the queue -- and clearing only the rows we rewrite would leave
+    # the last one standing for the rest of the pass.
+    printf '\033[%dA\033[J' "$rendered_lines"
   fi
   if [[ "$start" -gt 0 ]]; then
     printf '\033[2K  ... %d finished, scrolled off (all of them are in the summary)\n' "$start"
@@ -596,7 +636,7 @@ render() {
 
 run_pass() {
   local pass="$1"; shift
-  pass_dir="$log_dir/pass-$pass"
+  pass_dir="$run_dir/pass-$pass"
   mkdir -p "$pass_dir"
 
   q_pr=("$@")

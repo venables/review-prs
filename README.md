@@ -291,8 +291,10 @@ resume it.
 
 ### Logs
 
-Each pass writes to `$log_dir/pass-N/`, printed at the start of every run and
-again in the summary:
+Each pass writes to `$log_dir/run-<pid>/pass-N/`, printed at the start of every
+run and again in the summary. The per-run directory is what lets two runs share
+a `--log-dir` — ordinary under cron, where the default hour-long timeout outlasts
+most intervals — without reading each other's results:
 
 - `pr-N.json` — claude's result envelope (the review text is in `.result`)
 - `pr-N.log` — stderr, which is where a failure explains itself

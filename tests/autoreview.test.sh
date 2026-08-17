@@ -101,14 +101,27 @@ survivors="$(pgrep -f "$FAKE_SLEEP_TAG" 2>/dev/null | wc -l | tr -d ' ' || true)
 assert_equals "...and leaves nothing behind either" "$survivors" "0"
 
 # --- Logs -----------------------------------------------------------------
+# Each run keeps its output under a directory of its own, so two runs sharing a
+# --log-dir cannot read each other's results.
 run_autoreview --auto >/dev/null
-if [[ -s "$SANDBOX/out/logs/pass-1/pr-9.json" ]]; then
+envelope="$(echo "$SANDBOX"/out/logs/run-*/pass-1/pr-9.json)"
+if [[ -s "$envelope" ]]; then
   ok "each review's envelope is kept"
 else
-  not_ok "each review's envelope is kept" "no pr-9.json under pass-1"
+  not_ok "each review's envelope is kept" "no pr-9.json under a run dir"
 fi
 assert_contains "the envelope is what claude printed" \
-  "$(cat "$SANDBOX/out/logs/pass-1/pr-9.json")" '"result":"reviewed 9"'
+  "$(cat "$envelope" 2>/dev/null)" '"result":"reviewed 9"'
+
+runs_before="$(echo "$SANDBOX"/out/logs/run-* | wc -w | tr -d ' ')"
+( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto >/dev/null 2>&1 )
+runs_after="$(echo "$SANDBOX"/out/logs/run-* | wc -w | tr -d ' ')"
+if [[ "$runs_after" -gt "$runs_before" ]]; then
+  ok "a second run against the same log dir gets its own directory"
+else
+  not_ok "a second run against the same log dir gets its own directory" \
+    "still $runs_after run dir(s)"
+fi
 
 # --- Budget ---------------------------------------------------------------
 run_autoreview --auto --budget 2.50 >/dev/null
@@ -160,29 +173,35 @@ rm -f "$SANDBOX/bin/column"
 
 # A reviewer that reports in prose leaves no session id to read back, which must
 # not be mistaken for a failure: every review here succeeded.
+run_autoreview --auto >/dev/null
+sid8="$(session_id_from "$(claude_call_for '/auto-review 8')")"
 out="$(AUTOREVIEW_AUTO_CMD='text-review' run_autoreview --auto)"
 assert_equals "a non-JSON reviewer still exits 0" "$(last_status)" "0"
 assert_contains "a non-JSON reviewer still gets a summary" "$out" "RESULT"
 assert_contains "...naming each PR" "$out" "#9"
-assert_contains "...with no session to offer" "$out" "-"
+# An override owns its own session handling: it was offered an id and may have
+# ignored it, so the summary must not tell you to reopen one.
+assert_not_contains "...offering no session it cannot vouch for" "$out" "$sid8"
+assert_not_contains "...nor the derived one" "$out" "$sid9"
 
 # --- Babysit sessions -----------------------------------------------------
 # A later pass resumes the session the earlier pass actually ran in, recorded
 # under the log dir. Resuming the derived id instead would re-check a review
 # nobody wrote.
 run_autoreview --auto >/dev/null
+recorded="$(sandbox_uuid recorded)"
 mkdir -p "$SANDBOX/out/logs"
-printf 'aaaaaaaa-bbbb-5ccc-addd-eeeeeeeeeeee' >"$SANDBOX/out/logs/session-9.id"
+printf '%s' "$recorded" >"$SANDBOX/out/logs/session-9.id"
 reset_spawn_log
 ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto --continue >/dev/null 2>&1 )
 assert_contains "a later pass resumes the session the earlier pass used" \
-  "$(claude_call_for '/recheck-pr 9')" "--resume aaaaaaaa-bbbb-5ccc-addd-eeeeeeeeeeee"
+  "$(claude_call_for '/recheck-pr 9')" "--resume $recorded"
 
 # A recorded session another process still holds is not resumed either: two
 # agents writing one transcript is the thing the guard exists to prevent, and a
 # babysit interval is exactly when someone has `claude --resume` open.
 run_autoreview --auto >/dev/null
-held="bbbbbbbb-cccc-5ddd-aeee-ffffffffffff"
+held="$(sandbox_uuid held)"
 printf '%s' "$held" >"$SANDBOX/out/logs/session-9.id"
 bash -c 'sleep 10; :' "holder-$held" &
 holder=$!
@@ -193,10 +212,18 @@ kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 assert_contains "a held session is reported, not resumed" "$out" "open elsewhere"
 assert_not_contains "a held session is not resumed" "$(claude_calls)" "--resume $held"
-# Refusing the recorded id hands the PR back to the ordinary rules, which here
-# resume its own derived session.
-assert_contains "...and the PR falls back to the derived session" \
-  "$(claude_call_for '/recheck-pr 9')" "--resume $sid9"
+# And not quietly swapped for the derived id either: where a recorded id exists
+# it is this run's own review, so the derived one names something older.
+assert_not_contains "...nor swapped for the older derived session" \
+  "$(claude_calls)" "--resume $sid9"
+assert_contains "...the PR is reviewed fresh instead" "$(claude_calls)" "/auto-review 9"
+
+# Without -C there is nothing to resume, so a recorded id is not even consulted
+# -- and no note about it is printed.
+printf '%s' "$held" >"$SANDBOX/out/logs/session-9.id"
+out="$( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto 2>&1 )"
+assert_not_contains "a plain run says nothing about a session it would not resume" \
+  "$out" "open elsewhere"
 
 # PR #8 has no session, so its review pins one -- and that is the id recorded.
 run_autoreview --auto >/dev/null
@@ -215,6 +242,15 @@ assert_equals "a non-numeric --jobs exits nonzero" "$(last_status)" "1"
 out="$(run_autoreview --auto --budget lots)"
 assert_equals "a non-numeric --budget exits nonzero" "$(last_status)" "1"
 assert_contains "a non-numeric --budget says why" "$out" "expects a dollar amount"
+
+# An empty "=" value is the same typo as an empty separate value, and an
+# unattended sweep must not run uncapped because of which one you typed.
+out="$(run_autoreview --auto --budget=)"
+assert_equals "an empty --budget= exits nonzero" "$(last_status)" "1"
+assert_contains "an empty --budget= says why" "$out" "expects a value"
+
+out="$(run_autoreview --auto --log-dir=)"
+assert_equals "an empty --log-dir= exits nonzero" "$(last_status)" "1"
 
 out="$(run_autoreview --auto --timeout)"
 assert_equals "a flag with no value exits nonzero" "$(last_status)" "1"
