@@ -4,8 +4,15 @@ Pick open GitHub PRs from a multi-select list and fan each one out into its own
 terminal tab running a review command per PR. Built for batch-reviewing a repo's
 open pull requests without manually opening tabs and typing commands.
 
+Two entry points, same PR list:
+
+| Command                     | Runs each review in            | Use when                                                                |
+| --------------------------- | ------------------------------ | ----------------------------------------------------------------------- |
+| `review-prs`                | a terminal tab you can steer   | you want to watch a review happen and interrupt it                      |
+| [`autoreview`](#autoreview) | a headless `claude -p` process | there is no terminal (ssh, cron, CI), or a dozen PRs means a dozen tabs |
+
 Pairs nicely with the [`panel-review`](https://github.com/catena-labs/dev-skills)
-skill, which is the default review command each tab runs.
+skill, which is the default review command both run.
 
 ## What it does
 
@@ -16,12 +23,16 @@ skill, which is the default review command each tab runs.
 4. Opens a new terminal tab per selection, `cd`s to the repo root, and runs the
    review command (see [Review command](#review-command)) for each PR.
 
+Steps 1-3 are shared with [`autoreview`](#autoreview), which replaces step 4
+with a headless subprocess per PR.
+
 ## Requirements
 
 - [`gh`](https://cli.github.com) — authenticated (`gh auth login`)
-- [`gum`](https://github.com/charmbracelet/gum) — the interactive picker
+- [`gum`](https://github.com/charmbracelet/gum) — the interactive picker.
+  `autoreview --auto` never picks, so it does not need gum.
 - [`jq`](https://jqlang.github.io/jq/) — JSON processing
-- A supported terminal for spawning tabs:
+- A supported terminal for spawning tabs — **`review-prs` only**:
   - [Herdr](https://herdr.dev) (preferred; detected via `HERDR_ENV`, drives new
     tabs over its socket API via the `herdr` CLI), or
   - [cmux](https://cmux.io) (detected via `CMUX_SURFACE_ID`), or
@@ -41,7 +52,12 @@ brew install venabots/tap/review-prs
 ```sh
 git clone git@github.com:venabots/review-prs.git
 ln -s "$PWD/review-prs/review-prs" /usr/local/bin/review-prs
+ln -s "$PWD/review-prs/autoreview" /usr/local/bin/autoreview
 ```
+
+Symlinks are fine: both entry points resolve themselves through any links to
+find the shared `lib/` next to the real file. Do not copy a single script out of
+the checkout on its own — it will not find `lib/`.
 
 ## Usage
 
@@ -183,6 +199,123 @@ Dependabot PRs are hidden by default; pass `--dependabot` to include them, where
 they appear dimmed to mark them as lower-priority. (The bot match is a single
 anchored regex in the script — extend it as more AI coding bots show up.)
 
+## autoreview
+
+`autoreview` reviews the same PRs without tabs. Each one runs as a headless
+`claude -p` subprocess; the run shows live per-PR progress, prints a summary,
+and exits nonzero if any review failed.
+
+```sh
+autoreview                  # picker, then review each selection headlessly
+autoreview --auto           # review every NEW/UPDATED PR
+autoreview --auto --jobs 3  # ...three at a time (default 2)
+autoreview --continue       # resume earlier sessions for a second look
+autoreview --babysit=15     # re-run every 15 min until every PR is approved
+autoreview --help           # usage
+```
+
+It takes the same selection flags as `review-prs` (`--auto`, `--continue`,
+`--all`, `--dependabot`, `--babysit`) plus four of its own: `--jobs`,
+`--timeout`, `--budget` and `--log-dir`.
+
+```
+auto-reviewing 2 PR(s): #9 #8
+reviewing 2 PR(s), 2 at a time
+logs: /tmp/autoreview.k3Xq8p/pass-1
+
+  +  #9     done                           4m12s
+  /  #8     reviewing                      1m47s
+```
+
+and when it finishes:
+
+```
+PR  RESULT  TIME   COST   SESSION
+#9  done    4m12s  $0.51  cc10f740-28c3-58c6-ae64-d9ff37df22a7
+#8  done    6m03s  $0.88  fa5ced7b-32dd-578b-a3b9-d4d23195dce1
+
+logs: /tmp/autoreview.k3Xq8p/pass-1
+reopen any review with: claude --resume <SESSION>
+```
+
+### What you trade
+
+Losing the tab loses live steering, not access. Every review pins the same
+derived session id `review-prs` uses, so `claude --resume <id>` reopens any of
+them afterwards — which is why the summary prints them. Intervention becomes
+on-demand rather than up-front.
+
+What you gain:
+
+- **No terminal needed.** `review-prs` requires herdr, cmux or Ghostty and
+  refuses to run without one. This runs anywhere.
+- **An exit status that means something.** `review-prs` can only report whether
+  the _tabs opened_. This reports whether the _reviews succeeded_, so a cron job
+  or CI step can tell a finished sweep from a broken one. A review that exits
+  nonzero, that reports `is_error` inside a zero exit, or that overruns
+  `--timeout` all count as failures.
+- **Bounded concurrency.** Twelve PRs is twelve tabs under `review-prs`; here it
+  is `--jobs 2`. Keep that number low — a panel review is itself several agents,
+  so `--jobs 4` can mean a dozen concurrent processes.
+- **Per-PR accounting.** `--output-format json` gives cost and turns per PR, and
+  `--budget` caps each review's spend (`claude --max-budget-usd`).
+
+### Prompts
+
+Skills are invoked by slash name rather than in prose — an unattended one-shot
+has no human to correct a prompt that failed to trigger the skill.
+
+| Run                                                  | Prompt            |
+| ---------------------------------------------------- | ----------------- |
+| First review                                         | `/panel-review N` |
+| `--auto` / `--babysit`                               | `/auto-review N`  |
+| `--continue`, and every babysit pass after the first | `/recheck-pr N`   |
+
+There is no `pr-review-tab` here: that skill exists to close its own tab and to
+run an in-session `/loop`, and a headless process needs neither.
+
+### Babysit, headless
+
+`--babysit` re-runs the whole pass on an interval, dropping PRs as they become
+`APPROVED` and resuming the rest, until nothing is left. Approval is read back
+from GitHub rather than inferred from what the agent said — the review either
+landed as an approval or it did not.
+
+The loop is this script, not an in-session `/loop` inside a tab, so an interval
+that never converges is one process you can see and kill. Interrupting it stops
+the running reviews too, along with their children: an orphan keeps spending and
+keeps holding its session open, which would make the next `--continue` refuse to
+resume it.
+
+### Logs
+
+Each pass writes to `$log_dir/pass-N/`, printed at the start of every run and
+again in the summary:
+
+- `pr-N.json` — claude's result envelope (the review text is in `.result`)
+- `pr-N.log` — stderr, which is where a failure explains itself
+
+`--log-dir` pins the location; the default is a fresh temp directory per run.
+
+### Overrides
+
+`$AUTOREVIEW_CMD`, and `$AUTOREVIEW_AUTO_CMD` for `--auto`/`--babysit` runs,
+replace the built-in reviewer. Same substitution rules as `$REVIEW_PRS_CMD` —
+the PR number replaces the first `{}`, or is appended if there is no
+placeholder:
+
+```sh
+AUTOREVIEW_CMD='my-review' autoreview --auto
+AUTOREVIEW_CMD='gh pr checkout {} && my-review {}' autoreview
+```
+
+An override owns its own session handling and receives
+`$REVIEW_PRS_SESSION_ID` and `$REVIEW_PRS_SESSION_RESUME` — the same contract
+`review-prs` uses, so one wrapper works with both. Unlike `review-prs`, which
+can only reach a new tab through a command string, these arrive in the child's
+real environment. Cost is claude's own accounting, so the summary shows `-` for
+an overridden reviewer.
+
 ## Columns
 
 ```
@@ -260,14 +393,36 @@ spawn time would be overwritten by the review command within seconds.
 bash tests/run.sh
 ```
 
-The tests run the real script against fake `gh`, `gum`, and `cmux` binaries on
-`PATH`, inside a throwaway git repo, with `$CLAUDE_CONFIG_DIR` pointed at a
-throwaway session store. They never touch your repos, your Claude Code sessions,
-or GitHub. `tests/run.sh` also runs `bash -n` and `shellcheck`.
+### Layout
+
+```
+review-prs        entry point: the picker and the terminal-tab fan-out
+autoreview        entry point: the headless runner
+lib/repo.sh       dependency checks, repo and user context
+lib/pr-list.sh    the GraphQL query, ranking, the picker, PR selection
+lib/session.sh    derived session ids, and how a PR attaches to one
+lib/interval.sh   babysit-interval parsing
+```
+
+Both entry points source all four libraries, so what counts as an actionable PR
+and which session it belongs to is decided in exactly one place. Everything
+below the selection differs: `review-prs` spawns tabs, `autoreview` runs a job
+pool.
+
+### Tests
+
+The tests run the real scripts against fake `gh`, `gum`, `cmux` and `claude`
+binaries on `PATH`, inside a throwaway git repo, with `$CLAUDE_CONFIG_DIR`
+pointed at a throwaway session store. They never touch your repos, your Claude
+Code sessions, or GitHub. `tests/run.sh` also runs `bash -n` over every script
+and `shellcheck -x` over both entry points — `-x` so it follows the `source=`
+directives into `lib/`, which is the only context where a library's globals are
+defined.
 
 CI runs the same command on macOS and Linux — macOS because it ships bash 3.2
-and catches bashisms the script must not use, Linux because it has `md5sum`
-rather than `md5` and so exercises the other branch of the hash helper.
+and catches bashisms the scripts must not use (no `wait -n`, no associative
+arrays), Linux because it has `md5sum` rather than `md5` and so exercises the
+other branch of the hash helper.
 
 ## License
 
