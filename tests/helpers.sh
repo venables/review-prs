@@ -468,20 +468,21 @@ run_autoreview() {
   printf '%s' "$status" >"$SANDBOX/out/status"
 }
 
-# Run autoreview in the background and wait for $1 to appear in its output, up
-# to $2 seconds, then kill it. For the babysit loop, whose whole point is that
-# it does not exit -- the shortest interval it accepts is a minute, and no test
+# Run autoreview in the background, wait for $1 to appear in the file $3, up to
+# $2 seconds, then kill it. For the babysit loop, whose whole point is that it
+# does not exit -- the shortest interval it accepts is a minute, and no test
 # should wait one.
-run_autoreview_until() {
-  local needle="$1" limit="$2"; shift 2
-  local out="$SANDBOX/out/bg" waited=0 pid
+run_autoreview_watching() {
+  local needle="$1" limit="$2" watch="$3" want="$4"; shift 4
+  local out="$SANDBOX/out/bg" waited=0 pid seen
   reset_spawn_log
   rm -rf "$SANDBOX/out/logs"
   : >"$out"
   ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" "$@" >"$out" 2>&1 ) &
   pid=$!
   while [[ "$waited" -lt "$((limit * 10))" ]]; do
-    if grep -qF -- "$needle" "$out" 2>/dev/null; then break; fi
+    seen="$(grep -cF -- "$needle" "$watch" 2>/dev/null || printf '0')"
+    if [[ "$seen" -ge "$want" ]]; then break; fi
     if ! kill -0 "$pid" 2>/dev/null; then break; fi
     sleep 0.1
     waited=$((waited + 1))
@@ -490,6 +491,21 @@ run_autoreview_until() {
   kill "$pid" >/dev/null 2>&1 || true
   wait "$pid" 2>/dev/null || true
   cat "$out"
+}
+
+# Wait for something autoreview printed.
+run_autoreview_until() {
+  local needle="$1" limit="$2"; shift 2
+  run_autoreview_watching "$needle" "$limit" "$SANDBOX/out/bg" 1 "$@"
+}
+
+# Wait for the $3'th call autoreview made matching $1. A header is printed
+# before the work it announces, so waiting on one and then killing the run races
+# whatever it was about to do; the recorded call is the event itself. The count
+# is what makes a later pass distinguishable, since it repeats the same calls.
+run_autoreview_until_call() {
+  local needle="$1" limit="$2" want="${3:-1}"; shift 3
+  run_autoreview_watching "$needle" "$limit" "$CLAUDE_LOG" "$want" "$@"
 }
 
 # Create the session file that makes $1 look like an existing session.

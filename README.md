@@ -226,7 +226,7 @@ It takes the same selection flags as `review-prs` (`--auto`, `--continue`,
 ```
 auto-reviewing 2 PR(s): #9 #8
 reviewing 2 PR(s), 2 at a time
-logs: /tmp/autoreview.k3Xq8p/run-40127/pass-1
+logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 
   +  #9     done                           4m12s
   /  #8     reviewing                      1m47s
@@ -239,7 +239,7 @@ PR  RESULT  TIME   COST   SESSION
 #9  done    4m12s  $0.51  cc10f740-28c3-58c6-ae64-d9ff37df22a7
 #8  done    6m03s  $0.88  fa5ced7b-32dd-578b-a3b9-d4d23195dce1
 
-logs: /tmp/autoreview.k3Xq8p/run-40127/pass-1
+logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 reopen any review with: claude --resume <SESSION>
 ```
 
@@ -298,7 +298,7 @@ resume it.
 
 ### Logs
 
-Each pass writes to `$log_dir/run-<pid>/pass-N/`, printed at the start of every
+Each pass writes to `$log_dir/run-<random>/pass-N/`, printed at the start of every
 run and again in the summary. The per-run directory is what lets two runs share
 a `--log-dir` — ordinary under cron, where the default hour-long timeout outlasts
 most intervals — without reading each other's results:

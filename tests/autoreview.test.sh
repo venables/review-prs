@@ -273,13 +273,22 @@ assert_contains "only the unapproved PR is left" "$out" "(1 PR(s) left)"
 # the session its predecessor actually ran in, rather than the derived id, which
 # may name an older review. It costs a minute of wall clock because the shortest
 # interval the tool accepts is a minute -- deliberately, so a re-check loop
-# cannot run hot. Approving #8 makes pass 2's header ("1 PR(s)") unambiguous.
-out="$(FAKE_GH_APPROVED="8" run_autoreview_until "reviewing 1 PR(s)" 90 --auto --babysit=1)"
+# cannot run hot. Approving #8 leaves one PR for the second pass.
+out="$(FAKE_GH_APPROVED="8" run_autoreview_until_call "/recheck-pr 9" 240 1 --auto --babysit=1)"
 recorded="$(cat "$SANDBOX"/out/logs/run-*/session-9.id 2>/dev/null || true)"
 assert_contains "a second pass re-checks rather than reviews again" \
   "$(claude_calls)" "/recheck-pr 9"
 assert_contains "...resuming the session the first pass ran in" \
   "$(claude_call_for '/recheck-pr 9')" "--resume $recorded"
+
+# A pass whose review failed has nothing to re-check, so the next one reviews
+# from scratch rather than re-checking whatever session is on disk -- PR #9 has
+# one, made at the top of this file.
+out="$(FAKE_CLAUDE_IS_ERROR="9" FAKE_GH_APPROVED="8" \
+  run_autoreview_until_call "/auto-review 9" 240 2 --auto --babysit=1)"
+assert_not_contains "a pass after a failed review does not re-check it" \
+  "$(claude_calls)" "/recheck-pr 9"
+assert_not_contains "...and resumes nothing" "$(claude_calls)" "--resume $sid9"
 
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"

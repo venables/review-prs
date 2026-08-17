@@ -271,7 +271,8 @@ spin=0
 # Double-quoted so the trailing backslash is an escaped literal: |/-\
 spin_frames="|/-\\"
 tty=0
-if [[ -t 1 ]]; then tty=1; fi
+poll_interval=1
+if [[ -t 1 ]]; then tty=1; poll_interval=0.2; fi
 
 job_file() { printf '%s/pr-%s.%s' "$pass_dir" "${q_pr[$1]}" "$2"; }
 
@@ -358,8 +359,16 @@ run_job() {
 # of hashing the checkout into the id (see lib/session.sh).
 run_session_file() { printf '%s/session-%s.id' "$run_dir" "$1"; }
 
+# Set when a pass could not review a PR. Recording nothing for a failure is not
+# enough on its own: with no recorded id the next pass falls through to
+# plan_session, which resumes the derived session whenever a transcript exists
+# on disk -- so a review that failed here would still be "re-checked" against
+# whatever an earlier run left behind. The marker says explicitly that this run
+# has no review of that PR to check.
+run_failed_file() { printf '%s/failed-%s' "$run_dir" "$1"; }
+
 start_job() {
-  local i="$1" prior="" prior_busy=0
+  local i="$1" prior="" prior_busy=0 fresh=0
   # Only consulted when resuming is on the table at all: without --continue this
   # branch cannot be taken, and checking anyway would print a note about a
   # session the run was never going to touch.
@@ -378,7 +387,11 @@ start_job() {
     prior=""
     prior_busy=1
   fi
-  if [[ "$prior_busy" -eq 1 ]]; then
+  # A pass that failed leaves nothing to re-check, whatever is on disk.
+  if [[ -f "$(run_failed_file "${q_pr[i]}")" ]]; then
+    fresh=1
+  fi
+  if [[ "$prior_busy" -eq 1 || "$fresh" -eq 1 ]]; then
     # Deliberately not falling back to the derived id. Where a recorded id
     # exists at all it is this run's own review, and the derived one names
     # something older -- resuming that is the stale re-check the recording
@@ -454,21 +467,29 @@ job_session_id() {
 }
 
 finish_job() {
-  local i="$1" now="$2" raw="$3" sid
+  local i="$1" now="$2" raw="$3" sid ok=0
   q_end[i]="$now"
   wait "${q_pid[i]}" 2>/dev/null || true
   q_status[i]="$raw"
+  if [[ "$raw" == "0" ]] && ! job_reported_error "$i"; then ok=1; fi
+
+  # Only a review that finished is worth resuming. /recheck-pr against a failed
+  # one has no findings to check, so it reports nothing to fix and never
+  # approves -- and a babysit loop would re-spend on that PR every interval for
+  # as long as it runs. The marker is what makes the next pass review fresh
+  # rather than fall back to whatever session is on disk.
+  if [[ "$ok" -eq 1 ]]; then
+    rm -f "$(run_failed_file "${q_pr[i]}")"
+  else
+    : >"$(run_failed_file "${q_pr[i]}")"
+  fi
 
   # Correct the recorded id before anything reports it: the summary tells you to
   # reopen this review with it, and a babysit pass resumes it.
   sid="$(job_session_id "$i")"
   if [[ -n "$sid" ]]; then
     q_sid[i]="$sid"
-    # Only a review that finished is worth resuming. /recheck-pr against a
-    # failed review has no findings to check, so it reports nothing to fix and
-    # never approves -- and a babysit loop would then re-spend on that PR every
-    # interval for as long as it runs. A failed pass reviews fresh instead.
-    if [[ "$raw" == "0" ]] && ! job_reported_error "$i"; then
+    if [[ "$ok" -eq 1 ]]; then
       # Written the way the status file is, and for the same reason: a reader
       # must never see half an id.
       printf '%s' "$sid" >"$(run_session_file "${q_pr[i]}").tmp"
@@ -484,7 +505,7 @@ finish_job() {
   fi
   if [[ "$raw" == "timeout" ]]; then
     q_state[i]="timeout"
-  elif [[ "$raw" == "0" ]] && ! job_reported_error "$i"; then
+  elif [[ "$ok" -eq 1 ]]; then
     q_state[i]="done"
   else
     q_state[i]="failed"
@@ -723,7 +744,10 @@ run_pass() {
 
     if [[ "$running" -eq 0 && "$next" -ge "$total" ]]; then break; fi
     render "$now"
-    sleep 0.2
+    # 5 Hz is for the spinner. With no TTY there is nothing to animate, and a
+    # review runs for minutes -- polling that fast would only fork subshells at
+    # the machine that is also running the reviews.
+    sleep "$poll_interval"
   done
   render "$(date +%s)"
   flush_notes
