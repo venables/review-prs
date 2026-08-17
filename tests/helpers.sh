@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Shared harness for the review-prs tests.
+# Shared harness for the review-prs and autoreview tests.
 #
-# Each test runs the real script against fake `gh`, `gum` and `cmux` binaries on
-# PATH, inside a throwaway git repo, with $CLAUDE_CONFIG_DIR pointed at a
-# throwaway session store. Nothing here touches your real repos, your real
-# Claude Code sessions, or GitHub.
+# Each test runs the real script against fake `gh`, `gum`, `cmux` and `claude`
+# binaries on PATH, inside a throwaway git repo, with $CLAUDE_CONFIG_DIR
+# pointed at a throwaway session store. Nothing here touches your real repos,
+# your real Claude Code sessions, or GitHub.
 
 set -euo pipefail
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REVIEW_PRS="$TESTS_DIR/../review-prs"
+AUTOREVIEW="$TESTS_DIR/../autoreview"
 
 pass_count=0
 fail_count=0
@@ -69,16 +70,32 @@ setup_sandbox() {
   write_fake_gh
   write_fake_gum
   write_fake_cmux
+  write_fake_claude
+  write_fake_override
 
   export PATH="$SANDBOX/bin:$PATH"
   export CLAUDE_CONFIG_DIR="$SANDBOX/claude"
   export FAKE_GH_LOGIN="me"
   export SPAWN_LOG="$SANDBOX/out/spawned"
+  export CLAUDE_LOG="$SANDBOX/out/claude-calls"
+
+  # The name the fake claude gives its sleeping grandchild, which the timeout
+  # test looks for with `pgrep -f`. pgrep searches every process on the box, so
+  # a fixed marker would also match anything that merely mentions it -- an
+  # editor holding this file open, a grep, an agent reading this diff -- and
+  # fail the test on a machine where nothing leaked. The sandbox name makes it
+  # unique per run, and it exists nowhere on disk.
+  export FAKE_SLEEP_TAG="fake-claude-sleep-$(basename "$SANDBOX")"
 
   # Force the cmux spawner: it is the only one that is fully scriptable. Herdr
   # detection and the Ghostty AppleScript path are out of scope here.
   export CMUX_SURFACE_ID="test-surface"
   unset HERDR_ENV TERM_PROGRAM REVIEW_PRS_CMD REVIEW_PRS_AUTO_CMD || true
+  unset AUTOREVIEW_CMD AUTOREVIEW_AUTO_CMD AUTOREVIEW_JOBS AUTOREVIEW_TIMEOUT \
+        AUTOREVIEW_MAX_BUDGET_USD AUTOREVIEW_LOG_DIR \
+        AUTOREVIEW_BABYSIT_INTERVAL || true
+  unset FAKE_CLAUDE_FAIL FAKE_CLAUDE_IS_ERROR FAKE_CLAUDE_SLEEP \
+        FAKE_GH_APPROVED || true
   # Leave the workspace title alone; the fake cmux ignores it either way.
   export REVIEW_PRS_WORKSPACE=""
 
@@ -93,6 +110,9 @@ reset_spawn_log() {
   : >"$SPAWN_LOG"
   : >"$SPAWN_LOG.labels"
   : >"$SANDBOX/out/header"
+  : >"$CLAUDE_LOG"
+  : >"$CLAUDE_LOG.events"
+  : >"$SANDBOX/out/override"
 }
 
 # The command the script sent to the tab for PR $1 (first match wins).
@@ -106,6 +126,26 @@ spawned_labels() {
 
 picker_header() {
   cat "$SANDBOX/out/header" 2>/dev/null || true
+}
+
+# Every argument list the fake claude was invoked with, one call per line.
+claude_calls() {
+  cat "$CLAUDE_LOG" 2>/dev/null || true
+}
+
+# The one call whose arguments contain $1 (first match wins).
+claude_call_for() {
+  grep -m1 -F -- "$1" "$CLAUDE_LOG" 2>/dev/null || true
+}
+
+# Start/end markers in call order, for asserting how much ran at once.
+claude_events() {
+  cat "$CLAUDE_LOG.events" 2>/dev/null || true
+}
+
+# What the fake override binary saw: its arguments and the session environment.
+override_calls() {
+  cat "$SANDBOX/out/override" 2>/dev/null || true
 }
 
 # --- Fakes ----------------------------------------------------------------
@@ -143,6 +183,16 @@ case "$sub" in
         echo "fake gh: unhandled api target: $target" >&2
         exit 1
         ;;
+    esac
+    ;;
+  pr)
+    # `gh pr view N --json reviewDecision --jq ...`: PRs named in
+    # $FAKE_GH_APPROVED read as approved, everything else as undecided.
+    shift || true
+    num="${1:-}"
+    case " ${FAKE_GH_APPROVED:-} " in
+      *" $num "*) printf 'APPROVED\n' ;;
+      *)          printf '\n' ;;
     esac
     ;;
   *)
@@ -219,6 +269,57 @@ EOF
   chmod +x "$SANDBOX/bin/cmux"
 }
 
+write_fake_claude() {
+  cat >"$SANDBOX/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+# Stands in for `claude -p`: records the call, emits a result envelope, and can
+# be told to fail, to report an error inside a zero exit, or to run slowly.
+set -uo pipefail
+
+# The prompt is the last argument, and ends with the PR number.
+prompt="${!#}"
+n="${prompt##* }"
+
+printf '%s\n' "$*" >>"$CLAUDE_LOG"
+printf 'start %s\n' "$n" >>"$CLAUDE_LOG.events"
+
+if [[ -n "${FAKE_CLAUDE_SLEEP:-}" ]]; then
+  # Sleep in a marked grandchild, so a test can find survivors by name and so
+  # stopping this job has to walk past this shell -- which is what a real
+  # reviewer's own subprocesses look like. The marker is unique per sandbox:
+  # the test finds it with pgrep, which searches the whole box.
+  bash -c 'sleep "$1"' "$FAKE_SLEEP_TAG-$n" "$FAKE_CLAUDE_SLEEP"
+fi
+
+is_error=false
+status=0
+case " ${FAKE_CLAUDE_FAIL:-} " in
+  *" $n "*) status=1 ;;
+esac
+case " ${FAKE_CLAUDE_IS_ERROR:-} " in
+  *" $n "*) is_error=true ;;
+esac
+
+printf 'end %s\n' "$n" >>"$CLAUDE_LOG.events"
+printf '{"type":"result","is_error":%s,"total_cost_usd":0.42,"num_turns":3,"result":"reviewed %s"}\n' \
+  "$is_error" "$n"
+exit "$status"
+EOF
+  chmod +x "$SANDBOX/bin/claude"
+}
+
+# A stand-in for a user-supplied $AUTOREVIEW_CMD / $REVIEW_PRS_CMD.
+write_fake_override() {
+  cat >"$SANDBOX/bin/my-review" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'args=%s session=%s resume=%s\n' \
+  "$*" "${REVIEW_PRS_SESSION_ID:-unset}" "${REVIEW_PRS_SESSION_RESUME:-unset}" \
+  >>"$SANDBOX/out/override"
+EOF
+  chmod +x "$SANDBOX/bin/my-review"
+}
+
 # --- Fixtures -------------------------------------------------------------
 
 # Three open PRs by other people, one draft, one of yours, one Dependabot.
@@ -291,6 +392,43 @@ run_review_prs() {
 
 last_status() {
   cat "$SANDBOX/out/status" 2>/dev/null || printf 'unset'
+}
+
+# Run autoreview inside the sandbox repo. Same contract as run_review_prs:
+# combined output on stdout, exit status via last_status. Logs go somewhere the
+# test can read rather than a temp directory.
+run_autoreview() {
+  reset_spawn_log
+  rm -rf "$SANDBOX/out/logs"
+  set +e
+  ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" "$@" 2>&1 )
+  local status=$?
+  set -e
+  printf '%s' "$status" >"$SANDBOX/out/status"
+}
+
+# Run autoreview in the background and wait for $1 to appear in its output, up
+# to $2 seconds, then kill it. For the babysit loop, whose whole point is that
+# it does not exit -- the shortest interval it accepts is a minute, and no test
+# should wait one.
+run_autoreview_until() {
+  local needle="$1" limit="$2"; shift 2
+  local out="$SANDBOX/out/bg" waited=0 pid
+  reset_spawn_log
+  rm -rf "$SANDBOX/out/logs"
+  : >"$out"
+  ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" "$@" >"$out" 2>&1 ) &
+  pid=$!
+  while [[ "$waited" -lt "$((limit * 10))" ]]; do
+    if grep -qF -- "$needle" "$out" 2>/dev/null; then break; fi
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  pkill -P "$pid" >/dev/null 2>&1 || true
+  kill "$pid" >/dev/null 2>&1 || true
+  wait "$pid" 2>/dev/null || true
+  cat "$out"
 }
 
 # Create the session file that makes $1 look like an existing session.

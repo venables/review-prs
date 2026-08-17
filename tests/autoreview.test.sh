@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# autoreview: headless reviews -- prompts, concurrency, failure reporting,
+# timeouts, overrides and the babysit loop.
+
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers.sh"
+
+echo "autoreview"
+setup_sandbox
+trap teardown_sandbox EXIT
+
+# --- Which PRs get reviewed, and with what prompt -------------------------
+out="$(run_autoreview --auto)"
+assert_contains "NEW PRs are reviewed" "$(claude_calls)" "/auto-review 9"
+assert_contains "UPDATED/CHANGES PRs are reviewed" "$(claude_calls)" "/auto-review 8"
+assert_not_contains "SEEN PRs are skipped" "$(claude_calls)" "/auto-review 6"
+assert_contains "a clean run reports each PR" "$out" "done    #9"
+assert_equals "a clean run exits 0" "$(last_status)" "0"
+
+assert_contains "reviews run in print mode" "$(claude_call_for '/auto-review 9')" "-p "
+assert_contains "reviews ask for the json envelope" \
+  "$(claude_call_for '/auto-review 9')" "--output-format json"
+assert_contains "a first review pins --session-id" \
+  "$(claude_call_for '/auto-review 9')" "--session-id"
+
+FAKE_GUM_PICK="#9" run_autoreview >/dev/null
+assert_contains "the picker path runs a panel review" \
+  "$(claude_calls)" "/panel-review 9"
+
+# --- Session continuity ---------------------------------------------------
+run_autoreview --auto >/dev/null
+sid9="$(session_id_from "$(claude_call_for '/auto-review 9')")"
+assert_equals "the derived id is a 36-char uuid" "${#sid9}" "36"
+
+make_session "$sid9"
+run_autoreview --auto >/dev/null
+assert_not_contains "no -C: an existing session is not resumed" \
+  "$(claude_call_for '/auto-review 9')" "--resume"
+
+out="$(run_autoreview --auto --continue)"
+cmd9="$(claude_call_for '/recheck-pr 9')"
+assert_contains "-C resumes the derived id" "$cmd9" "--resume $sid9"
+assert_contains "-C swaps the prompt to a re-check" "$cmd9" "/recheck-pr 9"
+assert_contains "-C leaves a PR with no session on a fresh review" \
+  "$(claude_calls)" "/auto-review 8"
+
+# The summary hands back each session id, which is the whole reason losing the
+# tab is survivable.
+assert_contains "the summary prints session ids" "$out" "$sid9"
+assert_contains "the summary says how to reopen one" "$out" "claude --resume"
+
+# --- Failures -------------------------------------------------------------
+out="$(FAKE_CLAUDE_FAIL="9" run_autoreview --auto)"
+assert_equals "a failed review exits 1" "$(last_status)" "1"
+assert_contains "a failed review is named" "$out" "FAILED  #9"
+assert_contains "the failure count is reported" "$out" "1 of 2 review(s) failed"
+assert_contains "the other PR still ran" "$(claude_calls)" "/auto-review 8"
+
+# claude can exit 0 and still report a failed turn in its envelope.
+out="$(FAKE_CLAUDE_IS_ERROR="9" run_autoreview --auto)"
+assert_equals "is_error in the envelope fails the run" "$(last_status)" "1"
+assert_contains "is_error is reported as a failure" "$out" "FAILED  #9"
+
+# --- Concurrency ----------------------------------------------------------
+FAKE_CLAUDE_SLEEP=0.4 run_autoreview --auto --jobs 1 >/dev/null
+assert_equals "--jobs 1 runs one review at a time" \
+  "$(claude_events | tr '\n' ' ')" "start 9 end 9 start 8 end 8 "
+
+FAKE_CLAUDE_SLEEP=0.4 run_autoreview --auto --jobs 2 >/dev/null
+assert_equals "--jobs 2 overlaps them" \
+  "$(claude_events | head -2 | tr '\n' ' ')" "start 9 start 8 "
+
+# --- Timeout --------------------------------------------------------------
+out="$(FAKE_CLAUDE_SLEEP=30 run_autoreview --auto --jobs 2 --timeout 1)"
+assert_contains "a review that overruns --timeout is stopped" "$out" "TIMEOUT #9"
+assert_equals "a timed-out review exits 1" "$(last_status)" "1"
+
+# The reviewer's own children have to go too: an orphan keeps spending and keeps
+# holding the session open, so the next --continue would refuse to resume it.
+sleep 0.5
+survivors="$(pgrep -f "$FAKE_SLEEP_TAG" 2>/dev/null | wc -l | tr -d ' ' || true)"
+assert_equals "a stopped review leaves nothing behind" "$survivors" "0"
+
+# Job control would announce each killed job on stderr, in the middle of the
+# progress block.
+assert_not_contains "stopping a review is quiet" "$out" "Terminated"
+
+# --- Logs -----------------------------------------------------------------
+run_autoreview --auto >/dev/null
+if [[ -s "$SANDBOX/out/logs/pass-1/pr-9.json" ]]; then
+  ok "each review's envelope is kept"
+else
+  not_ok "each review's envelope is kept" "no pr-9.json under pass-1"
+fi
+assert_contains "the envelope is what claude printed" \
+  "$(cat "$SANDBOX/out/logs/pass-1/pr-9.json")" '"result":"reviewed 9"'
+
+# --- Budget ---------------------------------------------------------------
+run_autoreview --auto --budget 2.50 >/dev/null
+assert_contains "--budget reaches claude" \
+  "$(claude_call_for '/auto-review 9')" "--max-budget-usd 2.50"
+
+# --- Overrides ------------------------------------------------------------
+AUTOREVIEW_AUTO_CMD='my-review' run_autoreview --auto >/dev/null
+assert_contains "an override without {} gets the number appended" \
+  "$(override_calls)" "args=9"
+assert_contains "an override is handed the session id" "$(override_calls)" "session=$sid9"
+assert_contains "an override is told whether it is resuming" "$(override_calls)" "resume=0"
+assert_equals "an override replaces claude entirely" "$(claude_calls)" ""
+
+AUTOREVIEW_AUTO_CMD='my-review {} --extra {}' run_autoreview --auto >/dev/null
+assert_contains "{} is substituted everywhere" "$(override_calls)" "args=9 --extra 9"
+
+# --- Bad input ------------------------------------------------------------
+out="$(run_autoreview --auto --jobs 0)"
+assert_equals "--jobs 0 exits nonzero" "$(last_status)" "1"
+assert_contains "--jobs 0 says why" "$out" "expects an integer >= 1"
+
+out="$(run_autoreview --auto --jobs abc)"
+assert_equals "a non-numeric --jobs exits nonzero" "$(last_status)" "1"
+
+out="$(run_autoreview --auto --budget lots)"
+assert_equals "a non-numeric --budget exits nonzero" "$(last_status)" "1"
+assert_contains "a non-numeric --budget says why" "$out" "expects a dollar amount"
+
+out="$(run_autoreview --auto --timeout)"
+assert_equals "a flag with no value exits nonzero" "$(last_status)" "1"
+assert_contains "a flag with no value says why" "$out" "expects a value"
+
+out="$(run_autoreview --nope)"
+assert_equals "an unknown flag exits nonzero" "$(last_status)" "1"
+assert_contains "an unknown flag says so" "$out" "unknown arg"
+
+out="$(run_autoreview --auto --babysit=soon)"
+assert_equals "a bad babysit interval exits nonzero" "$(last_status)" "1"
+assert_contains "a bad babysit interval says why" "$out" "invalid babysit interval"
+
+# --- Babysit --------------------------------------------------------------
+# Every PR approved after the first pass: the loop has nothing left to wait for
+# and ends without sleeping.
+out="$(FAKE_GH_APPROVED="9 8" run_autoreview --auto --babysit=1)"
+assert_contains "an approved PR is dropped from the loop" "$out" "PR #9 is approved"
+assert_contains "the loop ends when every PR is approved" "$out" "every babysat PR is approved"
+assert_equals "a fully approved babysit run exits 0" "$(last_status)" "0"
+
+# One PR still unapproved: the loop waits for the interval instead of exiting.
+out="$(FAKE_GH_APPROVED="9" run_autoreview_until "next check in" 10 --auto --babysit=1)"
+assert_contains "an unapproved PR keeps the loop going" "$out" "next check in 1m"
+assert_contains "only the unapproved PR is left" "$out" "(1 PR(s) left)"
+
+# --- Nothing to do --------------------------------------------------------
+echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
+out="$(run_autoreview --auto)"
+assert_equals "an empty repo exits 0" "$(last_status)" "0"
+assert_contains "an empty repo says why" "$out" "no matching open PRs"
+
+finish
