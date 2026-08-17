@@ -239,6 +239,7 @@ q_status=()  # exit status, once finished
 
 pass_dir=""
 rendered_lines=0
+window_max=0
 spin=0
 # Double-quoted so the trailing backslash is an escaped literal: |/-\
 spin_frames="|/-\\"
@@ -328,12 +329,27 @@ start_job() {
   if [[ -f "$(run_session_file "${q_pr[i]}")" ]]; then
     prior="$(cat "$(run_session_file "${q_pr[i]}")")"
   fi
+  # Same guard plan_session applies to a derived id: a session another process
+  # still holds must not be resumed, or two agents write one transcript. The
+  # summary tells you to open `claude --resume <id>`, so a babysit interval is
+  # exactly when someone is holding one.
+  if [[ -n "$prior" ]] && session_in_use "$prior"; then
+    queue_note "note: PR #${q_pr[i]} has its review session open elsewhere; reviewing fresh"
+    prior=""
+  fi
   if [[ -n "$prior" && "$continue_sessions" -eq 1 ]]; then
     q_sid[i]="$prior"
     q_flag[i]="--resume $prior"
     q_resume[i]=1
   else
-    plan_session "${q_pr[i]}"
+    # plan_session speaks to stderr when it refuses to resume a live session.
+    # Catch that in a file rather than a command substitution, which would run
+    # it in a subshell and lose the three globals it exists to set.
+    plan_session "${q_pr[i]}" 2>"$pass_dir/plan-note.tmp"
+    if [[ -s "$pass_dir/plan-note.tmp" ]]; then
+      queue_note "$(cat "$pass_dir/plan-note.tmp")"
+    fi
+    rm -f "$pass_dir/plan-note.tmp"
     q_sid[i]="$session_id"
     q_flag[i]="$session_flag"
     q_resume[i]="$session_resume"
@@ -369,6 +385,11 @@ job_session_id() {
   sid="$(jq -r 'if type == "object" then (.session_id // empty) else empty end' \
     "$out" 2>/dev/null || true)"
   [[ "$sid" =~ ^[0-9a-fA-F-]{36}$ ]] && printf '%s' "$sid"
+  # An envelope with no usable session id is the ordinary case for an overridden
+  # reviewer that prints prose. Returning the test's own false here would abort
+  # the run at its caller's assignment, under errexit, with every review already
+  # finished -- so end on a success the caller can read as "nothing to record".
+  return 0
 }
 
 finish_job() {
@@ -398,40 +419,84 @@ finish_job() {
   note_transition "$i"
 }
 
-# Kill a process and everything under it, leaves first. Killing only the job
-# subshell is not enough: a reviewer spawns its own children (a panel review is
-# several agents), and an orphaned tree keeps spending, keeps holding the
-# session open -- so the next --continue refuses to resume it -- and keeps
-# whatever stdout it inherited open long after this script exits.
+# A process and everything under it, deepest first, one pid per line. Killing
+# only the job subshell is not enough: a reviewer spawns its own children (a
+# panel review is several agents), and an orphaned tree keeps spending, keeps
+# holding the session open -- so the next --continue refuses to resume it -- and
+# keeps whatever stdout it inherited open long after this script exits.
 #
 # Job control (`set -m`, then one signal to the process group) would do this in
 # one call, but it makes bash announce every killed job on stderr, which lands
 # in the middle of the redrawn progress block. Walking the tree is quiet.
-kill_tree() {
+process_tree() {
   local pid="$1" child
   for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-    kill_tree "$child"
+    process_tree "$child"
   done
-  kill "$pid" >/dev/null 2>&1 || true
+  printf '%s\n' "$pid"
+}
+
+signal_pids() {
+  local sig="$1"; shift
+  local p
+  for p in "$@"; do
+    kill -"$sig" "$p" >/dev/null 2>&1 || true
+  done
 }
 
 # Stop a job that has outrun --timeout, or that Ctrl-C caught. Best-effort by
 # design: a review we cannot reach is reported as a timeout either way, and the
 # pass moves on rather than blocking a slot forever.
 #
-# Two sweeps, because the first one races: a reviewer that forks while we are
-# walking its tree leaves a child we never saw. The second sweep catches it,
-# and the walk stays inside this job's own descendants.
+# The tree is snapshotted before anything is signalled, and that list is what
+# every later signal goes to. Walking it again after the first TERM would find
+# less than it should: the job subshell dies immediately, and a child that
+# outlives it is reparented away, so ancestry can no longer reach the very
+# processes still running. The snapshot still can.
+#
+# TERM first, then KILL: finish_job waits on the job, and a reviewer that
+# ignores TERM would make that wait block forever -- turning --timeout, whose
+# whole job is to stop a review that will not end, into the thing that hangs the
+# run. KILL cannot be ignored, so the wait always returns.
+#
+# The second walk is for the other race: a reviewer that forked while we were
+# taking the first snapshot has a child neither list has seen yet.
 #
 # Matching the session id with `pkill -f` would be a wider net, and too wide:
 # the id is on the command line of every process that carries it, including the
 # interactive `claude --resume <id>` the summary tells you to open and any
 # concurrent run reviewing the same PR. One timeout here must not kill those.
 stop_job() {
-  local pid="$1"
-  kill_tree "$pid"
+  local pid="$1" tree=() more=()
+  while IFS= read -r p; do tree+=("$p"); done < <(process_tree "$pid")
+  signal_pids TERM "${tree[@]}"
   sleep 0.2
-  kill_tree "$pid"
+  while IFS= read -r p; do more+=("$p"); done < <(process_tree "$pid")
+  tree+=(${more[@]+"${more[@]}"})
+  signal_pids TERM "${tree[@]}"
+  sleep 0.2
+  signal_pids KILL "${tree[@]}"
+}
+
+# Notes raised while the progress block is on screen have nowhere good to go:
+# printing one scrolls the block and leaves $rendered_lines pointing at the
+# wrong row, so every later redraw walks over whatever is there now. Hold them
+# and flush after the pass. Without a TTY there is no block to disturb.
+pass_notes=()
+queue_note() {
+  if [[ "$tty" -eq 1 ]]; then
+    pass_notes+=("$1")
+  else
+    printf '%s\n' "$1" >&2
+  fi
+}
+
+flush_notes() {
+  local n
+  for n in ${pass_notes[@]+"${pass_notes[@]}"}; do
+    printf '%s\n' "$n" >&2
+  done
+  pass_notes=()
 }
 
 # Without a TTY -- a cron run, or output piped to a log -- there is no cursor to
@@ -448,13 +513,58 @@ note_transition() {
   esac
 }
 
+# How many rows the progress block may occupy. The block is redrawn by moving
+# the cursor up over itself, and the cursor cannot climb past the top of the
+# window -- so a queue taller than the terminal would redraw onto rows it does
+# not own, corrupting the display and the scrollback above it. A busy repo makes
+# this ordinary rather than exotic: the PR query fetches 50, and --auto queues
+# every NEW/UPDATED one of them.
+window_rows() {
+  local lines n
+  lines="$(tput lines 2>/dev/null || printf '24')"
+  [[ "$lines" =~ ^[0-9]+$ ]] || lines=24
+  # Leave room for the two header lines, the elision line, and the prompt.
+  n=$((lines - 5))
+  [[ "$n" -lt 3 ]] && n=3
+  printf '%s' "$n"
+}
+
+# The first row still worth watching: everything above it has finished, so it is
+# what scrolls away first when the queue outgrows the window.
+first_unfinished() {
+  local i
+  for ((i = 0; i < ${#q_pr[@]}; i++)); do
+    case "${q_state[i]}" in
+      done|failed|timeout) ;;
+      *) printf '%s' "$i"; return 0 ;;
+    esac
+  done
+  printf '%s' "${#q_pr[@]}"
+}
+
 render() {
   if [[ "$tty" -ne 1 ]]; then return 0; fi
-  local now="$1" i mark label elapsed
+  local now="$1" i mark label elapsed total start end shown
+  total="${#q_pr[@]}"
+  start=0
+  end="$total"
+  if [[ "$total" -gt "$window_max" ]]; then
+    start="$(first_unfinished)"
+    if [[ $((start + window_max)) -gt "$total" ]]; then
+      start=$((total - window_max))
+    fi
+    [[ "$start" -lt 0 ]] && start=0
+    end=$((start + window_max))
+  fi
+  shown=0
   if [[ "$rendered_lines" -gt 0 ]]; then
     printf '\033[%dA' "$rendered_lines"
   fi
-  for ((i = 0; i < ${#q_pr[@]}; i++)); do
+  if [[ "$start" -gt 0 ]]; then
+    printf '\033[2K  ... %d finished, scrolled off (all of them are in the summary)\n' "$start"
+    shown=$((shown + 1))
+  fi
+  for ((i = start; i < end; i++)); do
     case "${q_state[i]}" in
       queued)
         mark=" "; label="queued"; elapsed="" ;;
@@ -474,8 +584,13 @@ render() {
         mark=" "; label="${q_state[i]}"; elapsed="" ;;
     esac
     printf '\033[2K  %s  #%-5s %-24s %8s\n' "$mark" "${q_pr[i]}" "$label" "$elapsed"
+    shown=$((shown + 1))
   done
-  rendered_lines="${#q_pr[@]}"
+  if [[ "$end" -lt "$total" ]]; then
+    printf '\033[2K  ... %d more waiting\n' $((total - end))
+    shown=$((shown + 1))
+  fi
+  rendered_lines="$shown"
   spin=$(((spin + 1) % ${#spin_frames}))
 }
 
@@ -494,6 +609,9 @@ run_pass() {
   printf 'reviewing %d PR(s), %d at a time\n' "$total" "$jobs_max"
   printf 'logs: %s\n\n' "$pass_dir"
   rendered_lines=0
+  # Measured once per pass rather than per redraw: a resize mid-pass is rare,
+  # and this would otherwise fork a `tput` five times a second.
+  window_max="$(window_rows)"
 
   local running=0 next=0 now status_file
   while :; do
@@ -522,6 +640,7 @@ run_pass() {
     sleep 0.2
   done
   render "$(date +%s)"
+  flush_notes
 }
 
 # Cost is claude's own accounting, straight out of the result envelope, so it is

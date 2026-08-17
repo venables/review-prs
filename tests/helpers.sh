@@ -339,6 +339,26 @@ printf 'args=%s session=%s resume=%s\n' \
   >>"$SANDBOX/out/override"
 EOF
   chmod +x "$SANDBOX/bin/my-review"
+
+  # An override that reports in prose rather than JSON -- the ordinary shape of
+  # a hand-rolled reviewer, and the one that leaves no session id to read back.
+  cat >"$SANDBOX/bin/text-review" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'reviewed PR %s, looks fine\n' "$1"
+EOF
+  chmod +x "$SANDBOX/bin/text-review"
+
+  # A reviewer that refuses to stop on TERM, which is what makes --timeout's
+  # escalation to KILL load-bearing: without it the run waits on it forever.
+  cat >"$SANDBOX/bin/stubborn-review" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+trap '' TERM
+( exec -a "$FAKE_SLEEP_TAG-stubborn" sleep 60 ) &
+wait
+EOF
+  chmod +x "$SANDBOX/bin/stubborn-review"
 }
 
 # --- Fixtures -------------------------------------------------------------

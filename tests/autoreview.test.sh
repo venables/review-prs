@@ -85,6 +85,21 @@ assert_equals "a stopped review leaves nothing behind" "$survivors" "0"
 # progress block.
 assert_not_contains "stopping a review is quiet" "$out" "Terminated"
 
+# A reviewer that ignores TERM must not outlive its timeout: the run waits on
+# each job, so anything short of KILL would hang here forever. Bounded by the
+# helper, which gives up after 20s -- a regression fails rather than hangs.
+# Waiting for the summary rather than the first TIMEOUT line: the run has to
+# reach its own end for this to mean anything, and killing it mid-flight would
+# orphan the reviewers itself and prove nothing.
+out="$(AUTOREVIEW_AUTO_CMD='stubborn-review' \
+  run_autoreview_until "reopen any review" 25 --auto --jobs 2 --timeout 1)"
+assert_contains "a reviewer that ignores TERM is still stopped" "$out" "TIMEOUT #9"
+assert_contains "...and the run reaches its summary instead of hanging" \
+  "$out" "reopen any review"
+sleep 0.5
+survivors="$(pgrep -f "$FAKE_SLEEP_TAG" 2>/dev/null | wc -l | tr -d ' ' || true)"
+assert_equals "...and leaves nothing behind either" "$survivors" "0"
+
 # --- Logs -----------------------------------------------------------------
 run_autoreview --auto >/dev/null
 if [[ -s "$SANDBOX/out/logs/pass-1/pr-9.json" ]]; then
@@ -143,6 +158,14 @@ assert_contains "...and still prints the session id" "$out" "00000000-0000-5000-
 assert_contains "...and still prints the result" "$out" "done"
 rm -f "$SANDBOX/bin/column"
 
+# A reviewer that reports in prose leaves no session id to read back, which must
+# not be mistaken for a failure: every review here succeeded.
+out="$(AUTOREVIEW_AUTO_CMD='text-review' run_autoreview --auto)"
+assert_equals "a non-JSON reviewer still exits 0" "$(last_status)" "0"
+assert_contains "a non-JSON reviewer still gets a summary" "$out" "RESULT"
+assert_contains "...naming each PR" "$out" "#9"
+assert_contains "...with no session to offer" "$out" "-"
+
 # --- Babysit sessions -----------------------------------------------------
 # A later pass resumes the session the earlier pass actually ran in, recorded
 # under the log dir. Resuming the derived id instead would re-check a review
@@ -154,6 +177,26 @@ reset_spawn_log
 ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto --continue >/dev/null 2>&1 )
 assert_contains "a later pass resumes the session the earlier pass used" \
   "$(claude_call_for '/recheck-pr 9')" "--resume aaaaaaaa-bbbb-5ccc-addd-eeeeeeeeeeee"
+
+# A recorded session another process still holds is not resumed either: two
+# agents writing one transcript is the thing the guard exists to prevent, and a
+# babysit interval is exactly when someone has `claude --resume` open.
+run_autoreview --auto >/dev/null
+held="bbbbbbbb-cccc-5ddd-aeee-ffffffffffff"
+printf '%s' "$held" >"$SANDBOX/out/logs/session-9.id"
+bash -c 'sleep 10; :' "holder-$held" &
+holder=$!
+sleep 0.5
+reset_spawn_log
+out="$( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto --continue 2>&1 )"
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+assert_contains "a held session is reported, not resumed" "$out" "open elsewhere"
+assert_not_contains "a held session is not resumed" "$(claude_calls)" "--resume $held"
+# Refusing the recorded id hands the PR back to the ordinary rules, which here
+# resume its own derived session.
+assert_contains "...and the PR falls back to the derived session" \
+  "$(claude_call_for '/recheck-pr 9')" "--resume $sid9"
 
 # PR #8 has no session, so its review pins one -- and that is the id recorded.
 run_autoreview --auto >/dev/null
