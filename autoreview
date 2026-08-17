@@ -176,6 +176,13 @@ if [[ -n "$max_budget" && ! "$max_budget" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   printf 'error: --budget expects a dollar amount, got "%s"\n' "$max_budget" >&2
   exit 1
 fi
+# A cap of zero is never what anyone meant, and it is ambiguous in the worst
+# place: it either fails every review in the sweep or is read as "no cap" and
+# spends freely. Every other numeric flag here rejects zero for the same reason.
+if [[ -n "$max_budget" && "$max_budget" =~ ^0*([.]0*)?$ ]]; then
+  printf 'error: --budget expects a positive dollar amount, got "%s"\n' "$max_budget" >&2
+  exit 1
+fi
 
 # Validate the interval only when babysitting is actually on, so an unrelated
 # bad env var never blocks a plain run.
@@ -223,14 +230,19 @@ select_prs
 if [[ -z "$log_dir" ]]; then
   log_dir="$(mktemp -d "${TMPDIR:-/tmp}/autoreview.XXXXXX")"
 fi
+mkdir -p "$log_dir"
 # Everything this run writes goes under a directory of its own. A --log-dir is
 # a fixed path -- the point of passing one -- and the cron use this tool is for
 # makes overlapping runs ordinary, with the default hour-long timeout longer
 # than most intervals. Sharing the pass directory would have each run reading
 # the other's status files and reporting its results as though they were its
 # own, which would corrupt the exit status the tool exists to provide.
-run_dir="$log_dir/run-$$"
-mkdir -p "$run_dir"
+#
+# Made rather than named: a pid-named directory would be inherited by whichever
+# later run the kernel hands that pid to, and a persistent --log-dir on a
+# container -- low pids, recycled fast -- would put that run inside an older
+# one's state, resuming sessions that were never its own.
+run_dir="$(mktemp -d "$log_dir/run-XXXXXX")"
 
 # --- Job pool -------------------------------------------------------------
 # Bash 3.2 -- still what macOS ships -- has no `wait -n`, and `kill -0` on a
@@ -452,10 +464,16 @@ finish_job() {
   sid="$(job_session_id "$i")"
   if [[ -n "$sid" ]]; then
     q_sid[i]="$sid"
-    # Written the way the status file is, and for the same reason: a reader must
-    # never see half an id.
-    printf '%s' "$sid" >"$(run_session_file "${q_pr[i]}").tmp"
-    mv "$(run_session_file "${q_pr[i]}").tmp" "$(run_session_file "${q_pr[i]}")"
+    # Only a review that finished is worth resuming. /recheck-pr against a
+    # failed review has no findings to check, so it reports nothing to fix and
+    # never approves -- and a babysit loop would then re-spend on that PR every
+    # interval for as long as it runs. A failed pass reviews fresh instead.
+    if [[ "$raw" == "0" ]] && ! job_reported_error "$i"; then
+      # Written the way the status file is, and for the same reason: a reader
+      # must never see half an id.
+      printf '%s' "$sid" >"$(run_session_file "${q_pr[i]}").tmp"
+      mv "$(run_session_file "${q_pr[i]}").tmp" "$(run_session_file "${q_pr[i]}")"
+    fi
   elif [[ -z "${q_flag[i]}" || -n "$review_cmd" ]]; then
     # Nothing here knows which session this review landed in: either no flag was
     # sent, or an override ran and owns its own session handling -- it was
@@ -769,12 +787,18 @@ pass_failures() {
 
 # Ctrl-C must not leave reviews running: they would keep holding their sessions
 # open, and the next --continue would refuse to resume them.
+#
+# Every job that has a pid and has not been accounted for, rather than only the
+# ones marked running: a signal can land between the moment a job is spawned and
+# the moment its state says so, and a job skipped here is a reviewer left alive.
 stop_running_jobs() {
   local i
   for ((i = 0; i < ${#q_pr[@]}; i++)); do
-    if [[ "${q_state[i]}" == "running" ]]; then
-      stop_job "${q_pid[i]}"
-    fi
+    if [[ -z "${q_pid[i]}" ]]; then continue; fi
+    case "${q_state[i]}" in
+      done|failed|timeout) ;;
+      *) stop_job "${q_pid[i]}" ;;
+    esac
   done
 }
 

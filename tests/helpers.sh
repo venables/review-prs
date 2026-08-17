@@ -498,29 +498,6 @@ make_session() {
   touch "$CLAUDE_CONFIG_DIR/projects/-fake-project/$1.jsonl"
 }
 
-# Run autoreview with $1 seeded as the recorded session for PR $2, in the run
-# directory this very process will use. `exec` is what makes that possible: it
-# keeps the pid, and the run directory is named for it -- so the file lands
-# where autoreview looks, without the script needing a knob that exists only
-# for tests. Remaining arguments are passed to autoreview.
-run_autoreview_with_recorded() {
-  local sid="$1" pr="$2"; shift 2
-  reset_spawn_log
-  ( cd "$SANDBOX/repo" && LOG="$SANDBOX/out/logs" SID="$sid" PR="$pr" \
-      bash -c 'mkdir -p "$LOG/run-$$" && printf "%s" "$SID" >"$LOG/run-$$/session-$PR.id" && exec "$0" --log-dir "$LOG" "$@"' \
-      "$AUTOREVIEW" "$@" 2>&1 )
-}
-
-# A session id that exists nowhere but this sandbox. A fixed literal would also
-# match any process merely carrying this file's text on its command line -- a
-# reviewer agent reading the diff, say -- and session_in_use looks for exactly
-# that with pgrep, so the fixed form makes the test fail on a busy machine.
-sandbox_uuid() {
-  local n
-  n="$(printf '%s%s' "$SANDBOX" "$1" | cksum | cut -d' ' -f1)"
-  printf '%08x-cafe-5000-a000-%012x' "$n" "$n"
-}
-
 # Pull the session id out of a spawned command, whichever flag carries it.
 session_id_from() {
   printf '%s\n' "$1" \

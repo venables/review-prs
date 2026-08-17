@@ -32,9 +32,11 @@ with a headless subprocess per PR.
 - [`gum`](https://github.com/charmbracelet/gum) — the interactive picker.
   `autoreview --auto` never picks, so it does not need gum.
 - [`jq`](https://jqlang.github.io/jq/) — JSON processing
-- `pgrep` — **`autoreview` only**: stopping a review walks its process tree with
-  it, so a timeout without `pgrep` would report a stopped review while the whole
-  tree kept running. Standard on macOS; `procps` on slim Linux images.
+- `pgrep` — required by `autoreview`, which walks a review's process tree with it
+  to stop one; without it a timeout would report a stopped review while the whole
+  tree kept running. `review-prs` runs fine without it, but `--continue` loses
+  its guard against resuming a session another tab still holds. Standard on
+  macOS; `procps` on slim Linux images.
 - A supported terminal for spawning tabs — **`review-prs` only**:
   - [Herdr](https://herdr.dev) (preferred; detected via `HERDR_ENV`, drives new
     tabs over its socket API via the `herdr` CLI), or
@@ -427,6 +429,10 @@ Code sessions, or GitHub. `tests/run.sh` also runs `bash -n` over every script
 and `shellcheck -x` over both entry points — `-x` so it follows the `source=`
 directives into `lib/`, which is the only context where a library's globals are
 defined.
+
+The suite takes about a minute and a half, most of it one test: whether a
+babysit pass resumes the session the previous pass ran in can only be shown by
+running a second pass, and the shortest interval the tool accepts is a minute.
 
 CI runs the same command on macOS and Linux — macOS because it ships bash 3.2
 and catches bashisms the scripts must not use (no `wait -n`, no associative

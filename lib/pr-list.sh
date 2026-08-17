@@ -236,14 +236,6 @@ select_prs() {
   fi
 }
 
-# A PR's current overall review decision, e.g. APPROVED / CHANGES_REQUESTED, or
-# empty when GitHub has not recorded one (or the lookup failed -- a transient
-# API error must read as "not approved yet" so a babysit run keeps waiting
-# rather than declaring victory).
-pr_review_decision() {
-  gh pr view "$1" --json reviewDecision --jq '.reviewDecision // ""' 2>/dev/null || true
-}
-
 # Why a babysit loop should stop watching a PR, or empty while it should keep
 # watching. Approval is the expected end, but a PR that was closed, or merged
 # without ever collecting an approving review, is just as finished -- and

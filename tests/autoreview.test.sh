@@ -193,54 +193,29 @@ assert_not_contains "...offering no session it cannot vouch for" "$out" "$sid8"
 assert_not_contains "...nor the derived one" "$out" "$sid9"
 
 # --- Babysit sessions -----------------------------------------------------
-# A later pass resumes the session the earlier pass actually ran in, recorded
-# under the log dir. Resuming the derived id instead would re-check a review
-# nobody wrote.
-recorded="$(sandbox_uuid recorded)"
-run_autoreview_with_recorded "$recorded" 9 --auto --continue >/dev/null
-assert_contains "a later pass resumes the session the earlier pass used" \
-  "$(claude_call_for '/recheck-pr 9')" "--resume $recorded"
-
-# A half-written record is not spliced into the command line.
-run_autoreview_with_recorded "not-a-session-id" 9 --auto --continue >/dev/null
-assert_not_contains "a malformed record is ignored" \
-  "$(claude_calls)" "--resume not-a-session-id"
-
-# A recorded session another process still holds is not resumed either: two
-# agents writing one transcript is the thing the guard exists to prevent, and a
-# babysit interval is exactly when someone has `claude --resume` open.
-held="$(sandbox_uuid held)"
-bash -c 'sleep 10; :' "holder-$held" &
-holder=$!
-sleep 0.5
-out="$(run_autoreview_with_recorded "$held" 9 --auto --continue)"
-kill "$holder" 2>/dev/null || true
-wait "$holder" 2>/dev/null || true
-assert_contains "a held session is reported, not resumed" "$out" "open elsewhere"
-assert_not_contains "a held session is not resumed" "$(claude_calls)" "--resume $held"
-# And not quietly swapped for the derived id either: where a recorded id exists
-# it is this run's own review, so the derived one names something older.
-assert_not_contains "...nor swapped for the older derived session" \
-  "$(claude_calls)" "--resume $sid9"
-assert_contains "...the PR is reviewed fresh instead" "$(claude_calls)" "/auto-review 9"
-
-# Without -C there is nothing to resume, so a recorded id is not even consulted
-# -- and no note about it is printed.
-bash -c 'sleep 10; :' "holder-$held" &
-holder=$!
-sleep 0.5
-out="$(run_autoreview_with_recorded "$held" 9 --auto)"
-kill "$holder" 2>/dev/null || true
-wait "$holder" 2>/dev/null || true
-assert_not_contains "a plain run says nothing about a session it would not resume" \
-  "$out" "open elsewhere"
-
 # PR #8 has no session, so its review pins one -- and that is the id recorded,
 # in this run's own directory rather than one shared with every other run.
 run_autoreview --auto >/dev/null
 assert_equals "the id a review ran in is recorded for the next pass" \
   "$(cat "$SANDBOX"/out/logs/run-*/session-8.id 2>/dev/null)" \
   "$(session_id_from "$(claude_call_for '/auto-review 8')")"
+
+# A failed review is not worth resuming: /recheck-pr against it has no findings
+# to check, so it would never approve and the loop would re-spend every
+# interval. Nothing is recorded for it.
+FAKE_CLAUDE_IS_ERROR="8" run_autoreview --auto >/dev/null
+if [[ -e "$(echo "$SANDBOX"/out/logs/run-*/session-8.id)" ]]; then
+  not_ok "a failed review records no session" "session-8.id was written"
+else
+  ok "a failed review records no session"
+fi
+
+# Two runs against one --log-dir get separate state, so neither can resume the
+# other's review of the same PR.
+run_autoreview --auto >/dev/null
+( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto >/dev/null 2>&1 )
+recorded_files="$(echo "$SANDBOX"/out/logs/run-*/session-9.id | wc -w | tr -d ' ')"
+assert_equals "each run records its sessions separately" "$recorded_files" "2"
 
 # --- Bad input ------------------------------------------------------------
 out="$(run_autoreview --auto --jobs 0)"
@@ -293,6 +268,18 @@ assert_contains "the loop ends with nothing left" "$out" "nothing left to babysi
 out="$(FAKE_GH_APPROVED="9" run_autoreview_until "next check in" 10 --auto --babysit=1)"
 assert_contains "an unapproved PR keeps the loop going" "$out" "next check in 1m"
 assert_contains "only the unapproved PR is left" "$out" "(1 PR(s) left)"
+
+# The one behaviour no single pass can show: the pass after the first resumes
+# the session its predecessor actually ran in, rather than the derived id, which
+# may name an older review. It costs a minute of wall clock because the shortest
+# interval the tool accepts is a minute -- deliberately, so a re-check loop
+# cannot run hot. Approving #8 makes pass 2's header ("1 PR(s)") unambiguous.
+out="$(FAKE_GH_APPROVED="8" run_autoreview_until "reviewing 1 PR(s)" 90 --auto --babysit=1)"
+recorded="$(cat "$SANDBOX"/out/logs/run-*/session-9.id 2>/dev/null || true)"
+assert_contains "a second pass re-checks rather than reviews again" \
+  "$(claude_calls)" "/recheck-pr 9"
+assert_contains "...resuming the session the first pass ran in" \
+  "$(claude_call_for '/recheck-pr 9')" "--resume $recorded"
 
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"

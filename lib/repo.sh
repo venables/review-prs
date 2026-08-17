@@ -12,12 +12,21 @@ require() {
 
 # Belt-and-suspenders: brew lists these as formula dependencies, but either
 # entry point may also be run standalone (curl-pipe-bash, manual install, a
-# clone on a box that never saw the tap). Every name here is also its formula
-# name, so the hint needs no lookup table.
+# clone on a box that never saw the tap). Most names here are also their formula
+# name; the few that are not get a hint of their own, because a message naming a
+# package that does not exist is worse than no message.
+dep_hint() {
+  case "$1" in
+    # Ships with macOS, so this only ever prints on a slim Linux image.
+    pgrep) printf 'install procps (it ships with macOS)' ;;
+    *)     printf 'brew install %s' "$1" ;;
+  esac
+}
+
 require_deps() {
   local missing=0 cmd
   for cmd in "$@"; do
-    require "$cmd" "brew install $cmd" || missing=1
+    require "$cmd" "$(dep_hint "$cmd")" || missing=1
   done
   [[ "$missing" -eq 0 ]] || exit 1
 }
