@@ -2,6 +2,10 @@
 # review-prs: pick open non-draft PRs in the current repo and fan out a
 # review command into a new terminal tab per selection.
 #
+# For the same fan-out without tabs -- headless `claude -p` reviews with a
+# progress display and a real exit status -- see the `autoreview` sibling.
+# Both share lib/: PR listing, ranking, the picker, and session continuity.
+#
 # Per-tab command:
 #   Each selected PR opens a tab that `cd`s to the repo root and runs the
 #   review command (see $REVIEW_PRS_CMD below) with the PR number. By default
@@ -56,6 +60,31 @@
 
 set -euo pipefail
 
+# --- Library --------------------------------------------------------------
+# Resolve this file through any symlinks before looking for lib/: the documented
+# manual install symlinks the entry point into /usr/local/bin, and the library
+# lives next to the real file, not next to the link.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *)  self="$(dirname "$self")/$link" ;;
+  esac
+done
+lib_dir="$(cd "$(dirname "$self")/lib" 2>/dev/null && pwd)" || {
+  printf 'error: cannot find lib/ next to %s\n' "$self" >&2
+  exit 1
+}
+# shellcheck source=lib/interval.sh
+. "$lib_dir/interval.sh"
+# shellcheck source=lib/repo.sh
+. "$lib_dir/repo.sh"
+# shellcheck source=lib/session.sh
+. "$lib_dir/session.sh"
+# shellcheck source=lib/pr-list.sh
+. "$lib_dir/pr-list.sh"
+
 # --- Args ----------------------------------------------------------------
 include_approved=0
 include_dependabot=0
@@ -100,29 +129,14 @@ $REVIEW_PRS_SESSION_ID and a 0/1 $REVIEW_PRS_SESSION_RESUME.
 Under herdr/cmux the enclosing workspace is renamed to $REVIEW_PRS_WORKSPACE
 (default "pr reviews"); set it empty to leave your workspace title alone.
 
+To review the same PRs headlessly instead -- no tabs, a progress display, and
+an exit status that reports the reviews rather than the spawns -- use
+`autoreview`, which takes the same flags.
+
 Your own PRs are always hidden -- this tool is for reviewing others' work.
 EOF
 }
 
-# Normalize a babysit interval to a /loop-style duration: a bare number is
-# minutes ("30" -> "30m"); an already-suffixed value ("30m", "1h") passes
-# through untouched. Anything else is rejected here rather than silently seeded
-# into the spawned tab: "0" would re-check with no delay (a hot loop running
-# recheck-pr under --dangerously-skip-permissions), and "soon" or a bare
-# "--babysit=" would reach /loop as an unparseable duration. Sub-minute units
-# are refused for the same hot-loop reason -- re-checking a PR every second is
-# never what you meant.
-normalize_interval() {
-  local v="$1"
-  [[ "$v" =~ ^[0-9]+$ ]] && v="${v}m"
-  # Leading zeros are fine ("05" is plainly five), but a value of zero is not --
-  # the [1-9] keeps "0", "00" and "0m" rejected.
-  if [[ ! "$v" =~ ^0*[1-9][0-9]*[mhd]$ ]]; then
-    printf 'error: invalid babysit interval: "%s" (expected a positive duration, e.g. 30, 30m, 1h)\n' "$1" >&2
-    return 1
-  fi
-  printf '%s' "$v"
-}
 # Kept raw until after arg parsing: validating here would make a bad
 # $REVIEW_PRS_BABYSIT_INTERVAL in your shell profile hard-fail every run,
 # including --help and ordinary picker runs that never babysit.
@@ -168,201 +182,6 @@ if [[ -n "$auto_review_cmd" && "$babysit" -eq 1 ]]; then
     "$babysit_interval" >&2
 fi
 
-# Author logins treated as bots: hidden unless --dependabot, dimmed when shown.
-# Extend this anchored alternation as more AI coding bots appear, e.g.
-#   bot_login_re='^(dependabot|renovate|copilot)'
-bot_login_re='^dependabot'
-
-# --- Dependency checks ----------------------------------------------------
-# Belt-and-suspenders: brew lists these as formula dependencies, but the
-# script may also be run standalone (curl-pipe-bash, manual install, etc.).
-require() {
-  command -v "$1" >/dev/null 2>&1 && return 0
-  printf 'error: missing required command: %s\n' "$1" >&2
-  [[ -n "${2:-}" ]] && printf '  install with: %s\n' "$2" >&2
-  return 1
-}
-
-missing=0
-require gh  "brew install gh"  || missing=1
-require gum "brew install gum" || missing=1
-require jq  "brew install jq"  || missing=1
-[[ "$missing" -eq 0 ]] || exit 1
-
-# --- Repo + user context --------------------------------------------------
-if ! repo_json="$(gh repo view --json owner,name 2>&1)"; then
-  echo "error: not a GitHub repo (or gh not authenticated)" >&2
-  echo "$repo_json" >&2
-  exit 1
-fi
-owner="$(jq -r '.owner.login' <<<"$repo_json")"
-name="$(jq -r '.name' <<<"$repo_json")"
-repo_root="$(git rev-parse --show-toplevel)"
-
-# `gh api` can exit 0 and still hand back an empty login, which would silently
-# mislabel every PR's engagement -- so check both the status and the value. The
-# `if !` is also what makes a genuine failure reportable here: a bare
-# `me="$(...)"` assignment would trip `set -e` and exit before the message.
-if ! me="$(gh api user --jq .login 2>&1)"; then
-  echo "error: failed to fetch current GitHub user" >&2
-  echo "$me" >&2
-  exit 1
-fi
-if [[ -z "$me" ]]; then
-  echo "error: gh api user returned empty login" >&2
-  exit 1
-fi
-
-# --- Session continuity ---------------------------------------------------
-# A PR's review session id is derived from the repo directory plus owner/name#NUM
-# rather than recorded in a state file: the mapping is then stable across runs
-# with nothing to keep in sync, and nothing to go stale when a PR is closed.
-#
-# $repo_root is in the hash on purpose, and it is what makes the whole scheme
-# safe. Claude Code stores a session under the directory it ran in, and each tab
-# cd's to $repo_root -- so a session belongs to one checkout. Hashing the path
-# in gives a second clone or a git worktree of the same repo its own id for the
-# same PR. Leave it out and both checkouts derive one id: the second would mark
-# the first's session RESUMABLE, resume it (which succeeds, and quietly carries
-# the other checkout's context), and -- worse -- would never pin a --session-id
-# of its own, so it could never become resumable.
-#
-# md5 on macOS, md5sum elsewhere. A box with neither still reviews fine -- it
-# just loses session continuity, so degrade instead of failing the run. This is
-# a naming hash, not a security one; collisions across PRs of one repo are the
-# only thing that matters, and 128 bits is far past enough for that.
-if command -v md5 >/dev/null 2>&1; then
-  hash_hex() { md5 -q; }
-elif command -v md5sum >/dev/null 2>&1; then
-  hash_hex() { md5sum | cut -d' ' -f1; }
-else
-  hash_hex() { printf ''; }
-fi
-
-# Shape the digest into a v5-form UUID: claude --session-id rejects anything
-# else. Byte 6's high nibble is the version (5) and byte 8's is the variant (a
-# => 10xx), which is why those two nibbles are literals rather than digest hex.
-pr_session_id() {
-  local h
-  h="$(printf 'review-prs:%s:%s/%s#%s' "$repo_root" "$owner" "$name" "$1" | hash_hex)"
-  [[ ${#h} -ge 32 ]] || return 0
-  printf '%s-%s-5%s-a%s-%s' \
-    "${h:0:8}" "${h:8:4}" "${h:13:3}" "${h:17:3}" "${h:20:12}"
-}
-
-# True when a session with this id already exists locally. Sessions live under a
-# directory named for the escaped cwd, but that escaping is undocumented and has
-# changed before -- so glob every project directory instead of rebuilding the
-# name. Searching wider than $repo_root is safe because the id already encodes
-# the checkout: only this checkout's session can carry this id.
-claude_projects_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
-session_exists() {
-  [[ -n "$1" && -d "$claude_projects_dir" ]] || return 1
-  compgen -G "$claude_projects_dir/*/$1.jsonl" >/dev/null 2>&1
-}
-
-if [[ "$continue_sessions" -eq 1 && -z "$(pr_session_id 0)" ]]; then
-  echo "error: --continue needs md5 or md5sum to derive session ids; neither found" >&2
-  exit 1
-fi
-
-# --- Fetch open non-draft PRs + activity in one GraphQL call --------------
-prs_json="$(gh api graphql \
-  -F owner="$owner" -F name="$name" \
-  -f query='
-    query($owner:String!, $name:String!) {
-      repository(owner:$owner, name:$name) {
-        pullRequests(states:OPEN, first:50, orderBy:{field:UPDATED_AT, direction:DESC}) {
-          nodes {
-            number
-            title
-            isDraft
-            updatedAt
-            reviewDecision
-            author { login }
-            comments(last:100) { nodes { author { login } updatedAt } }
-            reviews(last:100)  { nodes { author { login } submittedAt } }
-            commits(last:100)  { nodes { commit { committedDate author { user { login } } } } }
-          }
-        }
-      }
-    }' \
-  --jq '.data.repository.pullRequests.nodes | map(select(.isDraft == false))')"
-
-# Always hide your own PRs -- this tool is for reviewing others' work.
-prs_json="$(jq --arg me "$me" 'map(select((.author.login // "") != $me))' <<<"$prs_json")"
-
-# Hide bot PRs (Dependabot et al.) unless --dependabot was passed.
-if [[ "$include_dependabot" -eq 0 ]]; then
-  prs_json="$(jq --arg botre "$bot_login_re" \
-    'map(select((.author.login // "") | test($botre) | not))' <<<"$prs_json")"
-fi
-
-# Filter out APPROVED unless --all was passed.
-if [[ "$include_approved" -eq 0 ]]; then
-  prs_json="$(jq 'map(select(.reviewDecision != "APPROVED"))' <<<"$prs_json")"
-fi
-
-count="$(jq 'length' <<<"$prs_json")"
-if [[ "$count" -eq 0 ]]; then
-  hint=""
-  [[ "$include_approved"   -eq 0 ]] && hint+=" --all (approved)"
-  [[ "$include_dependabot" -eq 0 ]] && hint+=" --dependabot (bots)"
-  if [[ -n "$hint" ]]; then
-    printf 'no matching open PRs; try:%s\n' "$hint"
-  else
-    echo "no open non-draft PRs"
-  fi
-  exit 0
-fi
-
-# --- Build display rows ---------------------------------------------------
-# jq emits "RANK\tUPDATED_AT\tBOT\t#NUM\tENGAGE\tREVIEW\tTIME\t@AUTHOR\tTITLE",
-# then we sort by rank+recency and strip the two leading sort columns. The BOT
-# flag (0/1) rides along as the first surviving column so we can dim bot rows
-# after alignment without re-deriving the author.
-now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-sorted="$(jq -r --arg me "$me" --arg now "$now_iso" --arg botre "$bot_login_re" '
-  def rel(ts):
-    ((($now | fromdateiso8601) - (ts | fromdateiso8601)) | floor) as $s
-    | if   $s < 60     then "\($s)s ago"
-      elif $s < 3600   then "\(($s/60)   | floor)m ago"
-      elif $s < 86400  then "\(($s/3600) | floor)h ago"
-      else                  "\(($s/86400)| floor)d ago"
-      end;
-
-  .[]
-  | . as $pr
-  | (
-      ($pr.comments.nodes // [] | map({at: .updatedAt,            who: (.author.login // "")})) +
-      ($pr.reviews.nodes  // [] | map({at: .submittedAt,          who: (.author.login // "")})) +
-      ($pr.commits.nodes  // [] | map({at: .commit.committedDate, who: (.commit.author.user.login // "")}))
-    ) as $events
-  | ($events | map(select(.at != null and .who == $me)) | map(.at) | sort | last) as $mine
-  | ($events | map(select(.at != null and .who != $me)) | map(.at) | sort | last) as $other
-  | (
-      if   $mine  == null                     then "NEW"
-      elif $other != null and $other > $mine  then "UPDATED"
-      else                                         "SEEN"
-      end
-    ) as $engage
-  | (
-      if   $engage == "NEW"     then 0
-      elif $engage == "UPDATED" then 1
-      else                           2
-      end
-    ) as $rank
-  | (
-      if   .reviewDecision == "CHANGES_REQUESTED" then "CHANGES"
-      elif .reviewDecision == "APPROVED"          then "APPROVED"
-      else                                             "-"
-      end
-    ) as $review
-  | (if (.author.login // "") | test($botre) then 1 else 0 end) as $bot
-  | "\($rank)\t\(.updatedAt)\t\($bot)\t#\(.number)\t\($engage)\t\($review)\t\(rel(.updatedAt))\t@\(.author.login // "ghost")\t\(.title)"
-' <<<"$prs_json" | sort -t $'\t' -k1,1n -k2,2r | cut -f3-)"
-
 # Command choice is independent of how PRs are selected: any unattended run
 # (--auto sweep OR --babysit picker) takes the unattended override, so the tab
 # self-closes on approval; a plain picker run keeps the interactive one. From
@@ -371,104 +190,15 @@ if [[ "$auto" -eq 1 || "$babysit" -eq 1 ]]; then
   review_cmd="$auto_review_cmd"
 fi
 
-# --- Auto mode: no picker -------------------------------------------------
-# Fan out every NEW/UPDATED PR per tab. SEEN PRs are skipped on purpose --
-# nothing has changed since you last engaged, so an automated sweep has no
-# reason to re-review them. $sorted columns are tab-separated:
-# 1=bot 2=#NUM 3=engage 4=review 5=time 6=author 7=title.
-if [[ "$auto" -eq 1 ]]; then
-  numbers=()
-  while IFS= read -r n; do
-    [[ -z "$n" ]] && continue
-    numbers+=("$n")
-  done < <(awk -F'\t' '$3=="NEW" || $3=="UPDATED" { sub(/^#/, "", $2); print $2 }' <<<"$sorted")
-
-  if [[ "${#numbers[@]}" -eq 0 ]]; then
-    echo "no NEW or UPDATED PRs to auto-review"
-    exit 0
-  fi
-  printf 'auto-reviewing %d PR(s): %s\n' "${#numbers[@]}" "$(printf '#%s ' "${numbers[@]}")"
-else
-  # Mark the PRs that already have a local review session, so you can see what
-  # --continue would resume before you pick. The marker goes in after REVIEW,
-  # leaving the columns the auto branch reads (2=#NUM, 3=engage) where they are.
-  # The column only appears when something is resumable: on a repo you have
-  # never reviewed, every row would read "-" and buy nothing. This loop runs in
-  # the current shell, not a subshell, so $resumable_any survives it.
-  #
-  # Marking costs one hash and one glob per PR, so skip the whole loop when no
-  # session store exists -- there is nothing to find, and a box without Claude
-  # Code should not pay for the lookup on every picker run.
-  resumable_any=0
-  if [[ -d "$claude_projects_dir" ]]; then
-    marked=""
-    while IFS=$'\t' read -r bot num engage review rest; do
-      [[ -n "$num" ]] || continue
-      if session_exists "$(pr_session_id "${num#\#}")"; then
-        mark="RESUMABLE"
-        resumable_any=1
-      else
-        mark="-"
-      fi
-      marked+="$bot"$'\t'"$num"$'\t'"$engage"$'\t'"$review"$'\t'"$mark"$'\t'"$rest"$'\n'
-    done <<<"$sorted"
-    if [[ "$resumable_any" -eq 1 ]]; then
-      sorted="${marked%$'\n'}"
-    fi
-  fi
-
-  # Surviving columns: "BOT\t#NUM\t...\tTITLE". Align everything but the BOT
-  # flag, then dim bot rows (256-color gray 245) so they read as lower-priority
-  # noise. paste re-zips the flags with the aligned rows, preserving order.
-  dim=$'\033[38;5;245m'
-  reset=$'\033[0m'
-  aligned="$(cut -f2- <<<"$sorted" | column -t -s $'\t')"
-  display="$(paste -d $'\t' <(cut -f1 <<<"$sorted") <(printf '%s\n' "$aligned") \
-    | while IFS=$'\t' read -r bot row; do
-        if [[ "$bot" == "1" ]]; then
-          printf '%s%s%s\n' "$dim" "$row" "$reset"
-        else
-          printf '%s\n' "$row"
-        fi
-      done)"
-
-  # --- Picker -------------------------------------------------------------
-  legend_text='NEW = unreviewed by you   UPDATED = activity since your last comment   SEEN = nothing new   CHANGES = changes requested'
-  if [[ "$resumable_any" -eq 1 ]]; then
-    if [[ "$continue_sessions" -eq 1 ]]; then
-      legend_text+='   RESUMABLE = earlier review session, resumed by -C'
-    else
-      legend_text+='   RESUMABLE = earlier review session; pass -C to resume it'
-    fi
-  fi
-  [[ "$include_dependabot" -eq 1 ]] && legend_text+='   (dimmed = Dependabot)'
-  legend="$(gum style --foreground 240 "$legend_text")"
-
-  selected="$(printf '%s\n' "$display" \
-    | gum choose --no-limit \
-        --header "Pick PRs to review (space toggles, enter confirms)
-$legend" \
-        --height 20 \
-    || true)"
-
-  if [[ -z "${selected// /}" ]]; then
-    echo "no PRs selected"
-    exit 0
-  fi
-
-  numbers=()
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    if [[ "$line" =~ \#([0-9]+) ]]; then
-      numbers+=("${BASH_REMATCH[1]}")
-    fi
-  done <<<"$selected"
-
-  if [[ "${#numbers[@]}" -eq 0 ]]; then
-    echo "error: could not parse PR numbers from selection" >&2
-    exit 1
-  fi
+# --- Context + selection --------------------------------------------------
+require_deps gh gum jq
+load_repo_context
+# `if`, not `&&`: a false test as the last statement of a line would trip
+# errexit and exit the script before anything is selected.
+if [[ "$continue_sessions" -eq 1 ]]; then
+  require_session_ids
 fi
+select_prs
 
 # --- Terminal detection + spawn ------------------------------------------
 spawn_in_herdr() {
@@ -625,6 +355,7 @@ else
   echo "error: no supported terminal detected" >&2
   echo "  expected HERDR_ENV=1, CMUX_SURFACE_ID, or TERM_PROGRAM=ghostty" >&2
   echo "  HERDR_ENV=${HERDR_ENV:-<unset>} CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-<unset>} TERM_PROGRAM=${TERM_PROGRAM:-<unset>}" >&2
+  echo "  (for a headless fan-out that needs no terminal, use: autoreview)" >&2
   exit 1
 fi
 
@@ -635,32 +366,9 @@ spawn_failures=0
 for n in "${numbers[@]}"; do
   # Decide this PR's session before anything else: the flag, the prompt and the
   # tab label all follow from it.
-  sid="$(pr_session_id "$n")"
-  resume=0
-  session_flag=""
-  if session_exists "$sid"; then
-    # An earlier session exists. --continue reopens it; without --continue we
-    # pass no session flag at all and let claude allocate a fresh id, which
-    # keeps the default behavior unchanged -- reusing a taken id is a hard
-    # error, and quietly resuming would be a surprise.
-    #
-    # Refuse to resume a session another tab still holds. Claude Code treats an
-    # id as taken once the transcript file exists, so it does not stop a second
-    # process from reopening a live one -- two agents would then write one
-    # transcript. A babysit tab is long-lived by design, which makes this easy
-    # to hit. pgrep matches the id in the spawned command line; a false match
-    # only costs you a fresh review, so it fails safe.
-    if [[ "$continue_sessions" -eq 1 ]]; then
-      if pgrep -f -- "$sid" >/dev/null 2>&1; then
-        printf 'note: PR #%s has a review session open in another tab; reviewing fresh\n' "$n" >&2
-      else
-        resume=1
-        session_flag="--resume $sid"
-      fi
-    fi
-  elif [[ -n "$sid" ]]; then
-    session_flag="--session-id $sid"
-  fi
+  plan_session "$n"
+  sid="$session_id"
+  resume="$session_resume"
 
   if [[ "$resume" -eq 1 ]]; then
     echo "spawning tab for PR #$n via $spawner (resuming earlier review)"
