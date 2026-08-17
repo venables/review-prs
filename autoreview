@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# autoreview: review the current repo's open PRs headlessly -- no terminal
+# tabs. Each PR is reviewed by a `claude -p` subprocess; the run shows live
+# per-PR progress, prints a summary, and exits nonzero if any review failed.
+#
+# This is the sibling of `review-prs`, which fans the same PRs out into one
+# terminal tab each. Both share lib/: PR listing, ranking, the picker and
+# session continuity are identical, so the two agree on what is worth
+# reviewing and on which session a PR belongs to.
+#
+# Pick this one when there is no terminal to spawn into (ssh, cron, CI), when
+# the exit status has to mean "the reviews succeeded" rather than "the tabs
+# opened", or when a dozen PRs would mean a dozen tabs. Pick review-prs when
+# you want to watch a review happen and steer it mid-flight.
+#
+# Losing the tab does not lose the review: every run pins a derived session id,
+# so `claude --resume <id>` reopens any of them afterwards, and --continue
+# re-enters them here. The summary prints each session id for exactly that.
+#
+# Prompts, by mode:
+#   fresh               /panel-review N
+#   fresh, unattended   /auto-review N     (--auto / --babysit)
+#   resumed             /recheck-pr N      (--continue, and every babysit pass
+#                                           after the first)
+# Skills are invoked by slash name rather than in prose: an unattended one-shot
+# has no human to correct a prompt that failed to trigger the skill.
+#
+# --babysit re-runs the whole pass on an interval, dropping PRs as they become
+# APPROVED and resuming the rest, until nothing is left. Unlike review-prs --
+# which seeds an in-session /loop inside each tab -- the loop is this script,
+# so an interval that never converges is one process you can see and kill.
+
+set -euo pipefail
+
+# --- Library --------------------------------------------------------------
+# Resolve this file through any symlinks before looking for lib/: the documented
+# manual install symlinks the entry point into /usr/local/bin, and the library
+# lives next to the real file, not next to the link.
+self="${BASH_SOURCE[0]}"
+while [[ -L "$self" ]]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *)  self="$(dirname "$self")/$link" ;;
+  esac
+done
+lib_dir="$(cd "$(dirname "$self")/lib" 2>/dev/null && pwd)" || {
+  printf 'error: cannot find lib/ next to %s\n' "$self" >&2
+  exit 1
+}
+# shellcheck source=lib/interval.sh
+. "$lib_dir/interval.sh"
+# shellcheck source=lib/repo.sh
+. "$lib_dir/repo.sh"
+# shellcheck source=lib/session.sh
+. "$lib_dir/session.sh"
+# shellcheck source=lib/pr-list.sh
+. "$lib_dir/pr-list.sh"
+
+# --- Args ----------------------------------------------------------------
+include_approved=0
+include_dependabot=0
+auto=0
+babysit=0
+continue_sessions=0
+jobs_max="${AUTOREVIEW_JOBS:-2}"
+timeout="${AUTOREVIEW_TIMEOUT:-3600}"
+max_budget="${AUTOREVIEW_MAX_BUDGET_USD:-}"
+log_dir="${AUTOREVIEW_LOG_DIR:-}"
+
+print_help() {
+  cat <<'EOF'
+autoreview: review open PRs headlessly, with progress and a real exit status.
+
+Usage: autoreview [--auto] [--babysit[=MINUTES]] [--continue] [--jobs N]
+                  [--timeout SECONDS] [--budget USD] [--log-dir DIR]
+                  [--all] [--dependabot] [--help]
+
+  --auto, -A          Skip the picker; review every NEW/UPDATED PR.
+  --babysit[=MIN], -b Re-run the pass every MIN minutes (default 30, or
+                      $AUTOREVIEW_BABYSIT_INTERVAL), dropping PRs as they are
+                      approved, until none are left. A bare number is minutes;
+                      30m/1h/2d also work.
+  --continue, -C      Resume this machine's earlier review session for a PR
+                      (a second look at the findings) instead of reviewing it
+                      from scratch. Marked RESUMABLE in the picker.
+  --jobs N, -j N      Reviews to run at once (default 2, or $AUTOREVIEW_JOBS).
+                      Keep it low: a panel review is itself several agents.
+  --timeout SECONDS   Give up on a review that runs this long (default 3600,
+                      or $AUTOREVIEW_TIMEOUT; 0 disables).
+  --budget USD        Cap each review's API spend (claude --max-budget-usd).
+  --log-dir DIR       Where to write per-PR output (default: a temp directory,
+                      printed on every run).
+  --all, -a           Include PRs already marked APPROVED (default: exclude).
+  --dependabot, -d    Include Dependabot PRs (default: hidden; shown dimmed).
+  --help, -h          Show this help.
+
+Each PR is reviewed by:
+  claude -p --dangerously-skip-permissions --output-format json \
+    --session-id UUID "/panel-review N"
+where UUID is derived from the repo directory plus owner/name#N, so the same PR
+in this checkout always maps to the same session -- and `claude --resume UUID`
+reopens it interactively later. Override the reviewer via $AUTOREVIEW_CMD, or
+$AUTOREVIEW_AUTO_CMD for --auto/--babysit runs (the PR number replaces the
+first "{}", or is appended if absent):
+  AUTOREVIEW_CMD='my-review'                           (append form)
+  AUTOREVIEW_CMD='gh pr checkout {} && my-review {}'   (placeholder form)
+An overridden command owns its own session handling; it receives the id as
+$REVIEW_PRS_SESSION_ID and a 0/1 $REVIEW_PRS_SESSION_RESUME.
+
+Exit status is 0 only when every review in the final pass succeeded.
+
+To fan the same PRs into terminal tabs you can watch and steer instead, use
+`review-prs`.
+
+Your own PRs are always hidden -- this tool is for reviewing others' work.
+EOF
+}
+
+# Reject a flag value early rather than letting it reach a sleep, a slot count
+# or claude itself, where the failure would be far from its cause.
+require_int() {
+  local flag="$1" value="$2" min="$3"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || [[ "$value" -lt "$min" ]]; then
+    printf 'error: %s expects an integer >= %s, got "%s"\n' "$flag" "$min" "$value" >&2
+    exit 1
+  fi
+}
+
+# A flag written as "--flag value" needs its value to exist; "--flag=value" is
+# unpacked by the caller before we get here.
+require_value() {
+  if [[ -z "${2:-}" ]]; then
+    printf 'error: %s expects a value\n' "$1" >&2
+    exit 1
+  fi
+}
+
+# Kept raw until after arg parsing: validating here would make a bad
+# $AUTOREVIEW_BABYSIT_INTERVAL in your shell profile hard-fail every run,
+# including --help and ordinary picker runs that never babysit.
+babysit_interval_raw="${AUTOREVIEW_BABYSIT_INTERVAL:-30}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --auto|-A)       auto=1; shift ;;
+    --babysit|-b)    babysit=1; shift ;;
+    --babysit=*)     babysit=1; babysit_interval_raw="${1#*=}"; shift ;;
+    --continue|-C)   continue_sessions=1; shift ;;
+    --jobs|-j)       require_value "$1" "${2:-}"; jobs_max="$2"; shift 2 ;;
+    --jobs=*|-j=*)   jobs_max="${1#*=}"; shift ;;
+    --timeout)       require_value "$1" "${2:-}"; timeout="$2"; shift 2 ;;
+    --timeout=*)     timeout="${1#*=}"; shift ;;
+    --budget)        require_value "$1" "${2:-}"; max_budget="$2"; shift 2 ;;
+    --budget=*)      max_budget="${1#*=}"; shift ;;
+    --log-dir)       require_value "$1" "${2:-}"; log_dir="$2"; shift 2 ;;
+    --log-dir=*)     log_dir="${1#*=}"; shift ;;
+    --all|-a)        include_approved=1; shift ;;
+    --dependabot|-d) include_dependabot=1; shift ;;
+    --help|-h)       print_help; exit 0 ;;
+    *)               printf 'unknown arg: %s\n' "$1" >&2; print_help >&2; exit 1 ;;
+  esac
+done
+
+require_int "--jobs" "$jobs_max" 1
+require_int "--timeout" "$timeout" 0
+if [[ -n "$max_budget" && ! "$max_budget" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  printf 'error: --budget expects a dollar amount, got "%s"\n' "$max_budget" >&2
+  exit 1
+fi
+
+# Validate the interval only when babysitting is actually on, so an unrelated
+# bad env var never blocks a plain run.
+babysit_interval=""
+if [[ "$babysit" -eq 1 ]]; then
+  babysit_interval="$(normalize_interval "$babysit_interval_raw")" || exit 1
+fi
+
+# The reviewer to run, and its unattended twin. Empty means "use the built-in
+# claude invocation", which needs the PR number and the session state to pick
+# its flags and prompt and so cannot be flattened into a template string here.
+review_cmd="${AUTOREVIEW_CMD:-}"
+auto_review_cmd="${AUTOREVIEW_AUTO_CMD:-}"
+if [[ "$auto" -eq 1 || "$babysit" -eq 1 ]]; then
+  review_cmd="$auto_review_cmd"
+fi
+
+# --- Context + selection --------------------------------------------------
+# gum is required by the picker alone (see run_picker), so an --auto sweep runs
+# on a box that has never seen it.
+require_deps gh jq
+if [[ -z "$review_cmd" ]] && ! command -v claude >/dev/null 2>&1; then
+  echo "error: missing required command: claude" >&2
+  echo "  install it from https://claude.com/claude-code, or set \$AUTOREVIEW_CMD" >&2
+  exit 1
+fi
+load_repo_context
+# `if`, not `&&`: a false test as the last statement of a line would trip
+# errexit and exit the script before anything is selected.
+if [[ "$continue_sessions" -eq 1 ]]; then
+  require_session_ids
+fi
+select_prs
+
+if [[ -z "$log_dir" ]]; then
+  log_dir="$(mktemp -d "${TMPDIR:-/tmp}/autoreview.XXXXXX")"
+fi
+mkdir -p "$log_dir"
+
+# --- Job pool -------------------------------------------------------------
+# Bash 3.2 -- still what macOS ships -- has no `wait -n`, and `kill -0` on a
+# finished child keeps succeeding until it is reaped. So a job announces its own
+# completion by writing its exit status to a file, under a temp name and moved
+# into place so a half-written status can never be read. The loop that watches
+# for those files is also the loop that redraws the display, which is why
+# scheduling and rendering are one loop and not two.
+#
+# State is parallel arrays indexed by queue position (bash 3.2 has no
+# associative arrays):
+q_pr=()      # PR number
+q_state=()   # queued | running | done | failed | timeout
+q_pid=()     # job subshell pid, while running
+q_sid=()     # derived session id
+q_flag=()    # "--session-id UUID" / "--resume UUID" / ""
+q_resume=()  # 1 when this job resumes an earlier session
+q_start=()   # epoch seconds
+q_end=()     # epoch seconds
+q_status=()  # exit status, once finished
+
+pass_dir=""
+rendered_lines=0
+spin=0
+# Double-quoted so the trailing backslash is an escaped literal: |/-\
+spin_frames="|/-\\"
+tty=0
+if [[ -t 1 ]]; then tty=1; fi
+
+job_file() { printf '%s/pr-%s.%s' "$pass_dir" "${q_pr[$1]}" "$2"; }
+
+fmt_dur() {
+  local s="$1"
+  if   [[ "$s" -ge 3600 ]]; then printf '%dh%02dm' $((s / 3600)) $(((s % 3600) / 60))
+  elif [[ "$s" -ge 60   ]]; then printf '%dm%02ds' $((s / 60)) $((s % 60))
+  else                           printf '%ds' "$s"
+  fi
+}
+
+# The prompt for one PR. Resuming and reviewing from scratch are different jobs,
+# so they get different prompts: a resumed session already holds the earlier
+# review, which is exactly what recheck-pr needs and what a fresh panel review
+# would throw away.
+headless_prompt() {
+  local i="$1" n="${q_pr[$1]}"
+  if [[ "${q_resume[i]}" -eq 1 ]]; then
+    printf '/recheck-pr %s' "$n"
+  elif [[ "$auto" -eq 1 || "$babysit" -eq 1 ]]; then
+    printf '/auto-review %s' "$n"
+  else
+    printf '/panel-review %s' "$n"
+  fi
+}
+
+# Runs inside the job subshell, with stdout on the JSON envelope and stderr on
+# the log. Unlike review-prs -- whose tab is a new shell it can only reach
+# through a command string -- we spawn the child ourselves, so the session
+# variables an override reads go into its real environment.
+review_for() {
+  local i="$1" n="${q_pr[$1]}"
+  cd "$repo_root" || return 1
+
+  if [[ -n "$review_cmd" ]]; then
+    local invocation
+    if [[ "$review_cmd" == *"{}"* ]]; then
+      invocation="${review_cmd//\{\}/$n}"
+    else
+      invocation="$review_cmd $n"
+    fi
+    REVIEW_PRS_SESSION_ID="${q_sid[i]}" REVIEW_PRS_SESSION_RESUME="${q_resume[i]}" \
+      bash -c "$invocation"
+    return
+  fi
+
+  local argv=(claude -p --dangerously-skip-permissions --output-format json)
+  if [[ -n "${q_flag[i]}" ]]; then
+    # Two fixed words ("--resume UUID"), never user content, so splitting the
+    # planned flag back apart is safe and keeps plan_session's single output.
+    local flag_words=()
+    read -r -a flag_words <<<"${q_flag[i]}"
+    argv+=("${flag_words[@]}")
+  fi
+  if [[ -n "$max_budget" ]]; then
+    argv+=(--max-budget-usd "$max_budget")
+  fi
+  argv+=("$(headless_prompt "$i")")
+  "${argv[@]}"
+}
+
+run_job() {
+  local i="$1" rc=0 status_file
+  status_file="$(job_file "$i" status)"
+  set +e
+  review_for "$i" >"$(job_file "$i" json)" 2>"$(job_file "$i" log)"
+  rc=$?
+  printf '%s' "$rc" >"$status_file.tmp"
+  mv "$status_file.tmp" "$status_file"
+}
+
+start_job() {
+  local i="$1"
+  plan_session "${q_pr[i]}"
+  q_sid[i]="$session_id"
+  q_flag[i]="$session_flag"
+  q_resume[i]="$session_resume"
+  rm -f "$(job_file "$i" status)"
+  run_job "$i" &
+  q_pid[i]=$!
+  q_start[i]="$(date +%s)"
+  q_state[i]="running"
+  note_transition "$i"
+}
+
+# claude -p can exit 0 and still report a failed turn in its envelope, so a zero
+# exit is not on its own a successful review. An override whose stdout is not
+# JSON simply never trips this.
+job_reported_error() {
+  local out flag
+  out="$(job_file "$1" json)"
+  [[ -s "$out" ]] || return 1
+  flag="$(jq -r 'if type == "object" then (.is_error // false) else false end' \
+    "$out" 2>/dev/null || printf 'false')"
+  [[ "$flag" == "true" ]]
+}
+
+finish_job() {
+  local i="$1" now="$2" raw="$3"
+  q_end[i]="$now"
+  wait "${q_pid[i]}" 2>/dev/null || true
+  q_status[i]="$raw"
+  if [[ "$raw" == "timeout" ]]; then
+    q_state[i]="timeout"
+  elif [[ "$raw" == "0" ]] && ! job_reported_error "$i"; then
+    q_state[i]="done"
+  else
+    q_state[i]="failed"
+  fi
+  note_transition "$i"
+}
+
+# Kill a process and everything under it, leaves first. Killing only the job
+# subshell is not enough: a reviewer spawns its own children (a panel review is
+# several agents), and an orphaned tree keeps spending, keeps holding the
+# session open -- so the next --continue refuses to resume it -- and keeps
+# whatever stdout it inherited open long after this script exits.
+#
+# Job control (`set -m`, then one signal to the process group) would do this in
+# one call, but it makes bash announce every killed job on stderr, which lands
+# in the middle of the redrawn progress block. Walking the tree is quiet.
+kill_tree() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    kill_tree "$child"
+  done
+  kill "$pid" >/dev/null 2>&1 || true
+}
+
+# Stop a job that has outrun --timeout, or that Ctrl-C caught. Best-effort by
+# design: a review we cannot reach is reported as a timeout either way, and the
+# pass moves on rather than blocking a slot forever. The session id is a second
+# net -- it is unique and on the reviewer's command line, so it catches a
+# process the tree walk raced past.
+stop_job() {
+  local pid="$1" sid="$2"
+  kill_tree "$pid"
+  if [[ -n "$sid" ]]; then
+    pkill -f -- "$sid" >/dev/null 2>&1 || true
+  fi
+}
+
+# Without a TTY -- a cron run, or output piped to a log -- there is no cursor to
+# move, so the in-place block is replaced by one line per state change.
+note_transition() {
+  if [[ "$tty" -eq 1 ]]; then return 0; fi
+  local i="$1" n="${q_pr[$1]}" took
+  took="$(fmt_dur $((q_end[i] - q_start[i])))"
+  case "${q_state[i]}" in
+    running) printf 'start   #%s\n' "$n" ;;
+    done)    printf 'done    #%s (%s)\n' "$n" "$took" ;;
+    failed)  printf 'FAILED  #%s (exit %s, %s)\n' "$n" "${q_status[i]}" "$took" ;;
+    timeout) printf 'TIMEOUT #%s (%s)\n' "$n" "$took" ;;
+  esac
+}
+
+render() {
+  if [[ "$tty" -ne 1 ]]; then return 0; fi
+  local now="$1" i mark label elapsed
+  if [[ "$rendered_lines" -gt 0 ]]; then
+    printf '\033[%dA' "$rendered_lines"
+  fi
+  for ((i = 0; i < ${#q_pr[@]}; i++)); do
+    case "${q_state[i]}" in
+      queued)
+        mark=" "; label="queued"; elapsed="" ;;
+      running)
+        mark="${spin_frames:$spin:1}"; label="reviewing"
+        elapsed="$(fmt_dur $((now - q_start[i])))" ;;
+      done)
+        mark="+"; label="done"
+        elapsed="$(fmt_dur $((q_end[i] - q_start[i])))" ;;
+      failed)
+        mark="x"; label="failed (exit ${q_status[i]})"
+        elapsed="$(fmt_dur $((q_end[i] - q_start[i])))" ;;
+      timeout)
+        mark="x"; label="timed out"
+        elapsed="$(fmt_dur $((q_end[i] - q_start[i])))" ;;
+      *)
+        mark=" "; label="${q_state[i]}"; elapsed="" ;;
+    esac
+    printf '\033[2K  %s  #%-5s %-24s %8s\n' "$mark" "${q_pr[i]}" "$label" "$elapsed"
+  done
+  rendered_lines="${#q_pr[@]}"
+  spin=$(((spin + 1) % ${#spin_frames}))
+}
+
+run_pass() {
+  local pass="$1"; shift
+  pass_dir="$log_dir/pass-$pass"
+  mkdir -p "$pass_dir"
+
+  q_pr=("$@")
+  local total="${#q_pr[@]}" i
+  for ((i = 0; i < total; i++)); do
+    q_state[i]="queued"; q_pid[i]=""; q_sid[i]=""; q_flag[i]=""
+    q_resume[i]=0; q_start[i]=0; q_end[i]=0; q_status[i]=""
+  done
+
+  printf 'reviewing %d PR(s), %d at a time\n' "$total" "$jobs_max"
+  printf 'logs: %s\n\n' "$pass_dir"
+  rendered_lines=0
+
+  local running=0 next=0 now status_file
+  while :; do
+    while [[ "$running" -lt "$jobs_max" && "$next" -lt "$total" ]]; do
+      start_job "$next"
+      next=$((next + 1))
+      running=$((running + 1))
+    done
+
+    now="$(date +%s)"
+    for ((i = 0; i < total; i++)); do
+      if [[ "${q_state[i]}" != "running" ]]; then continue; fi
+      status_file="$(job_file "$i" status)"
+      if [[ -f "$status_file" ]]; then
+        finish_job "$i" "$now" "$(cat "$status_file")"
+        running=$((running - 1))
+      elif [[ "$timeout" -gt 0 && $((now - q_start[i])) -ge "$timeout" ]]; then
+        stop_job "${q_pid[i]}" "${q_sid[i]}"
+        finish_job "$i" "$now" "timeout"
+        running=$((running - 1))
+      fi
+    done
+
+    if [[ "$running" -eq 0 && "$next" -ge "$total" ]]; then break; fi
+    render "$now"
+    sleep 0.2
+  done
+  render "$(date +%s)"
+}
+
+# Cost is claude's own accounting, straight out of the result envelope, so it is
+# only ever there for the built-in reviewer.
+job_cost() {
+  local out c
+  out="$(job_file "$1" json)"
+  if [[ ! -s "$out" ]]; then printf '-'; return 0; fi
+  c="$(jq -r 'if type == "object" then (.total_cost_usd // empty) else empty end' \
+    "$out" 2>/dev/null || true)"
+  if [[ "$c" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    LC_ALL=C printf '$%.2f' "$c"
+  else
+    printf '-'
+  fi
+}
+
+print_summary() {
+  local i rows result
+  rows="PR"$'\t'"RESULT"$'\t'"TIME"$'\t'"COST"$'\t'"SESSION"$'\n'
+  for ((i = 0; i < ${#q_pr[@]}; i++)); do
+    case "${q_state[i]}" in
+      done)    result="done" ;;
+      timeout) result="timed out" ;;
+      failed)  result="failed (exit ${q_status[i]})" ;;
+      *)       result="${q_state[i]}" ;;
+    esac
+    rows+="#${q_pr[i]}"$'\t'"$result"$'\t'
+    rows+="$(fmt_dur $((q_end[i] - q_start[i])))"$'\t'
+    rows+="$(job_cost "$i")"$'\t'"${q_sid[i]:--}"$'\n'
+  done
+  printf '\n'
+  printf '%s' "$rows" | column -t -s $'\t'
+  printf '\nlogs: %s\n' "$pass_dir"
+  printf 'reopen any review with: claude --resume <SESSION>\n'
+}
+
+pass_failures() {
+  local i n=0
+  for ((i = 0; i < ${#q_pr[@]}; i++)); do
+    if [[ "${q_state[i]}" != "done" ]]; then n=$((n + 1)); fi
+  done
+  printf '%s' "$n"
+}
+
+# Ctrl-C must not leave reviews running: they would keep holding their sessions
+# open, and the next --continue would refuse to resume them.
+stop_running_jobs() {
+  local i
+  for ((i = 0; i < ${#q_pr[@]}; i++)); do
+    if [[ "${q_state[i]}" == "running" ]]; then
+      stop_job "${q_pid[i]}" "${q_sid[i]}"
+    fi
+  done
+}
+
+show_cursor() {
+  if [[ "$tty" -eq 1 ]]; then printf '\033[?25h'; fi
+}
+
+on_signal() {
+  printf '\n'
+  echo "interrupted; stopping running reviews" >&2
+  stop_running_jobs
+  show_cursor
+  exit 130
+}
+
+trap on_signal INT TERM
+trap show_cursor EXIT
+if [[ "$tty" -eq 1 ]]; then printf '\033[?25l'; fi
+
+# --- Passes ---------------------------------------------------------------
+queue=("${numbers[@]}")
+pass=1
+failures=0
+while :; do
+  run_pass "$pass" "${queue[@]}"
+  print_summary
+  failures="$(pass_failures)"
+
+  if [[ "$babysit" -ne 1 ]]; then break; fi
+
+  # Approval is read back from GitHub rather than inferred from what the agent
+  # said: the review either landed as an approval or it did not, and a run that
+  # believed its own report would babysit a PR it never actually approved.
+  remaining=()
+  for n in "${queue[@]}"; do
+    if [[ "$(pr_review_decision "$n")" == "APPROVED" ]]; then
+      printf '\nPR #%s is approved; dropping it from the babysit loop\n' "$n"
+    else
+      remaining+=("$n")
+    fi
+  done
+  if [[ "${#remaining[@]}" -eq 0 ]]; then
+    printf '\nevery babysat PR is approved\n'
+    break
+  fi
+
+  queue=("${remaining[@]}")
+  # The first pass pinned each session; every later pass resumes it whether or
+  # not --continue was passed. Re-reviewing from scratch each interval would
+  # throw away the findings the author is in the middle of answering.
+  continue_sessions=1
+  printf '\nnext check in %s (%d PR(s) left)\n' "$babysit_interval" "${#queue[@]}"
+  sleep "$(interval_seconds "$babysit_interval")"
+  pass=$((pass + 1))
+done
+
+# Exit nonzero when any review in the final pass did not complete cleanly, so a
+# cron job or a CI step can tell a finished sweep from a broken one.
+if [[ "$failures" -gt 0 ]]; then
+  printf 'error: %d of %d review(s) failed\n' "$failures" "${#q_pr[@]}" >&2
+  exit 1
+fi
