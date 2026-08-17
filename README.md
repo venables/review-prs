@@ -240,10 +240,12 @@ reopen any review with: claude --resume <SESSION>
 
 ### What you trade
 
-Losing the tab loses live steering, not access. Every review pins the same
-derived session id `review-prs` uses, so `claude --resume <id>` reopens any of
-them afterwards — which is why the summary prints them. Intervention becomes
-on-demand rather than up-front.
+Losing the tab loses live steering, not access. A PR with no session yet gets
+the same derived id `review-prs` would pin, so `claude --resume <id>` reopens
+the review afterwards — which is why the summary prints one per PR. (The id
+comes from the result envelope, so it names the review that just ran even when
+the run let Claude Code allocate its own.) Intervention becomes on-demand rather
+than up-front.
 
 What you gain:
 

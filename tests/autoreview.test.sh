@@ -111,6 +111,56 @@ assert_equals "an override replaces claude entirely" "$(claude_calls)" ""
 AUTOREVIEW_AUTO_CMD='my-review {} --extra {}' run_autoreview --auto >/dev/null
 assert_contains "{} is substituted everywhere" "$(override_calls)" "args=9 --extra 9"
 
+out="$(AUTOREVIEW_CMD='my-review' run_autoreview --auto)"
+assert_contains "an unattended run says when it falls back to the built-in reviewer" \
+  "$out" 'AUTOREVIEW_CMD is set but $AUTOREVIEW_AUTO_CMD is not'
+assert_contains "...and the built-in reviewer is what actually ran" \
+  "$(claude_calls)" "/auto-review 9"
+
+AUTOREVIEW_CMD='my-review' run_autoreview >/dev/null
+assert_equals "an attended run uses the override without complaint" \
+  "$(claude_calls)" ""
+
+# --- The summary ----------------------------------------------------------
+# The session column names the review that just ran, which is not always the
+# derived id: PR #9's session already exists (made above) and no -C was passed,
+# so no flag was sent and claude allocated its own id.
+out="$(run_autoreview --auto)"
+assert_not_contains "an unpinned review is not reported under the derived id" \
+  "$out" "$sid9"
+assert_contains "an unpinned review is reported under the id it actually ran in" \
+  "$out" "00000000-0000-5000-a000-000000000009"
+
+# A box without `column` -- a slim CI image -- still gets its session ids.
+cat >"$SANDBOX/bin/column" <<'STUB'
+#!/usr/bin/env bash
+exit 127
+STUB
+chmod +x "$SANDBOX/bin/column"
+out="$(run_autoreview --auto)"
+assert_equals "a summary that cannot be aligned still exits 0" "$(last_status)" "0"
+assert_contains "...and still prints the session id" "$out" "00000000-0000-5000-a000-0000000000"
+assert_contains "...and still prints the result" "$out" "done"
+rm -f "$SANDBOX/bin/column"
+
+# --- Babysit sessions -----------------------------------------------------
+# A later pass resumes the session the earlier pass actually ran in, recorded
+# under the log dir. Resuming the derived id instead would re-check a review
+# nobody wrote.
+run_autoreview --auto >/dev/null
+mkdir -p "$SANDBOX/out/logs"
+printf 'aaaaaaaa-bbbb-5ccc-addd-eeeeeeeeeeee' >"$SANDBOX/out/logs/session-9.id"
+reset_spawn_log
+( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto --continue >/dev/null 2>&1 )
+assert_contains "a later pass resumes the session the earlier pass used" \
+  "$(claude_call_for '/recheck-pr 9')" "--resume aaaaaaaa-bbbb-5ccc-addd-eeeeeeeeeeee"
+
+# PR #8 has no session, so its review pins one -- and that is the id recorded.
+run_autoreview --auto >/dev/null
+assert_equals "the id a review ran in is recorded for the next pass" \
+  "$(cat "$SANDBOX/out/logs/session-8.id")" \
+  "$(session_id_from "$(claude_call_for '/auto-review 8')")"
+
 # --- Bad input ------------------------------------------------------------
 out="$(run_autoreview --auto --jobs 0)"
 assert_equals "--jobs 0 exits nonzero" "$(last_status)" "1"

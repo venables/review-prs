@@ -288,7 +288,13 @@ if [[ -n "${FAKE_CLAUDE_SLEEP:-}" ]]; then
   # stopping this job has to walk past this shell -- which is what a real
   # reviewer's own subprocesses look like. The marker is unique per sandbox:
   # the test finds it with pgrep, which searches the whole box.
-  bash -c 'sleep "$1"' "$FAKE_SLEEP_TAG-$n" "$FAKE_CLAUDE_SLEEP"
+  # The subshell and the trailing ":" are both load-bearing: a single-command
+  # `bash -c` body is exec'd in place, which would drop the tag from the command
+  # line and leave the assertion unable to see a survivor at all. This way the
+  # wrapper keeps the tag in its own argv and the sleep carries it via exec -a,
+  # so a leak of either one trips the test.
+  bash -c '( exec -a "$0-sleep" sleep "$1" ) ; :' \
+    "$FAKE_SLEEP_TAG-$n" "$FAKE_CLAUDE_SLEEP"
 fi
 
 is_error=false
@@ -300,9 +306,24 @@ case " ${FAKE_CLAUDE_IS_ERROR:-} " in
   *" $n "*) is_error=true ;;
 esac
 
+# The envelope reports the session the turn ran in: the pinned or resumed id
+# when one was given, otherwise the fresh id claude would have allocated
+# itself. That difference is what the caller has to notice.
+sid=""
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    --session-id|--resume) sid="$arg" ;;
+  esac
+  prev="$arg"
+done
+if [[ -z "$sid" ]]; then
+  sid="00000000-0000-5000-a000-0000000000$(printf '%02d' "$n")"
+fi
+
 printf 'end %s\n' "$n" >>"$CLAUDE_LOG.events"
-printf '{"type":"result","is_error":%s,"total_cost_usd":0.42,"num_turns":3,"result":"reviewed %s"}\n' \
-  "$is_error" "$n"
+printf '{"type":"result","is_error":%s,"session_id":"%s","total_cost_usd":0.42,"num_turns":3,"result":"reviewed %s"}\n' \
+  "$is_error" "$sid" "$n"
 exit "$status"
 EOF
   chmod +x "$SANDBOX/bin/claude"

@@ -13,9 +13,11 @@
 # opened", or when a dozen PRs would mean a dozen tabs. Pick review-prs when
 # you want to watch a review happen and steer it mid-flight.
 #
-# Losing the tab does not lose the review: every run pins a derived session id,
-# so `claude --resume <id>` reopens any of them afterwards, and --continue
-# re-enters them here. The summary prints each session id for exactly that.
+# Losing the tab does not lose the review: a PR with no session yet gets a
+# derived id pinned to it, so `claude --resume <id>` reopens the review
+# afterwards and --continue re-enters it here. The summary prints the session
+# each review actually ran in -- read back from the result envelope, because a
+# run that did not pin an id cannot know it any other way.
 #
 # Prompts, by mode:
 #   fresh               /panel-review N
@@ -182,6 +184,14 @@ fi
 review_cmd="${AUTOREVIEW_CMD:-}"
 auto_review_cmd="${AUTOREVIEW_AUTO_CMD:-}"
 if [[ "$auto" -eq 1 || "$babysit" -eq 1 ]]; then
+  # An unattended run takes the unattended override. Falling silently back to
+  # the built-in reviewer here would be the expensive kind of surprise: you
+  # replaced the reviewer, and an unwatched sweep spends real money running an
+  # agent under --dangerously-skip-permissions anyway. Say which one is running.
+  if [[ -n "$review_cmd" && -z "$auto_review_cmd" ]]; then
+    printf 'note: $AUTOREVIEW_CMD is set but $AUTOREVIEW_AUTO_CMD is not; %s runs the built-in reviewer\n' \
+      "$([[ "$auto" -eq 1 ]] && printf -- '--auto' || printf -- '--babysit')" >&2
+  fi
   review_cmd="$auto_review_cmd"
 fi
 
@@ -305,12 +315,29 @@ run_job() {
   mv "$status_file.tmp" "$status_file"
 }
 
+# The session an earlier pass of this run actually used for a PR, recorded by
+# finish_job. Only --babysit produces a second pass, and only this file makes it
+# resume the review it just ran: plan_session derives its id from the repo and
+# PR number alone, so where a session already existed before the run, pass 1
+# left it untouched and reviewed under an id claude allocated -- and pass 2
+# would otherwise resume the older session and re-check findings nobody wrote.
+run_session_file() { printf '%s/session-%s.id' "$log_dir" "$1"; }
+
 start_job() {
-  local i="$1"
-  plan_session "${q_pr[i]}"
-  q_sid[i]="$session_id"
-  q_flag[i]="$session_flag"
-  q_resume[i]="$session_resume"
+  local i="$1" prior=""
+  if [[ -f "$(run_session_file "${q_pr[i]}")" ]]; then
+    prior="$(cat "$(run_session_file "${q_pr[i]}")")"
+  fi
+  if [[ -n "$prior" && "$continue_sessions" -eq 1 ]]; then
+    q_sid[i]="$prior"
+    q_flag[i]="--resume $prior"
+    q_resume[i]=1
+  else
+    plan_session "${q_pr[i]}"
+    q_sid[i]="$session_id"
+    q_flag[i]="$session_flag"
+    q_resume[i]="$session_resume"
+  fi
   rm -f "$(job_file "$i" status)"
   run_job "$i" &
   q_pid[i]=$!
@@ -331,11 +358,36 @@ job_reported_error() {
   [[ "$flag" == "true" ]]
 }
 
+# The session the review actually ran in, straight from the result envelope.
+# This is the only trustworthy source: where a session already existed and
+# --continue was not passed, no session flag was sent at all and claude
+# allocated its own id, so the derived id names a different, older review.
+job_session_id() {
+  local out sid
+  out="$(job_file "$1" json)"
+  [[ -s "$out" ]] || return 0
+  sid="$(jq -r 'if type == "object" then (.session_id // empty) else empty end' \
+    "$out" 2>/dev/null || true)"
+  [[ "$sid" =~ ^[0-9a-fA-F-]{36}$ ]] && printf '%s' "$sid"
+}
+
 finish_job() {
-  local i="$1" now="$2" raw="$3"
+  local i="$1" now="$2" raw="$3" sid
   q_end[i]="$now"
   wait "${q_pid[i]}" 2>/dev/null || true
   q_status[i]="$raw"
+
+  # Correct the recorded id before anything reports it: the summary tells you to
+  # reopen this review with it, and a babysit pass resumes it.
+  sid="$(job_session_id "$i")"
+  if [[ -n "$sid" ]]; then
+    q_sid[i]="$sid"
+    printf '%s' "$sid" >"$(run_session_file "${q_pr[i]}")"
+  elif [[ -z "${q_flag[i]}" ]]; then
+    # No envelope to read and no flag was sent, so nothing here knows which
+    # session the review landed in. Saying so beats naming the wrong one.
+    q_sid[i]=""
+  fi
   if [[ "$raw" == "timeout" ]]; then
     q_state[i]="timeout"
   elif [[ "$raw" == "0" ]] && ! job_reported_error "$i"; then
@@ -365,15 +417,21 @@ kill_tree() {
 
 # Stop a job that has outrun --timeout, or that Ctrl-C caught. Best-effort by
 # design: a review we cannot reach is reported as a timeout either way, and the
-# pass moves on rather than blocking a slot forever. The session id is a second
-# net -- it is unique and on the reviewer's command line, so it catches a
-# process the tree walk raced past.
+# pass moves on rather than blocking a slot forever.
+#
+# Two sweeps, because the first one races: a reviewer that forks while we are
+# walking its tree leaves a child we never saw. The second sweep catches it,
+# and the walk stays inside this job's own descendants.
+#
+# Matching the session id with `pkill -f` would be a wider net, and too wide:
+# the id is on the command line of every process that carries it, including the
+# interactive `claude --resume <id>` the summary tells you to open and any
+# concurrent run reviewing the same PR. One timeout here must not kill those.
 stop_job() {
-  local pid="$1" sid="$2"
+  local pid="$1"
   kill_tree "$pid"
-  if [[ -n "$sid" ]]; then
-    pkill -f -- "$sid" >/dev/null 2>&1 || true
-  fi
+  sleep 0.2
+  kill_tree "$pid"
 }
 
 # Without a TTY -- a cron run, or output piped to a log -- there is no cursor to
@@ -453,7 +511,7 @@ run_pass() {
         finish_job "$i" "$now" "$(cat "$status_file")"
         running=$((running - 1))
       elif [[ "$timeout" -gt 0 && $((now - q_start[i])) -ge "$timeout" ]]; then
-        stop_job "${q_pid[i]}" "${q_sid[i]}"
+        stop_job "${q_pid[i]}"
         finish_job "$i" "$now" "timeout"
         running=$((running - 1))
       fi
@@ -496,7 +554,20 @@ print_summary() {
     rows+="$(job_cost "$i")"$'\t'"${q_sid[i]:--}"$'\n'
   done
   printf '\n'
-  printf '%s' "$rows" | column -t -s $'\t'
+  # `column` is not a hard dependency: it lives in util-linux, and the boxes
+  # this tool is built for -- a slim CI image, a minimal container -- are
+  # exactly the ones that ship without it. Losing the alignment is nothing;
+  # failing here would throw away the session ids after every review has already
+  # succeeded, and would end a babysit loop on its first pass.
+  #
+  # Aligned into a variable first, so a column that dies halfway cannot leave
+  # half a table on screen ahead of the fallback.
+  local aligned
+  if aligned="$(printf '%s' "$rows" | column -t -s $'\t' 2>/dev/null)"; then
+    printf '%s\n' "$aligned"
+  else
+    printf '%s' "$rows"
+  fi
   printf '\nlogs: %s\n' "$pass_dir"
   printf 'reopen any review with: claude --resume <SESSION>\n'
 }
@@ -515,7 +586,7 @@ stop_running_jobs() {
   local i
   for ((i = 0; i < ${#q_pr[@]}; i++)); do
     if [[ "${q_state[i]}" == "running" ]]; then
-      stop_job "${q_pid[i]}" "${q_sid[i]}"
+      stop_job "${q_pid[i]}"
     fi
   done
 }
@@ -532,7 +603,10 @@ on_signal() {
   exit 130
 }
 
-trap on_signal INT TERM
+# HUP belongs here as much as INT does: the first use case for a headless run is
+# an ssh session, and a dropped connection must stop the reviews rather than
+# orphan them.
+trap on_signal INT TERM HUP
 trap show_cursor EXIT
 if [[ "$tty" -eq 1 ]]; then printf '\033[?25l'; fi
 
