@@ -95,7 +95,7 @@ setup_sandbox() {
         AUTOREVIEW_MAX_BUDGET_USD AUTOREVIEW_LOG_DIR \
         AUTOREVIEW_BABYSIT_INTERVAL || true
   unset FAKE_CLAUDE_FAIL FAKE_CLAUDE_IS_ERROR FAKE_CLAUDE_SLEEP \
-        FAKE_GH_APPROVED || true
+        FAKE_CLAUDE_GARBAGE FAKE_GH_APPROVED FAKE_GH_CLOSED || true
   # Leave the workspace title alone; the fake cmux ignores it either way.
   export REVIEW_PRS_WORKSPACE=""
 
@@ -186,13 +186,23 @@ case "$sub" in
     esac
     ;;
   pr)
-    # `gh pr view N --json reviewDecision --jq ...`: PRs named in
-    # $FAKE_GH_APPROVED read as approved, everything else as undecided.
+    # `gh pr view N --json ...`: PRs named in $FAKE_GH_APPROVED read as
+    # approved and those in $FAKE_GH_CLOSED as closed; everything else is an
+    # open PR with no decision yet. The two shapes asked for are a bare
+    # decision (--jq) and the state+decision object.
     shift || true
     num="${1:-}"
+    decision=""
+    state="OPEN"
     case " ${FAKE_GH_APPROVED:-} " in
-      *" $num "*) printf 'APPROVED\n' ;;
-      *)          printf '\n' ;;
+      *" $num "*) decision="APPROVED" ;;
+    esac
+    case " ${FAKE_GH_CLOSED:-} " in
+      *" $num "*) state="CLOSED" ;;
+    esac
+    case " $* " in
+      *" --jq "*) printf '%s\n' "$decision" ;;
+      *) printf '{"state":"%s","reviewDecision":"%s"}\n' "$state" "$decision" ;;
     esac
     ;;
   *)
@@ -322,6 +332,16 @@ if [[ -z "$sid" ]]; then
 fi
 
 printf 'end %s\n' "$n" >>"$CLAUDE_LOG.events"
+
+# A turn that dies mid-write, or an error printed as prose: asked for JSON and
+# given something else, with a zero exit.
+case " ${FAKE_CLAUDE_GARBAGE:-} " in
+  *" $n "*)
+    printf 'Error: credit balance too low\n'
+    exit 0
+    ;;
+esac
+
 printf '{"type":"result","is_error":%s,"session_id":"%s","total_cost_usd":0.42,"num_turns":3,"result":"reviewed %s"}\n' \
   "$is_error" "$sid" "$n"
 exit "$status"
@@ -476,6 +496,19 @@ run_autoreview_until() {
 make_session() {
   mkdir -p "$CLAUDE_CONFIG_DIR/projects/-fake-project"
   touch "$CLAUDE_CONFIG_DIR/projects/-fake-project/$1.jsonl"
+}
+
+# Run autoreview with $1 seeded as the recorded session for PR $2, in the run
+# directory this very process will use. `exec` is what makes that possible: it
+# keeps the pid, and the run directory is named for it -- so the file lands
+# where autoreview looks, without the script needing a knob that exists only
+# for tests. Remaining arguments are passed to autoreview.
+run_autoreview_with_recorded() {
+  local sid="$1" pr="$2"; shift 2
+  reset_spawn_log
+  ( cd "$SANDBOX/repo" && LOG="$SANDBOX/out/logs" SID="$sid" PR="$pr" \
+      bash -c 'mkdir -p "$LOG/run-$$" && printf "%s" "$SID" >"$LOG/run-$$/session-$PR.id" && exec "$0" --log-dir "$LOG" "$@"' \
+      "$AUTOREVIEW" "$@" 2>&1 )
 }
 
 # A session id that exists nowhere but this sandbox. A fixed literal would also

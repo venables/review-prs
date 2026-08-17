@@ -203,8 +203,10 @@ fi
 
 # --- Context + selection --------------------------------------------------
 # gum is required by the picker alone (see run_picker), so an --auto sweep runs
-# on a box that has never seen it.
-require_deps gh jq
+# on a box that has never seen it. pgrep is not optional here the way it is for
+# a tab spawner: stopping a review walks the process tree with it, and without
+# it a timeout would report a stopped review while the whole tree kept running.
+require_deps gh jq pgrep
 if [[ -z "$review_cmd" ]] && ! command -v claude >/dev/null 2>&1; then
   echo "error: missing required command: claude" >&2
   echo "  install it from https://claude.com/claude-code, or set \$AUTOREVIEW_CMD" >&2
@@ -336,11 +338,13 @@ run_job() {
 # left it untouched and reviewed under an id claude allocated -- and pass 2
 # would otherwise resume the older session and re-check findings nobody wrote.
 #
-# It sits in $log_dir rather than the per-run directory on purpose: it is a
-# fact about this checkout's PRs, not about one process, and two runs sharing a
-# log dir agreeing on which session a PR was reviewed in is right. Resuming a
-# live one is refused separately, in start_job.
-run_session_file() { printf '%s/session-%s.id' "$log_dir" "$1"; }
+# Per run, not per log dir. Two runs can share a --log-dir -- under cron they
+# routinely do -- and a shared file would have each overwriting the other's
+# answer, so a later pass could resume the other run's review of the same PR.
+# A log dir shared between two checkouts would be worse still: PR #9 means a
+# different PR in each, and resuming across them would defeat the whole point
+# of hashing the checkout into the id (see lib/session.sh).
+run_session_file() { printf '%s/session-%s.id' "$run_dir" "$1"; }
 
 start_job() {
   local i="$1" prior="" prior_busy=0
@@ -349,6 +353,9 @@ start_job() {
   # session the run was never going to touch.
   if [[ "$continue_sessions" -eq 1 && -f "$(run_session_file "${q_pr[i]}")" ]]; then
     prior="$(cat "$(run_session_file "${q_pr[i]}")")"
+    # The id goes into a command line unquoted, so anything that is not one is
+    # dropped rather than word-split into argv.
+    [[ "$prior" =~ ^[0-9a-fA-F-]{36}$ ]] || prior=""
   fi
   # Same guard plan_session applies to a derived id: a session another process
   # still holds must not be resumed, or two agents write one transcript. The
@@ -393,15 +400,27 @@ start_job() {
 }
 
 # claude -p can exit 0 and still report a failed turn in its envelope, so a zero
-# exit is not on its own a successful review. An override whose stdout is not
-# JSON simply never trips this.
+# exit is not on its own a successful review.
+#
+# The built-in reviewer is held to more than that: it was asked for JSON, so
+# anything else -- empty output, a truncated write, a plain-text error line --
+# means the review did not finish, whatever the exit status said. An overridden
+# reviewer is judged on its exit status alone; prose on stdout is its normal
+# shape, not a failure.
 job_reported_error() {
   local out flag
   out="$(job_file "$1" json)"
-  [[ -s "$out" ]] || return 1
-  flag="$(jq -r 'if type == "object" then (.is_error // false) else false end' \
-    "$out" 2>/dev/null || printf 'false')"
-  [[ "$flag" == "true" ]]
+  if [[ -n "$review_cmd" ]]; then
+    [[ -s "$out" ]] || return 1
+    flag="$(jq -r 'if type == "object" then (.is_error // false) else false end' \
+      "$out" 2>/dev/null || printf 'false')"
+    [[ "$flag" == "true" ]]
+    return
+  fi
+  [[ -s "$out" ]] || return 0
+  flag="$(jq -r 'if type == "object" then (.is_error // false) else "malformed" end' \
+    "$out" 2>/dev/null || printf 'malformed')"
+  [[ "$flag" != "false" ]]
 }
 
 # The session the review actually ran in, straight from the result envelope.
@@ -433,7 +452,10 @@ finish_job() {
   sid="$(job_session_id "$i")"
   if [[ -n "$sid" ]]; then
     q_sid[i]="$sid"
-    printf '%s' "$sid" >"$(run_session_file "${q_pr[i]}")"
+    # Written the way the status file is, and for the same reason: a reader must
+    # never see half an id.
+    printf '%s' "$sid" >"$(run_session_file "${q_pr[i]}").tmp"
+    mv "$(run_session_file "${q_pr[i]}").tmp" "$(run_session_file "${q_pr[i]}")"
   elif [[ -z "${q_flag[i]}" || -n "$review_cmd" ]]; then
     # Nothing here knows which session this review landed in: either no flag was
     # sent, or an override ran and owns its own session handling -- it was
@@ -500,11 +522,17 @@ signal_pids() {
 # interactive `claude --resume <id>` the summary tells you to open and any
 # concurrent run reviewing the same PR. One timeout here must not kill those.
 stop_job() {
-  local pid="$1" tree=() more=()
+  local pid="$1" tree=() more=() p q
   while IFS= read -r p; do tree+=("$p"); done < <(process_tree "$pid")
   signal_pids TERM "${tree[@]}"
   sleep 0.2
-  while IFS= read -r p; do more+=("$p"); done < <(process_tree "$pid")
+  # Re-discovered from every pid already known, not just the root: the root is
+  # usually the first thing to die, and from a dead pid nothing below it can be
+  # found any more. A reviewer that outlived the TERM and forked after the first
+  # snapshot is reachable only through itself.
+  for p in "${tree[@]}"; do
+    while IFS= read -r q; do more+=("$q"); done < <(process_tree "$p")
+  done
   tree+=(${more[@]+"${more[@]}"})
   signal_pids TERM "${tree[@]}"
   sleep 0.2
@@ -780,19 +808,22 @@ while :; do
 
   if [[ "$babysit" -ne 1 ]]; then break; fi
 
-  # Approval is read back from GitHub rather than inferred from what the agent
-  # said: the review either landed as an approval or it did not, and a run that
-  # believed its own report would babysit a PR it never actually approved.
+  # Read back from GitHub rather than inferred from what the agent said: the
+  # review either landed as an approval or it did not, and a run that believed
+  # its own report would babysit a PR it never actually approved. A PR that was
+  # closed, or merged with no approving review, is finished too -- waiting for
+  # an approval that is never coming would re-review it every interval forever.
   remaining=()
   for n in "${queue[@]}"; do
-    if [[ "$(pr_review_decision "$n")" == "APPROVED" ]]; then
-      printf '\nPR #%s is approved; dropping it from the babysit loop\n' "$n"
+    done_because="$(pr_babysit_done "$n")"
+    if [[ -n "$done_because" ]]; then
+      printf '\nPR #%s is %s; dropping it from the babysit loop\n' "$n" "$done_because"
     else
       remaining+=("$n")
     fi
   done
   if [[ "${#remaining[@]}" -eq 0 ]]; then
-    printf '\nevery babysat PR is approved\n'
+    printf '\nnothing left to babysit\n'
     break
   fi
 

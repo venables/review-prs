@@ -32,6 +32,9 @@ with a headless subprocess per PR.
 - [`gum`](https://github.com/charmbracelet/gum) — the interactive picker.
   `autoreview --auto` never picks, so it does not need gum.
 - [`jq`](https://jqlang.github.io/jq/) — JSON processing
+- `pgrep` — **`autoreview` only**: stopping a review walks its process tree with
+  it, so a timeout without `pgrep` would report a stopped review while the whole
+  tree kept running. Standard on macOS; `procps` on slim Linux images.
 - A supported terminal for spawning tabs — **`review-prs` only**:
   - [Herdr](https://herdr.dev) (preferred; detected via `HERDR_ENV`, drives new
     tabs over its socket API via the `herdr` CLI), or
@@ -221,7 +224,7 @@ It takes the same selection flags as `review-prs` (`--auto`, `--continue`,
 ```
 auto-reviewing 2 PR(s): #9 #8
 reviewing 2 PR(s), 2 at a time
-logs: /tmp/autoreview.k3Xq8p/pass-1
+logs: /tmp/autoreview.k3Xq8p/run-40127/pass-1
 
   +  #9     done                           4m12s
   /  #8     reviewing                      1m47s
@@ -234,7 +237,7 @@ PR  RESULT  TIME   COST   SESSION
 #9  done    4m12s  $0.51  cc10f740-28c3-58c6-ae64-d9ff37df22a7
 #8  done    6m03s  $0.88  fa5ced7b-32dd-578b-a3b9-d4d23195dce1
 
-logs: /tmp/autoreview.k3Xq8p/pass-1
+logs: /tmp/autoreview.k3Xq8p/run-40127/pass-1
 reopen any review with: claude --resume <SESSION>
 ```
 
@@ -281,7 +284,9 @@ run an in-session `/loop`, and a headless process needs neither.
 `--babysit` re-runs the whole pass on an interval, dropping PRs as they become
 `APPROVED` and resuming the rest, until nothing is left. Approval is read back
 from GitHub rather than inferred from what the agent said — the review either
-landed as an approval or it did not.
+landed as an approval or it did not. A PR that is closed, or merged without an
+approving review, is dropped too; waiting for an approval that is never coming
+would re-review it on every interval forever.
 
 The loop is this script, not an in-session `/loop` inside a tab, so an interval
 that never converges is one process you can see and kill. Interrupting it stops

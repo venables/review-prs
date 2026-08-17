@@ -61,6 +61,14 @@ out="$(FAKE_CLAUDE_IS_ERROR="9" run_autoreview --auto)"
 assert_equals "is_error in the envelope fails the run" "$(last_status)" "1"
 assert_contains "is_error is reported as a failure" "$out" "FAILED  #9"
 
+# The built-in reviewer was asked for JSON, so prose with a zero exit means the
+# review did not finish -- whatever the exit status claimed.
+out="$(FAKE_CLAUDE_GARBAGE="9" run_autoreview --auto)"
+assert_equals "a built-in reviewer that answers in prose fails the run" \
+  "$(last_status)" "1"
+assert_contains "...and is named" "$out" "FAILED  #9"
+assert_contains "...while the other PR still succeeds" "$out" "done    #8"
+
 # --- Concurrency ----------------------------------------------------------
 FAKE_CLAUDE_SLEEP=0.4 run_autoreview --auto --jobs 1 >/dev/null
 assert_equals "--jobs 1 runs one review at a time" \
@@ -188,26 +196,24 @@ assert_not_contains "...nor the derived one" "$out" "$sid9"
 # A later pass resumes the session the earlier pass actually ran in, recorded
 # under the log dir. Resuming the derived id instead would re-check a review
 # nobody wrote.
-run_autoreview --auto >/dev/null
 recorded="$(sandbox_uuid recorded)"
-mkdir -p "$SANDBOX/out/logs"
-printf '%s' "$recorded" >"$SANDBOX/out/logs/session-9.id"
-reset_spawn_log
-( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto --continue >/dev/null 2>&1 )
+run_autoreview_with_recorded "$recorded" 9 --auto --continue >/dev/null
 assert_contains "a later pass resumes the session the earlier pass used" \
   "$(claude_call_for '/recheck-pr 9')" "--resume $recorded"
+
+# A half-written record is not spliced into the command line.
+run_autoreview_with_recorded "not-a-session-id" 9 --auto --continue >/dev/null
+assert_not_contains "a malformed record is ignored" \
+  "$(claude_calls)" "--resume not-a-session-id"
 
 # A recorded session another process still holds is not resumed either: two
 # agents writing one transcript is the thing the guard exists to prevent, and a
 # babysit interval is exactly when someone has `claude --resume` open.
-run_autoreview --auto >/dev/null
 held="$(sandbox_uuid held)"
-printf '%s' "$held" >"$SANDBOX/out/logs/session-9.id"
 bash -c 'sleep 10; :' "holder-$held" &
 holder=$!
 sleep 0.5
-reset_spawn_log
-out="$( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto --continue 2>&1 )"
+out="$(run_autoreview_with_recorded "$held" 9 --auto --continue)"
 kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 assert_contains "a held session is reported, not resumed" "$out" "open elsewhere"
@@ -220,15 +226,20 @@ assert_contains "...the PR is reviewed fresh instead" "$(claude_calls)" "/auto-r
 
 # Without -C there is nothing to resume, so a recorded id is not even consulted
 # -- and no note about it is printed.
-printf '%s' "$held" >"$SANDBOX/out/logs/session-9.id"
-out="$( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto 2>&1 )"
+bash -c 'sleep 10; :' "holder-$held" &
+holder=$!
+sleep 0.5
+out="$(run_autoreview_with_recorded "$held" 9 --auto)"
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
 assert_not_contains "a plain run says nothing about a session it would not resume" \
   "$out" "open elsewhere"
 
-# PR #8 has no session, so its review pins one -- and that is the id recorded.
+# PR #8 has no session, so its review pins one -- and that is the id recorded,
+# in this run's own directory rather than one shared with every other run.
 run_autoreview --auto >/dev/null
 assert_equals "the id a review ran in is recorded for the next pass" \
-  "$(cat "$SANDBOX/out/logs/session-8.id")" \
+  "$(cat "$SANDBOX"/out/logs/run-*/session-8.id 2>/dev/null)" \
   "$(session_id_from "$(claude_call_for '/auto-review 8')")"
 
 # --- Bad input ------------------------------------------------------------
@@ -269,8 +280,14 @@ assert_contains "a bad babysit interval says why" "$out" "invalid babysit interv
 # and ends without sleeping.
 out="$(FAKE_GH_APPROVED="9 8" run_autoreview --auto --babysit=1)"
 assert_contains "an approved PR is dropped from the loop" "$out" "PR #9 is approved"
-assert_contains "the loop ends when every PR is approved" "$out" "every babysat PR is approved"
+assert_contains "the loop ends when every PR is approved" "$out" "nothing left to babysit"
 assert_equals "a fully approved babysit run exits 0" "$(last_status)" "0"
+
+# A PR that will never be approved because it is no longer open must leave the
+# queue too, or the loop re-reviews it every interval for as long as it runs.
+out="$(FAKE_GH_APPROVED="8" FAKE_GH_CLOSED="9" run_autoreview --auto --babysit=1)"
+assert_contains "a closed PR is dropped from the loop" "$out" "PR #9 is closed"
+assert_contains "the loop ends with nothing left" "$out" "nothing left to babysit"
 
 # One PR still unapproved: the loop waits for the interval instead of exiting.
 out="$(FAKE_GH_APPROVED="9" run_autoreview_until "next check in" 10 --auto --babysit=1)"
