@@ -1,5 +1,6 @@
 # shellcheck shell=bash
-# Babysit-interval parsing, shared by review-prs and autoreview.
+# Babysit-interval parsing for review-prs. The rust autoreview mirrors this
+# in src/interval.rs; change both together.
 #
 # Sourced, never executed: the entry point owns `set -euo pipefail`.
 
@@ -22,15 +23,3 @@ normalize_interval() {
   printf '%s' "$v"
 }
 
-# The same duration in seconds, for a sleep. Only ever called on a value
-# normalize_interval has already accepted, so the suffix is known good. 10#
-# strips leading zeros that arithmetic would otherwise read as octal ("05m").
-interval_seconds() {
-  local v="$1" n
-  n=$((10#${v%[mhd]}))
-  case "$v" in
-    *m) printf '%s' $((n * 60)) ;;
-    *h) printf '%s' $((n * 3600)) ;;
-    *d) printf '%s' $((n * 86400)) ;;
-  esac
-}

@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Fetching, ranking and selecting the PRs to review, shared by review-prs and
-# autoreview.
+# Fetching, ranking and selecting the PRs to review, for review-prs. The rust
+# autoreview mirrors this in src/prlist.rs; change both together.
 #
 # Reads these globals, which the entry point sets from its own flags:
 #   $owner $name $me            (lib/repo.sh)
@@ -236,22 +236,3 @@ select_prs() {
   fi
 }
 
-# Why a babysit loop should stop watching a PR, or empty while it should keep
-# watching. Approval is the expected end, but a PR that was closed, or merged
-# without ever collecting an approving review, is just as finished -- and
-# waiting for an approval it will never get would re-review it on every interval
-# for as long as the process lives.
-#
-# One call for both facts, since this runs per PR per interval. A failed lookup
-# yields neither, which reads as "keep waiting".
-pr_babysit_done() {
-  local json state decision
-  json="$(gh pr view "$1" --json state,reviewDecision 2>/dev/null)" || return 0
-  state="$(jq -r '.state // ""' <<<"$json" 2>/dev/null || true)"
-  decision="$(jq -r '.reviewDecision // ""' <<<"$json" 2>/dev/null || true)"
-  if [[ "$decision" == "APPROVED" ]]; then
-    printf 'approved'
-  elif [[ -n "$state" && "$state" != "OPEN" ]]; then
-    printf '%s' "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')"
-  fi
-}

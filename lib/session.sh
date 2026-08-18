@@ -1,5 +1,8 @@
 # shellcheck shell=bash
-# Review-session continuity, shared by review-prs and autoreview.
+# Review-session continuity for review-prs. The rust autoreview mirrors this
+# byte for byte in src/session.rs, where golden tests pin the derived ids --
+# change both together, or the two tools stop agreeing on which session a PR
+# belongs to.
 #
 # A PR's review session id is derived from the repo directory plus
 # owner/name#NUM rather than recorded in a state file: the mapping is then

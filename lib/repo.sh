@@ -1,5 +1,6 @@
 # shellcheck shell=bash
-# Dependency checks and repo/user context, shared by review-prs and autoreview.
+# Dependency checks and repo/user context for review-prs. The rust autoreview
+# mirrors this in src/repo.rs; change both together.
 #
 # Sourced, never executed: the entry point owns `set -euo pipefail`.
 
