@@ -34,15 +34,22 @@ pub fn normalize(raw: &str) -> Result<Interval, String> {
         ));
     }
 
-    let n: u64 = v[..v.len() - 1]
-        .trim_start_matches('0')
-        .parse()
-        .map_err(|_| format!("error: invalid babysit interval: \"{raw}\""))?;
-    let secs = match v.as_bytes()[v.len() - 1] {
-        b'm' => n * 60,
-        b'h' => n * 3600,
-        _ => n * 86400,
+    // Checked arithmetic, and a parse that can refuse: an absurd interval
+    // must not wrap into a near-zero sleep -- that is the hot loop this whole
+    // function exists to prevent. (The bash side would hand such a value to
+    // sleep, which refuses it; rejecting here is the same outcome, earlier.)
+    let reject = || {
+        format!(
+            "error: invalid babysit interval: \"{raw}\" (expected a positive duration, e.g. 30, 30m, 1h)"
+        )
     };
+    let n: u64 = v[..v.len() - 1].trim_start_matches('0').parse().map_err(|_| reject())?;
+    let secs = match v.as_bytes()[v.len() - 1] {
+        b'm' => n.checked_mul(60),
+        b'h' => n.checked_mul(3600),
+        _ => n.checked_mul(86400),
+    }
+    .ok_or_else(reject)?;
     Ok(Interval { normalized: v, secs })
 }
 
@@ -92,5 +99,13 @@ mod tests {
         for bad in ["", "5s", "m", "1x", "-5", "1.5h"] {
             assert!(normalize(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn absurd_intervals_are_rejected_not_wrapped() {
+        // Overflow in the unit conversion, and digits past u64 entirely: both
+        // must reject rather than wrap into a near-zero sleep.
+        assert!(normalize("300000000000000000d").is_err());
+        assert!(normalize("99999999999999999999m").is_err());
     }
 }

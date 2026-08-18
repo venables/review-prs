@@ -159,14 +159,11 @@ pub fn fetch_prs(ctx: &RepoContext, include_approved: bool, include_dependabot: 
         .context("running gh api graphql")?;
     if !out.status.success() {
         eprintln!("{}", String::from_utf8_lossy(&out.stderr).trim_end());
-        bail!("gh api graphql failed");
+        bail!(crate::repo::AlreadyReported);
     }
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    let nodes = parsed
-        .pointer("/data/repository/pullRequests/nodes")
-        .cloned()
-        .unwrap_or_else(|| serde_json::Value::Array(vec![]));
-    let prs: Vec<PrNode> = serde_json::from_value(nodes)?;
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parsing gh api graphql output")?;
+    let prs = extract_nodes(&parsed)?;
 
     let prs: Vec<PrNode> = prs
         .into_iter()
@@ -193,6 +190,30 @@ pub fn fetch_prs(ctx: &RepoContext, include_approved: bool, include_dependabot: 
         return Ok(None);
     }
     Ok(Some(prs))
+}
+
+/// The PR nodes out of a GraphQL response -- or a refusal. A 200 carrying an
+/// `errors` array, or a response missing the data path entirely, must not
+/// read as "no PRs": an unattended sweep would then exit 0 having reviewed
+/// nothing, which is the lie the exit status exists to prevent.
+fn extract_nodes(parsed: &serde_json::Value) -> Result<Vec<PrNode>> {
+    if let Some(errors) = parsed.get("errors").and_then(|e| e.as_array())
+        && !errors.is_empty()
+    {
+        eprintln!("error: gh api graphql returned errors:");
+        for err in errors {
+            match err.get("message").and_then(|m| m.as_str()) {
+                Some(msg) => eprintln!("  {msg}"),
+                None => eprintln!("  {err}"),
+            }
+        }
+        bail!(crate::repo::AlreadyReported);
+    }
+    let Some(nodes) = parsed.pointer("/data/repository/pullRequests/nodes") else {
+        eprintln!("error: gh api graphql returned no pull request data");
+        bail!(crate::repo::AlreadyReported);
+    };
+    serde_json::from_value(nodes.clone()).context("parsing the pull request list")
 }
 
 /// Seconds since the epoch for a strict "YYYY-MM-DDTHH:MM:SSZ" timestamp --
@@ -446,6 +467,24 @@ mod tests {
         assert_eq!(rel(now, "2026-08-10T11:30:00Z"), "30m ago");
         assert_eq!(rel(now, "2026-08-10T07:00:00Z"), "5h ago");
         assert_eq!(rel(now, "2026-08-07T12:00:00Z"), "3d ago");
+    }
+
+    #[test]
+    fn graphql_errors_do_not_read_as_an_empty_repo() {
+        // A 200 carrying errors, and a response missing the data path: both
+        // must refuse, or an unattended sweep exits 0 having reviewed nothing.
+        let with_errors: serde_json::Value =
+            serde_json::from_str(r#"{"errors":[{"message":"rate limited"}],"data":null}"#).unwrap();
+        assert!(extract_nodes(&with_errors).is_err());
+
+        let missing_path: serde_json::Value = serde_json::from_str(r#"{"data":{}}"#).unwrap();
+        assert!(extract_nodes(&missing_path).is_err());
+
+        let ok: serde_json::Value = serde_json::from_str(
+            r#"{"data":{"repository":{"pullRequests":{"nodes":[]}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_nodes(&ok).unwrap().len(), 0);
     }
 
     #[test]

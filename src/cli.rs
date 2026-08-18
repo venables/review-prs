@@ -110,12 +110,17 @@ fn env_nonempty(env: EnvFn, name: &str) -> Option<String> {
 
 /// Reject a flag value early rather than letting it reach a sleep, a slot
 /// count or the reviewer itself, where the failure would be far from its
-/// cause.
-fn require_int(flag: &str, value: &str, min: u64) -> Result<u64, CliError> {
+/// cause. The max matters as much as the min: a --jobs past u32 would
+/// otherwise truncate to zero slots and stall the pool forever, and a
+/// timeout past the deadline arithmetic would overflow it.
+fn require_int(flag: &str, value: &str, min: u64, max: u64) -> Result<u64, CliError> {
     let ok = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
     let parsed = if ok { value.parse::<u64>().ok() } else { None };
     match parsed {
-        Some(n) if n >= min => Ok(n),
+        Some(n) if n >= min && n <= max => Ok(n),
+        Some(n) if n > max => Err(err(format!(
+            "error: {flag} expects an integer <= {max}, got \"{value}\""
+        ))),
         _ => Err(err(format!(
             "error: {flag} expects an integer >= {min}, got \"{value}\""
         ))),
@@ -186,8 +191,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         }
     }
 
-    let jobs = require_int("--jobs", &jobs_raw, 1)? as u32;
-    let timeout_secs = require_int("--timeout", &timeout_raw, 0)?;
+    let jobs = require_int("--jobs", &jobs_raw, 1, 1024)? as u32;
+    // The cap matches what dash-p is handed when the timeout is disabled, and
+    // keeps the deadline arithmetic far from overflow. Nobody waits 31 years.
+    let timeout_secs = require_int("--timeout", &timeout_raw, 0, 999_999_999)?;
 
     if let Some(b) = &budget_raw {
         let dollar = {
@@ -336,6 +343,16 @@ mod tests {
         let e = run(&["--nope"]).err().unwrap();
         assert_eq!(e.msg, "unknown arg: --nope");
         assert!(e.show_help);
+    }
+
+    #[test]
+    fn out_of_range_values_are_rejected_not_truncated() {
+        // 2^32 would truncate to zero pool slots and stall forever.
+        assert_eq!(
+            msg(&["--jobs", "4294967296"]),
+            "error: --jobs expects an integer <= 1024, got \"4294967296\""
+        );
+        assert!(msg(&["--timeout", "99999999999999"]).contains("expects an integer <="));
     }
 
     #[test]

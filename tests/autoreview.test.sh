@@ -78,9 +78,12 @@ FAKE_CLAUDE_SLEEP=0.4 run_autoreview --auto --jobs 1 >/dev/null
 assert_equals "--jobs 1 runs one review at a time" \
   "$(claude_events | tr '\n' ' ')" "start 9 end 9 start 8 end 8 "
 
+# Overlap means both reviews started before either ended. The two fakes race
+# to write their own start lines, so the first two events are asserted as a
+# set, not a sequence.
 FAKE_CLAUDE_SLEEP=0.4 run_autoreview --auto --jobs 2 >/dev/null
 assert_equals "--jobs 2 overlaps them" \
-  "$(claude_events | head -2 | tr '\n' ' ')" "start 9 start 8 "
+  "$(claude_events | head -2 | sort | tr '\n' ' ')" "start 8 start 9 "
 
 # --- Timeout --------------------------------------------------------------
 out="$(FAKE_CLAUDE_SLEEP=30 run_autoreview --auto --jobs 2 --timeout 1)"

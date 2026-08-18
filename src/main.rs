@@ -185,7 +185,14 @@ fn main() {
     }
     match run(&cfg) {
         Ok(code) => std::process::exit(code),
-        // The message was already printed where the failure happened.
-        Err(_) => std::process::exit(1),
+        Err(e) => {
+            // A tool built for cron and CI must never exit 1 silently:
+            // stderr is the only diagnostic channel an unattended run has.
+            // Sites that already explained themselves bail AlreadyReported.
+            if e.downcast_ref::<repo::AlreadyReported>().is_none() {
+                eprintln!("error: {e:#}");
+            }
+            std::process::exit(1)
+        }
     }
 }

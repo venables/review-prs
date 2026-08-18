@@ -184,6 +184,13 @@ pub fn run_pass(
             }
         }
 
+        // A spawn failure can finish the last job right here, with nothing
+        // running and nothing to receive -- waiting on the channel then would
+        // stall the end of the pass for the full receive timeout.
+        if finished >= total {
+            break;
+        }
+
         let wait = if ui.tty {
             Duration::from_millis(200)
         } else {

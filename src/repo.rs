@@ -5,6 +5,20 @@ use anyhow::{Result, bail};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// A failure whose message already went to stderr at the site that understood
+/// it. main() prints every other error chain -- a tool built for cron and CI
+/// must never exit 1 silently -- and skips these to avoid saying it twice.
+#[derive(Debug)]
+pub struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "already reported")
+    }
+}
+
+impl std::error::Error for AlreadyReported {}
+
 pub struct RepoContext {
     pub owner: String,
     pub name: String,
@@ -62,7 +76,7 @@ pub fn require_deps(cmds: &[&str]) -> Result<()> {
         }
     }
     if missing {
-        bail!("missing dependencies");
+        bail!(AlreadyReported);
     }
     Ok(())
 }
@@ -83,7 +97,7 @@ pub fn load() -> Result<RepoContext> {
     if !repo_view.status.success() {
         eprintln!("error: not a GitHub repo (or gh not authenticated)");
         eprintln!("{}", combined_output(&repo_view));
-        bail!("no repo context");
+        bail!(AlreadyReported);
     }
     let repo_json: serde_json::Value = serde_json::from_slice(&repo_view.stdout)?;
     let owner = repo_json["owner"]["login"].as_str().unwrap_or_default().to_string();
@@ -98,12 +112,12 @@ pub fn load() -> Result<RepoContext> {
     if !user.status.success() {
         eprintln!("error: failed to fetch current GitHub user");
         eprintln!("{}", combined_output(&user));
-        bail!("no user");
+        bail!(AlreadyReported);
     }
     let me = String::from_utf8_lossy(&user.stdout).trim().to_string();
     if me.is_empty() {
         eprintln!("error: gh api user returned empty login");
-        bail!("empty login");
+        bail!(AlreadyReported);
     }
 
     Ok(RepoContext { owner, name, repo_root, me })
