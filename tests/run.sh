@@ -25,17 +25,18 @@ else
 fi
 echo
 
+export AUTOREVIEW="$ROOT/target/debug/autoreview"
+
 for f in "$TESTS_DIR"/*.test.sh; do
   bash "$f" || failed=1
   echo
 done
 
-# The two entry points plus the libraries they source. Libraries are listed
-# explicitly rather than globbed so a new one that nothing sources still gets
-# parsed and linted.
+# The bash entry point plus the libraries it sources (autoreview is rust and
+# linted by cargo). Libraries are listed explicitly rather than globbed so a
+# new one that nothing sources still gets parsed and linted.
 scripts=(
   "$ROOT/review-prs"
-  "$ROOT/autoreview"
   "$ROOT/lib/interval.sh"
   "$ROOT/lib/repo.sh"
   "$ROOT/lib/session.sh"
@@ -53,15 +54,14 @@ for f in "${scripts[@]}"; do
 done
 
 if command -v shellcheck >/dev/null 2>&1; then
-  # Only the entry points are handed to shellcheck: -x follows their
+  # Only the entry point is handed to shellcheck: -x follows its
   # `# shellcheck source=` directives into lib/, which is the only context where
   # a library's globals are actually defined. Checking a library on its own
-  # would report every one of them unset. Both entry points source all four, so
-  # nothing goes unchecked.
+  # would report every one of them unset.
   #
   # SC2016 fires on the single-quoted GraphQL query and on literal "$VAR" names
   # inside help text and messages. Both are intentional.
-  if shellcheck -x --exclude=SC2016 "$ROOT/review-prs" "$ROOT/autoreview"; then
+  if shellcheck -x --exclude=SC2016 "$ROOT/review-prs"; then
     echo "  ok    shellcheck clean"
   else
     echo "  FAIL  shellcheck reported problems"

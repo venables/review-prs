@@ -17,9 +17,12 @@ assert_not_contains "SEEN PRs are skipped" "$(claude_calls)" "/auto-review 6"
 assert_contains "a clean run reports each PR" "$out" "done    #9"
 assert_equals "a clean run exits 0" "$(last_status)" "0"
 
-assert_contains "reviews run in print mode" "$(claude_call_for '/auto-review 9')" "-p "
+assert_contains "reviews always get a meta envelope" \
+  "$(claude_call_for '/auto-review 9')" "--meta-file"
 assert_contains "reviews ask for the json envelope" \
   "$(claude_call_for '/auto-review 9')" "--output-format json"
+assert_contains "reviews carry the timeout" \
+  "$(claude_call_for '/auto-review 9')" "--timeout"
 assert_contains "a first review pins --session-id" \
   "$(claude_call_for '/auto-review 9')" "--session-id"
 
@@ -56,13 +59,14 @@ assert_contains "a failed review is named" "$out" "FAILED  #9"
 assert_contains "the failure count is reported" "$out" "1 of 2 review(s) failed"
 assert_contains "the other PR still ran" "$(claude_calls)" "/auto-review 8"
 
-# claude can exit 0 and still report a failed turn in its envelope.
+# A turn that reports is_error is exit 10 from dash-p -- the envelope-level
+# failure and the exit code are one signal now.
 out="$(FAKE_CLAUDE_IS_ERROR="9" run_autoreview --auto)"
 assert_equals "is_error in the envelope fails the run" "$(last_status)" "1"
 assert_contains "is_error is reported as a failure" "$out" "FAILED  #9"
 
-# The built-in reviewer was asked for JSON, so prose with a zero exit means the
-# review did not finish -- whatever the exit status claimed.
+# Garbage claude output (a crash, prose instead of JSON) is also exit 10 from
+# dash-p, with an empty session id in the envelope.
 out="$(FAKE_CLAUDE_GARBAGE="9" run_autoreview --auto)"
 assert_equals "a built-in reviewer that answers in prose fails the run" \
   "$(last_status)" "1"
@@ -127,8 +131,8 @@ if [[ -s "$envelope" ]]; then
 else
   not_ok "each review's envelope is kept" "no pr-9.json under a run dir"
 fi
-assert_contains "the envelope is what claude printed" \
-  "$(cat "$envelope" 2>/dev/null)" '"result":"reviewed 9"'
+assert_contains "the answer is what dash-p printed" \
+  "$(cat "$envelope" 2>/dev/null)" '"answer":"reviewed 9"'
 
 runs_before="$(echo "$SANDBOX"/out/logs/run-* | wc -w | tr -d ' ')"
 ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" --auto >/dev/null 2>&1 )
@@ -141,9 +145,12 @@ else
 fi
 
 # --- Budget ---------------------------------------------------------------
+# The single-token = form: dash-p forwards unrecognized flags only that way,
+# and a silently dropped cap on an unattended sweep is exactly the failure the
+# flag exists to prevent.
 run_autoreview --auto --budget 2.50 >/dev/null
-assert_contains "--budget reaches claude" \
-  "$(claude_call_for '/auto-review 9')" "--max-budget-usd 2.50"
+assert_contains "--budget reaches the reviewer" \
+  "$(claude_call_for '/auto-review 9')" "--max-budget-usd=2.50"
 
 # --- Overrides ------------------------------------------------------------
 AUTOREVIEW_AUTO_CMD='my-review' run_autoreview --auto >/dev/null
@@ -176,17 +183,12 @@ assert_not_contains "an unpinned review is not reported under the derived id" \
 assert_contains "an unpinned review is reported under the id it actually ran in" \
   "$out" "00000000-0000-5000-a000-000000000009"
 
-# A box without `column` -- a slim CI image -- still gets its session ids.
-cat >"$SANDBOX/bin/column" <<'STUB'
-#!/usr/bin/env bash
-exit 127
-STUB
-chmod +x "$SANDBOX/bin/column"
+# The summary is formatted natively -- `column` is not a dependency, so a slim
+# CI image without it still gets its session ids.
 out="$(run_autoreview --auto)"
-assert_equals "a summary that cannot be aligned still exits 0" "$(last_status)" "0"
-assert_contains "...and still prints the session id" "$out" "00000000-0000-5000-a000-0000000000"
-assert_contains "...and still prints the result" "$out" "done"
-rm -f "$SANDBOX/bin/column"
+assert_equals "the summary needs no external formatter" "$(last_status)" "0"
+assert_contains "...and prints the session id" "$out" "00000000-0000-5000-a000-0000000000"
+assert_contains "...and the result" "$out" "done"
 
 # A reviewer that reports in prose leaves no session id to read back, which must
 # not be mistaken for a failure: every review here succeeded.

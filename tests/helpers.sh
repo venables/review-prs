@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared harness for the review-prs and autoreview tests.
 #
-# Each test runs the real script against fake `gh`, `gum`, `cmux` and `claude`
+# Each test runs the real binaries against fake `gh`, `gum`, `cmux` and `dash-p`
 # binaries on PATH, inside a throwaway git repo, with $CLAUDE_CONFIG_DIR
 # pointed at a throwaway session store. Nothing here touches your real repos,
 # your real Claude Code sessions, or GitHub.
@@ -10,7 +10,9 @@ set -euo pipefail
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REVIEW_PRS="$TESTS_DIR/../review-prs"
-AUTOREVIEW="$TESTS_DIR/../autoreview"
+# The rust binary; tests/run.sh builds it and exports the path, the default
+# covers running one test file by hand after a `cargo build`.
+AUTOREVIEW="${AUTOREVIEW:-$TESTS_DIR/../target/debug/autoreview}"
 
 pass_count=0
 fail_count=0
@@ -70,7 +72,7 @@ setup_sandbox() {
   write_fake_gh
   write_fake_gum
   write_fake_cmux
-  write_fake_claude
+  write_fake_dashp
   write_fake_override
 
   export PATH="$SANDBOX/bin:$PATH"
@@ -79,7 +81,7 @@ setup_sandbox() {
   export SPAWN_LOG="$SANDBOX/out/spawned"
   export CLAUDE_LOG="$SANDBOX/out/claude-calls"
 
-  # The name the fake claude gives its sleeping grandchild, which the timeout
+  # The name the fake dash-p gives its sleeping grandchild, which the timeout
   # test looks for with `pgrep -f`. pgrep searches every process on the box, so
   # a fixed marker would also match anything that merely mentions it -- an
   # editor holding this file open, a grep, an agent reading this diff -- and
@@ -97,6 +99,9 @@ setup_sandbox() {
   unset FAKE_CLAUDE_FAIL FAKE_CLAUDE_IS_ERROR FAKE_CLAUDE_SLEEP \
         FAKE_CLAUDE_GARBAGE FAKE_CLAUDE_KILL_JOB \
         FAKE_GH_APPROVED FAKE_GH_CLOSED || true
+  # The host may have a real dash-p and an inherited override for it; the
+  # sandbox must only ever see its fake on PATH.
+  unset DASHP_BIN || true
   # Leave the workspace title alone; the fake cmux ignores it either way.
   export REVIEW_PRS_WORKSPACE=""
 
@@ -280,11 +285,14 @@ EOF
   chmod +x "$SANDBOX/bin/cmux"
 }
 
-write_fake_claude() {
-  cat >"$SANDBOX/bin/claude" <<'EOF'
+write_fake_dashp() {
+  cat >"$SANDBOX/bin/dash-p" <<'EOF'
 #!/usr/bin/env bash
-# Stands in for `claude -p`: records the call, emits a result envelope, and can
-# be told to fail, to report an error inside a zero exit, or to run slowly.
+# Stands in for dash-p, which drives claude for the built-in reviewer: records
+# the call, writes the meta envelope, and reports failures the way the real
+# one does -- in its exit code (0 ok, 10 agent-error), with the session id in
+# the envelope. The FAKE_CLAUDE_* knobs keep their names; each maps its old
+# scenario onto the dash-p contract.
 set -uo pipefail
 
 # The prompt is the last argument, and ends with the PR number.
@@ -294,69 +302,74 @@ n="${prompt##* }"
 printf '%s\n' "$*" >>"$CLAUDE_LOG"
 printf 'start %s\n' "$n" >>"$CLAUDE_LOG.events"
 
-if [[ -n "${FAKE_CLAUDE_SLEEP:-}" ]]; then
-  # Sleep in a marked grandchild, so a test can find survivors by name and so
-  # stopping this job has to walk past this shell -- which is what a real
-  # reviewer's own subprocesses look like. The marker is unique per sandbox:
-  # the test finds it with pgrep, which searches the whole box.
-  # The subshell and the trailing ":" are both load-bearing: a single-command
-  # `bash -c` body is exec'd in place, which would drop the tag from the command
-  # line and leave the assertion unable to see a survivor at all. This way the
-  # wrapper keeps the tag in its own argv and the sleep carries it via exec -a,
-  # so a leak of either one trips the test.
-  bash -c '( exec -a "$0-sleep" sleep "$1" ) ; :' \
-    "$FAKE_SLEEP_TAG-$n" "$FAKE_CLAUDE_SLEEP"
-fi
-
-is_error=false
-status=0
-case " ${FAKE_CLAUDE_FAIL:-} " in
-  *" $n "*) status=1 ;;
-esac
-case " ${FAKE_CLAUDE_IS_ERROR:-} " in
-  *" $n "*) is_error=true ;;
-esac
-
-# The envelope reports the session the turn ran in: the pinned or resumed id
-# when one was given, otherwise the fresh id claude would have allocated
-# itself. That difference is what the caller has to notice.
+meta=""
 sid=""
 prev=""
 for arg in "$@"; do
   case "$prev" in
+    --meta-file) meta="$arg" ;;
     --session-id|--resume) sid="$arg" ;;
   esac
   prev="$arg"
 done
+# The envelope reports the session the turn ran in: the pinned or resumed id
+# when one was given, otherwise the fresh id claude would have allocated
+# itself. That difference is what the caller has to notice.
 if [[ -z "$sid" ]]; then
   sid="00000000-0000-5000-a000-0000000000$(printf '%02d' "$n")"
 fi
 
-printf 'end %s\n' "$n" >>"$CLAUDE_LOG.events"
+if [[ -n "${FAKE_CLAUDE_SLEEP:-}" ]]; then
+  # Sleep in a marked grandchild, so a test can find survivors by name and so
+  # stopping this job has more than one process to stop -- which is what a
+  # real reviewer's own subprocesses look like. The marker is unique per
+  # sandbox: the test finds it with pgrep, which searches the whole box.
+  # The subshell and the trailing ":" are both load-bearing: a single-command
+  # `bash -c` body is exec'd in place, which would drop the tag from the
+  # command line. --timeout is deliberately NOT honored here: the timeout
+  # tests exercise autoreview's own guard and group kill, not the fake's
+  # ability to exit.
+  bash -c '( exec -a "$0-sleep" sleep "$1" ) ; :' \
+    "$FAKE_SLEEP_TAG-$n" "$FAKE_CLAUDE_SLEEP"
+fi
 
-# Take the job subshell down with no status written -- what an OOM kill or a
-# stray pkill does to a running review. The parent here is the job itself.
+# Die with no result written -- what an OOM kill or a stray pkill does to a
+# running review.
 case " ${FAKE_CLAUDE_KILL_JOB:-} " in
   *" $n "*)
-    kill -9 "$PPID" 2>/dev/null || true
+    kill -9 $$
     sleep 5
     ;;
 esac
 
-# A turn that dies mid-write, or an error printed as prose: asked for JSON and
-# given something else, with a zero exit.
+status=0
+label="ok"
+case " ${FAKE_CLAUDE_FAIL:-} " in
+  *" $n "*) status=10; label="agent-error" ;;
+esac
+# An is_error turn IS exit 10 under dash-p; the knob keeps its name so the
+# test scenarios keep their meaning.
+case " ${FAKE_CLAUDE_IS_ERROR:-} " in
+  *" $n "*) status=10; label="agent-error" ;;
+esac
+# Garbage claude output: dash-p exits 10 with an empty session id.
 case " ${FAKE_CLAUDE_GARBAGE:-} " in
-  *" $n "*)
-    printf 'Error: credit balance too low\n'
-    exit 0
-    ;;
+  *" $n "*) status=10; label="agent-error"; sid="" ;;
 esac
 
-printf '{"type":"result","is_error":%s,"session_id":"%s","total_cost_usd":0.42,"num_turns":3,"result":"reviewed %s"}\n' \
-  "$is_error" "$sid" "$n"
+printf 'end %s\n' "$n" >>"$CLAUDE_LOG.events"
+
+if [[ -n "$meta" ]]; then
+  printf '{"harness":"claude","drive":"print","exit_status":"%s","session_id":"%s","total_cost_usd":0.42,"num_turns":3,"duration_ms":10}\n' \
+    "$label" "$sid" >"$meta"
+fi
+if [[ "$status" -eq 0 ]]; then
+  printf '{"answer":"reviewed %s","metadata":{"session_id":"%s","total_cost_usd":0.42}}\n' \
+    "$n" "$sid"
+fi
 exit "$status"
 EOF
-  chmod +x "$SANDBOX/bin/claude"
+  chmod +x "$SANDBOX/bin/dash-p"
 }
 
 # A stand-in for a user-supplied $AUTOREVIEW_CMD / $REVIEW_PRS_CMD.
