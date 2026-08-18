@@ -166,10 +166,13 @@ pub fn run_pass(
                     let tx = tx.clone();
                     std::thread::spawn(move || {
                         let mut child = child;
-                        let status = child.wait();
-                        if let Ok(status) = status {
-                            let _ = tx.send(Event::JobExited { idx, status });
-                        }
+                        // A wait() error (ECHILD, if anything else reaped the
+                        // child) still frees the slot: a dropped event would
+                        // hang the pass forever, in a tool built for cron.
+                        let status = child.wait().unwrap_or_else(|_| {
+                            std::os::unix::process::ExitStatusExt::from_raw(127 << 8)
+                        });
+                        let _ = tx.send(Event::JobExited { idx, status });
                     });
                 }
                 Err(e) => {
@@ -178,6 +181,10 @@ pub fn run_pass(
                     ui.queue_note(format!("error: could not start the review for PR #{}: {e}", jobs[idx].pr));
                     jobs[idx].state = JobState::Failed;
                     jobs[idx].exit_code = Some(127);
+                    // The failed marker too, like the exit path: the next
+                    // babysit pass must review fresh, not re-check a stale
+                    // session for a PR this run never reviewed.
+                    rundir.mark_failed(jobs[idx].pr);
                     finished += 1;
                     ui.note_transition(&jobs[idx]);
                 }

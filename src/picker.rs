@@ -134,7 +134,7 @@ pub fn run(
     }
     if numbers.is_empty() {
         eprintln!("error: could not parse PR numbers from selection");
-        bail!("unparseable selection");
+        bail!(repo::AlreadyReported);
     }
     Ok(Some(numbers))
 }

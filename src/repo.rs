@@ -103,8 +103,16 @@ pub fn load() -> Result<RepoContext> {
     let owner = repo_json["owner"]["login"].as_str().unwrap_or_default().to_string();
     let name = repo_json["name"].as_str().unwrap_or_default().to_string();
 
+    // gh can answer from $GH_REPO outside any checkout; an empty repo root
+    // would hash into every session id and fail every spawn one PR at a time.
     let toplevel = Command::new("git").args(["rev-parse", "--show-toplevel"]).output()?;
-    let repo_root = PathBuf::from(String::from_utf8_lossy(&toplevel.stdout).trim());
+    let root_str = String::from_utf8_lossy(&toplevel.stdout).trim().to_string();
+    if !toplevel.status.success() || root_str.is_empty() {
+        eprintln!("error: not inside a git checkout");
+        eprintln!("{}", combined_output(&toplevel));
+        bail!(AlreadyReported);
+    }
+    let repo_root = PathBuf::from(root_str);
 
     // gh can exit 0 and still hand back an empty login, which would silently
     // mislabel every PR's engagement -- so check both the status and the value.

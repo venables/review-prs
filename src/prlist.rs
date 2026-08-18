@@ -373,7 +373,8 @@ pub fn pr_babysit_done(n: u64) -> Option<String> {
 mod tests {
     use super::*;
 
-    // The same fixture tests/helpers.sh seeds: 9 and 8 are NEW by others,
+    // The same shape tests/helpers.sh seeds (its numbering differs slightly:
+    // there 5 is the approved PR and 2 the draft): 9 and 8 are NEW by others,
     // 6 is SEEN (me commented last), 5 is a draft, 4 is mine, 3 is
     // dependabot, 2 is approved.
     fn fixture() -> Vec<PrNode> {
