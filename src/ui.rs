@@ -83,16 +83,81 @@ impl Ui {
         }
     }
 
-    /// Reset per-pass display state. (The TTY block measures its window here;
-    /// see render.)
+    /// Reset per-pass display state and measure the window once: a resize
+    /// mid-pass is rare, and measuring per redraw would fork a `tput` five
+    /// times a second.
     pub fn begin_pass(&mut self) {
         self.rendered_lines = 0;
         self.spin = 0;
+        self.window_max = window_rows();
     }
 
-    /// The live TTY progress block. Filled in by the TTY-rendering change;
-    /// the suite runs without a TTY and never sees it.
-    pub fn render(&mut self, _jobs: &[Job]) {}
+    /// The live TTY progress block, redrawn in place. The block is windowed:
+    /// the cursor cannot climb past the top of the screen, so a queue taller
+    /// than the terminal would otherwise redraw onto rows it does not own.
+    /// A busy repo makes that ordinary -- the PR query fetches 50, and --auto
+    /// queues every NEW/UPDATED one of them.
+    pub fn render(&mut self, jobs: &[Job]) {
+        if !self.tty {
+            return;
+        }
+        let total = jobs.len();
+        let (start, end) = if total > self.window_max {
+            // Everything above the first unfinished row is done and scrolls
+            // away first.
+            let first_unfinished = jobs
+                .iter()
+                .position(|j| !matches!(j.state, JobState::Done | JobState::Failed | JobState::Timeout))
+                .unwrap_or(total);
+            let start = first_unfinished.min(total - self.window_max);
+            (start, start + self.window_max)
+        } else {
+            (0, total)
+        };
+
+        let mut out = String::new();
+        if self.rendered_lines > 0 {
+            // Up, then erase everything below: the block can be one line
+            // shorter than last time, and clearing only the rows we rewrite
+            // would leave the last one standing for the rest of the pass.
+            out.push_str(&format!("\x1b[{}A\x1b[J", self.rendered_lines));
+        }
+        let mut shown = 0;
+        if start > 0 {
+            out.push_str(&format!(
+                "\x1b[2K  ... {start} finished, scrolled off (all of them are in the summary)\n"
+            ));
+            shown += 1;
+        }
+        const SPIN: [char; 4] = ['|', '/', '-', '\\'];
+        for job in &jobs[start..end] {
+            let (mark, label, elapsed) = match job.state {
+                JobState::Queued => (' ', "queued".to_string(), String::new()),
+                JobState::Running => (
+                    SPIN[self.spin % SPIN.len()],
+                    "reviewing".to_string(),
+                    fmt_dur(job.started.map(|s| s.elapsed().as_secs()).unwrap_or(0)),
+                ),
+                JobState::Done => ('+', "done".to_string(), fmt_dur(job.elapsed_secs)),
+                JobState::Failed => (
+                    'x',
+                    format!("failed ({})", job.outcome()),
+                    fmt_dur(job.elapsed_secs),
+                ),
+                JobState::Timeout => ('x', "timed out".to_string(), fmt_dur(job.elapsed_secs)),
+            };
+            out.push_str(&format!("\x1b[2K  {mark}  #{:<5} {label:<24} {elapsed:>8}\n", job.pr));
+            shown += 1;
+        }
+        if end < total {
+            out.push_str(&format!("\x1b[2K  ... {} more waiting\n", total - end));
+            shown += 1;
+        }
+        print!("{out}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        self.rendered_lines = shown;
+        self.spin = (self.spin + 1) % SPIN.len();
+    }
 
     pub fn hide_cursor(&self) {
         if self.tty {
@@ -135,6 +200,25 @@ impl Ui {
         print!("{}", align(&rows));
         println!("\nlogs: {}", pass_dir.display());
         println!("reopen any review with: claude --resume <SESSION>");
+    }
+}
+
+/// How many rows the progress block may occupy: the terminal height minus
+/// room for the two header lines, the elision line, and the prompt.
+fn window_rows() -> usize {
+    let lines = std::process::Command::new("tput")
+        .arg("lines")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok())
+        .unwrap_or(24);
+    lines.saturating_sub(5).max(3)
+}
+
+/// A panic must not leave the terminal without its cursor.
+impl Drop for Ui {
+    fn drop(&mut self) {
+        self.show_cursor();
     }
 }
 
