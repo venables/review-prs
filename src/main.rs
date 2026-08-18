@@ -10,6 +10,7 @@
 // pin the session ids to lib/session.sh's output.
 
 mod interval;
+mod session;
 
 fn main() {
     eprintln!("autoreview: not implemented yet");
