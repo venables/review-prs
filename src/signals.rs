@@ -12,8 +12,8 @@ use std::sync::mpsc::Sender;
 pub fn install(tx: Sender<Event>) {
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP]).expect("installing signal handlers");
     std::thread::spawn(move || {
-        for sig in signals.forever() {
-            if tx.send(Event::Signal(sig)).is_err() {
+        for _sig in signals.forever() {
+            if tx.send(Event::Signal).is_err() {
                 return;
             }
         }

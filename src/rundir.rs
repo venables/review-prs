@@ -43,7 +43,6 @@ fn make_unique_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
 }
 
 pub struct RunDir {
-    pub log_dir: PathBuf,
     pub root: PathBuf,
     pub pass_dir: PathBuf,
 }
@@ -61,7 +60,7 @@ impl RunDir {
             }
         };
         let root = make_unique_dir(&log_dir, "run-")?;
-        Ok(RunDir { log_dir, pass_dir: root.clone(), root })
+        Ok(RunDir { pass_dir: root.clone(), root })
     }
 
     pub fn start_pass(&mut self, pass: u32) -> Result<&Path> {

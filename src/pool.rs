@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 pub enum Event {
     JobExited { idx: usize, status: std::process::ExitStatus },
-    Signal(i32),
+    Signal,
 }
 
 /// Stop one job: every process in its group, TERM first so a well-behaved
@@ -248,7 +248,7 @@ pub fn run_pass(
                 }
                 ui.note_transition(job);
             }
-            Ok(Event::Signal(_)) => interrupt(&jobs, ui, rundir),
+            Ok(Event::Signal) => interrupt(&jobs, ui, rundir),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }

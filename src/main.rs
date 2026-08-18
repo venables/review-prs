@@ -152,7 +152,7 @@ fn interruptible_sleep(
             return;
         }
         match rx.recv_timeout(left) {
-            Ok(pool::Event::Signal(_)) => {
+            Ok(pool::Event::Signal) => {
                 println!();
                 eprintln!("interrupted; stopping running reviews");
                 ui.show_cursor();
