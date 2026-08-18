@@ -6,10 +6,10 @@ open pull requests without manually opening tabs and typing commands.
 
 Two entry points, same PR list:
 
-| Command                     | Runs each review in            | Use when                                                                |
-| --------------------------- | ------------------------------ | ----------------------------------------------------------------------- |
-| `review-prs`                | a terminal tab you can steer   | you want to watch a review happen and interrupt it                      |
-| [`autoreview`](#autoreview) | a headless dash-p process      | there is no terminal (ssh, cron, CI), or a dozen PRs means a dozen tabs |
+| Command                     | Runs each review in          | Use when                                                                |
+| --------------------------- | ---------------------------- | ----------------------------------------------------------------------- |
+| `review-prs`                | a terminal tab you can steer | you want to watch a review happen and interrupt it                      |
+| [`autoreview`](#autoreview) | a headless dash-p process    | there is no terminal (ssh, cron, CI), or a dozen PRs means a dozen tabs |
 
 Pairs nicely with the [`panel-review`](https://github.com/catena-labs/dev-skills)
 skill, which is the default review command both run.
@@ -212,8 +212,10 @@ anchored regex in the script — extend it as more AI coding bots show up.)
 
 `autoreview` reviews the same PRs without tabs. It is a Rust binary; each
 review runs as a [dash-p](https://github.com/venabots/dash-p) subprocess
-driving claude headlessly, and the run shows live per-PR progress, prints a
-summary, and exits nonzero if any review failed.
+driving claude headlessly. The run shows a live per-PR board, reads each
+review's verdict back from GitHub when it finishes, and ends with a summary
+of verdicts, findings, models and cost. It exits nonzero if any review
+failed.
 
 ```sh
 autoreview                  # picker, then review each selection headlessly
@@ -228,25 +230,67 @@ It takes the same selection flags as `review-prs` (`--auto`, `--continue`,
 `--all`, `--dependabot`, `--babysit`) plus four of its own: `--jobs`,
 `--timeout`, `--budget` and `--log-dir`.
 
+On a terminal the pass is a live board -- finished reviews settle into
+permanent result lines, running ones spin, and a progress bar tracks the
+pass:
+
 ```
 auto-reviewing 2 PR(s): #9 #8
-reviewing 2 PR(s), 2 at a time
-logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
+reviewing 2 PR(s), 2 at a time · logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 
-  +  #9     done                           4m12s
-  /  #8     reviewing                      1m47s
+  ✓ #9 approved · risk LOW · 4m12s · $0.51  Add retry logic
+  ⠹ #8 Fix flaky test · reviewing 1m47s
+  ━━━━━━━━━━━━╸───────────  1/2 · 1 running
 ```
 
-and when it finishes:
+and the summary is a pair of tables -- what each review concluded, and which
+models did the reviewing:
 
 ```
-PR  RESULT  TIME   COST   SESSION
-#9  done    4m12s  $0.51  cc10f740-28c3-58c6-ae64-d9ff37df22a7
-#8  done    6m03s  $0.88  fa5ced7b-32dd-578b-a3b9-d4d23195dce1
-
-logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
+╭────┬────────┬───────────┬──────┬──────────────┬───────┬───────┬────────────────╮
+│ PR ┆ RESULT ┆ VERDICT   ┆ RISK ┆ FINDINGS     ┆ TIME  ┆ COST  ┆ MODEL          │
+╞════╪════════╪═══════════╪══════╪══════════════╪═══════╪═══════╪════════════════╡
+│ #9 ┆ done   ┆ approved  ┆ LOW  ┆ 1 polish     ┆ 4m12s ┆ $0.51 ┆ claude-fable-5 │
+│ #8 ┆ done   ┆ commented ┆ MED  ┆ 2 should-fix ┆ 6m03s ┆ $0.88 ┆ claude-fable-5 │
+╰────┴────────┴───────────┴──────┴──────────────┴───────┴───────┴────────────────╯
+╭────┬──────────┬─────────────────┬────────┬──────────┬────────╮
+│ PR ┆ PANELIST ┆ MODEL           ┆ RESULT ┆ FINDINGS ┆ TOP    │
+╞════╪══════════╪═════════════════╪════════╪══════════╪════════╡
+│ #9 ┆ codex    ┆ gpt-5.5         ┆ ok     ┆ 1        ┆ LOW    │
+│ #9 ┆ claude   ┆ claude-opus-4.7 ┆ ok     ┆ 0        ┆ -      │
+│ #8 ┆ codex    ┆ gpt-5.5         ┆ ok     ┆ 3        ┆ MEDIUM │
+│ #8 ┆ claude   ┆ claude-opus-4.7 ┆ ok     ┆ 2        ┆ MEDIUM │
+╰────┴──────────┴─────────────────┴────────┴──────────┴────────╯
 reopen any review with: claude --resume <SESSION>
+  #9  cc10f740-28c3-58c6-ae64-d9ff37df22a7
+  #8  fa5ced7b-32dd-578b-a3b9-d4d23195dce1
+logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 ```
+
+Without a TTY -- cron, CI, piped output -- the board becomes one plain line
+per state change and the summary a plain aligned table with the same columns,
+plus one `panel #N:` line per PR with panel data.
+
+### Verdicts and models
+
+The VERDICT column is read back from GitHub, not taken from the agent's
+report: after a review finishes, autoreview asks `gh` whether your login
+submitted a review on that PR since the job started -- approved, commented,
+or changes requested. An agent that believed its own report would show
+"approved" for an approval that never landed.
+
+Everything GitHub cannot know comes from the reviewer itself. A system-prompt
+instruction sent with every built-in review asks the agent to end its final
+reply with a fenced `autoreview` code block: its decision, the synthesized
+risk, the finding counts per bucket, and every launched panelist with its
+self-reported model, result, finding count and top severity. The block is
+best-effort -- a review that never writes it costs a `-` in those columns,
+nothing more -- and it is also the verdict fallback when GitHub has nothing
+to say.
+
+MODEL is dash-p's accounting (`model_resolved` in its envelope): the model
+that drove the review session. The panel table lists the models the
+panelists ran on, as they reported them to the session that fanned them out.
 
 ### What you trade
 
@@ -331,8 +375,10 @@ An override owns its own session handling and receives
 `$REVIEW_PRS_SESSION_ID` and `$REVIEW_PRS_SESSION_RESUME` — the same contract
 `review-prs` uses, so one wrapper works with both. Unlike `review-prs`, which
 can only reach a new tab through a command string, these arrive in the child's
-real environment. Cost and session are dash-p's accounting, so the summary
-shows `-` for both under an overridden reviewer -- it owns its own sessions.
+real environment. Cost, session and model are dash-p's accounting, so the
+summary shows `-` for them under an overridden reviewer -- it owns its own
+sessions -- and the trailer is not read either. The verdict column still
+works: it is read back from GitHub, which does not care who reviewed.
 
 ## Columns
 
