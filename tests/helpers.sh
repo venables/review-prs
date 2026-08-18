@@ -67,7 +67,11 @@ setup_sandbox() {
     "$SANDBOX/fixtures" "$SANDBOX/out"
 
   git -C "$SANDBOX/repo" init -q
-  git -C "$SANDBOX/repo" commit -q --allow-empty -m init
+  # An explicit ident: a CI runner has none configured, and Linux git refuses
+  # to synthesize one (macOS quietly does, which is why this only ever failed
+  # on the Ubuntu leg).
+  git -C "$SANDBOX/repo" -c user.name=test -c user.email=test@example.com \
+    commit -q --allow-empty -m init
 
   write_fake_gh
   write_fake_gum
