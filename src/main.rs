@@ -20,6 +20,7 @@ mod job;
 mod picker;
 mod pool;
 mod prlist;
+mod report;
 mod repo;
 mod rundir;
 mod session;
@@ -43,7 +44,10 @@ fn mark_resumable(rows: &mut [prlist::Row], ctx: &RepoContext) {
     }
 }
 
-fn select_prs(cfg: &Config, ctx: &RepoContext) -> anyhow::Result<Option<Vec<u64>>> {
+/// The chosen PR numbers, plus every fetched PR's title for the live board.
+type Selection = (Vec<u64>, std::collections::HashMap<u64, String>);
+
+fn select_prs(cfg: &Config, ctx: &RepoContext) -> anyhow::Result<Option<Selection>> {
     let Some(prs) = prlist::fetch_prs(ctx, cfg.include_approved, cfg.include_dependabot)? else {
         return Ok(None);
     };
@@ -52,12 +56,14 @@ fn select_prs(cfg: &Config, ctx: &RepoContext) -> anyhow::Result<Option<Vec<u64>
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let mut rows = prlist::build_rows(&prs, &ctx.me, now);
-    if cfg.auto {
-        Ok(prlist::select_auto(&rows))
+    let titles = rows.iter().map(|r| (r.number, r.title.clone())).collect();
+    let numbers = if cfg.auto {
+        prlist::select_auto(&rows)
     } else {
         mark_resumable(&mut rows, ctx);
-        picker::run(&rows, cfg.continue_sessions, cfg.include_dependabot)
-    }
+        picker::run(&rows, cfg.continue_sessions, cfg.include_dependabot)?
+    };
+    Ok(numbers.map(|n| (n, titles)))
 }
 
 fn run(cfg: &Config) -> anyhow::Result<i32> {
@@ -71,7 +77,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     }
     let ctx = repo::load()?;
 
-    let Some(numbers) = select_prs(cfg, &ctx)? else {
+    let Some((numbers, titles)) = select_prs(cfg, &ctx)? else {
         return Ok(0);
     };
 
@@ -91,7 +97,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     let mut pass = 1u32;
     let (failures, total) = loop {
         rundir.start_pass(pass)?;
-        let jobs = pool::run_pass(&queue, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
+        let jobs = pool::run_pass(&queue, &titles, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
         ui.print_summary(&jobs, &rundir.pass_dir);
         let failures = pool::failures(&jobs);
 
@@ -158,8 +164,8 @@ fn interruptible_sleep(
                 ui.show_cursor();
                 std::process::exit(130);
             }
-            // A stale exit event from a pass that already finished.
-            Ok(pool::Event::JobExited { .. }) => {}
+            // Stale job events from a pass that already finished.
+            Ok(_) => {}
             Err(_) => return,
         }
     }

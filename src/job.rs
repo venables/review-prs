@@ -10,6 +10,7 @@
 //! is its normal shape, not a failure.
 
 use crate::cli::Config;
+use crate::report::Trailer;
 use crate::repo::RepoContext;
 use crate::rundir::RunDir;
 use crate::session::{SessionFlag, is_uuid_shaped};
@@ -41,6 +42,8 @@ pub enum JobState {
 #[derive(Debug)]
 pub struct Job {
     pub pr: u64,
+    /// The PR title, for the live board; empty when unknown.
+    pub title: String,
     pub state: JobState,
     /// The child's pid doubles as its process-group id (process_group(0)).
     pub pgid: Option<i32>,
@@ -49,27 +52,44 @@ pub struct Job {
     pub sid: Option<String>,
     pub resume: bool,
     pub started: Option<Instant>,
+    /// The child exited and was reaped; only the verdict readback remains.
+    pub reaped: bool,
+    /// Wall-clock start, for comparing against GitHub review timestamps.
+    pub started_epoch: i64,
     pub elapsed_secs: u64,
     /// The exit code, or None for signal-death ("no result").
     pub exit_code: Option<i32>,
     pub guard_tripped: bool,
     pub cost: Option<f64>,
+    /// The model dash-p reports the review ran on.
+    pub model: Option<String>,
+    /// What the review concluded: GitHub's readback first, else the agent's
+    /// own trailer decision.
+    pub verdict: Option<String>,
+    /// The agent's self-reported trailer (risk, findings, panel).
+    pub trailer: Option<Trailer>,
 }
 
 impl Job {
     pub fn new(pr: u64) -> Job {
         Job {
             pr,
+            title: String::new(),
             state: JobState::Queued,
             pgid: None,
             flag: SessionFlag::None,
             sid: None,
             resume: false,
             started: None,
+            reaped: false,
+            started_epoch: 0,
             elapsed_secs: 0,
             exit_code: None,
             guard_tripped: false,
             cost: None,
+            model: None,
+            verdict: None,
+            trailer: None,
         }
     }
 
@@ -114,6 +134,11 @@ pub fn dashp_args(job: &Job, cfg: &Config, rundir: &RunDir) -> Vec<String> {
         "--timeout".into(),
         timeout.to_string(),
         "--dangerously-skip-permissions".into(),
+        // The trailer request rides in the system prompt rather than the
+        // user prompt, so the slash command stays the whole prompt and the
+        // skill trigger is never at risk. Single-token `=` form: dash-p
+        // forwards unrecognized flags only that way.
+        format!("--append-system-prompt={}", crate::report::TRAILER_INSTRUCTION),
     ];
     match &job.flag {
         SessionFlag::Pin(id) => {
@@ -202,6 +227,9 @@ pub struct MetaEnvelope {
     pub session_id: String,
     #[serde(default)]
     pub total_cost_usd: f64,
+    /// The model the harness actually ran, e.g. "claude-fable-5".
+    #[serde(default)]
+    pub model_resolved: String,
 }
 
 pub fn read_meta(rundir: &RunDir, pr: u64) -> Option<MetaEnvelope> {
@@ -280,6 +308,8 @@ mod tests {
         assert!(joined.contains("--timeout 3600"));
         assert!(joined.contains("--dangerously-skip-permissions"));
         assert!(joined.contains("--session-id 7442b624-5cba-5d44-ae67-9c390cfe70a1"));
+        // The trailer request rides along as one `=`-form token.
+        assert!(argv.iter().any(|a| a.starts_with("--append-system-prompt=")));
         // The single-token = form: dash-p forwards unknown flags only this way.
         assert!(argv.contains(&"--max-budget-usd=2.50".to_string()));
         assert_eq!(argv.last().unwrap(), "/auto-review 9");
@@ -329,6 +359,7 @@ mod tests {
         let meta = MetaEnvelope {
             session_id: "80e25f6a-45b7-5246-a9e2-8feda1021531".into(),
             total_cost_usd: 0.42,
+            model_resolved: "claude-fable-5".into(),
         };
         assert_eq!(summary_sid(&job, Some(&meta), false).as_deref(), Some("80e25f6a-45b7-5246-a9e2-8feda1021531"));
 

@@ -218,7 +218,7 @@ fn extract_nodes(parsed: &serde_json::Value) -> Result<Vec<PrNode>> {
 
 /// Seconds since the epoch for a strict "YYYY-MM-DDTHH:MM:SSZ" timestamp --
 /// the only shape GitHub emits here. Days-from-civil, no external crate.
-fn parse_iso(ts: &str) -> Option<i64> {
+pub fn parse_iso(ts: &str) -> Option<i64> {
     let b = ts.as_bytes();
     if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
         return None;

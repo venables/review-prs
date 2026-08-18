@@ -101,8 +101,9 @@ setup_sandbox() {
         AUTOREVIEW_MAX_BUDGET_USD AUTOREVIEW_LOG_DIR \
         AUTOREVIEW_BABYSIT_INTERVAL || true
   unset FAKE_CLAUDE_FAIL FAKE_CLAUDE_IS_ERROR FAKE_CLAUDE_SLEEP \
-        FAKE_CLAUDE_GARBAGE FAKE_CLAUDE_KILL_JOB \
-        FAKE_GH_APPROVED FAKE_GH_CLOSED || true
+        FAKE_CLAUDE_GARBAGE FAKE_CLAUDE_KILL_JOB FAKE_CLAUDE_TRAILER \
+        FAKE_GH_APPROVED FAKE_GH_CLOSED FAKE_GH_MY_REVIEW \
+        FAKE_GH_VIEW_FAIL || true
   # The host may have a real dash-p and an inherited override for it; the
   # sandbox must only ever see its fake on PATH.
   unset DASHP_BIN || true
@@ -198,10 +199,14 @@ case "$sub" in
   pr)
     # `gh pr view N --json ...`: PRs named in $FAKE_GH_APPROVED read as
     # approved and those in $FAKE_GH_CLOSED as closed; everything else is an
-    # open PR with no decision yet. The two shapes asked for are a bare
-    # decision (--jq) and the state+decision object.
+    # open PR with no decision yet. The shapes asked for are a bare decision
+    # (--jq), the state+decision object, and the latestReviews list -- the
+    # last driven by $FAKE_GH_MY_REVIEW ("9:APPROVED 8:COMMENTED"), stamped
+    # now so it reads as this run's review.
     shift || true
     num="${1:-}"
+    # A gh that cannot answer at all -- rate limit, expired auth, network.
+    [[ "${FAKE_GH_VIEW_FAIL:-0}" == "1" ]] && exit 1
     decision=""
     state="OPEN"
     case " ${FAKE_GH_APPROVED:-} " in
@@ -211,6 +216,20 @@ case "$sub" in
       *" $num "*) state="CLOSED" ;;
     esac
     case " $* " in
+      *" latestReviews "*)
+        mystate=""
+        for entry in ${FAKE_GH_MY_REVIEW:-}; do
+          case "$entry" in
+            "$num:"*) mystate="${entry#*:}" ;;
+          esac
+        done
+        if [[ -n "$mystate" ]]; then
+          printf '{"latestReviews":[{"author":{"login":"%s"},"state":"%s","submittedAt":"%s"}]}\n' \
+            "${FAKE_GH_LOGIN:-me}" "$mystate" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        else
+          printf '{"latestReviews":[]}\n'
+        fi
+        ;;
       *" --jq "*) printf '%s\n' "$decision" ;;
       *) printf '{"state":"%s","reviewDecision":"%s"}\n' "$state" "$decision" ;;
     esac
@@ -364,12 +383,22 @@ esac
 printf 'end %s\n' "$n" >>"$CLAUDE_LOG.events"
 
 if [[ -n "$meta" ]]; then
-  printf '{"harness":"claude","drive":"print","exit_status":"%s","session_id":"%s","total_cost_usd":0.42,"num_turns":3,"duration_ms":10}\n' \
+  printf '{"harness":"claude","drive":"print","exit_status":"%s","session_id":"%s","total_cost_usd":0.42,"num_turns":3,"duration_ms":10,"model_resolved":"claude-fable-5"}\n' \
     "$label" "$sid" >"$meta"
 fi
+# PRs named in $FAKE_CLAUDE_TRAILER end their answer with the fenced
+# ```autoreview block a real reviewer is asked for via the system prompt.
+# The \n and \" sequences are literal here: they are JSON escapes for the
+# consumer to decode, not printf's to interpret.
+trailer=""
+case " ${FAKE_CLAUDE_TRAILER:-} " in
+  *" $n "*)
+    trailer='\n\n```autoreview\n{\"decision\":\"commented\",\"risk\":\"LOW\",\"findings\":{\"must_fix\":0,\"should_fix\":0,\"polish\":1},\"panel\":[{\"name\":\"codex\",\"model\":\"gpt-5.5\",\"ok\":true,\"findings\":1,\"top\":\"LOW\"},{\"name\":\"claude\",\"model\":\"claude-opus-4.7\",\"ok\":true,\"findings\":0}]}\n```'
+    ;;
+esac
 if [[ "$status" -eq 0 ]]; then
-  printf '{"answer":"reviewed %s","metadata":{"session_id":"%s","total_cost_usd":0.42}}\n' \
-    "$n" "$sid"
+  printf '{"answer":"reviewed %s%s","metadata":{"session_id":"%s","total_cost_usd":0.42}}\n' \
+    "$n" "$trailer" "$sid"
 fi
 exit "$status"
 EOF

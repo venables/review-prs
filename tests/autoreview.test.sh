@@ -206,6 +206,49 @@ assert_contains "...naming each PR" "$out" "#9"
 assert_not_contains "...offering no session it cannot vouch for" "$out" "$sid8"
 assert_not_contains "...nor the derived one" "$out" "$sid9"
 
+# --- Verdicts and models --------------------------------------------------
+# The verdict is read back from GitHub -- an agent that believed its own
+# report would show "approved" for an approval that never landed. The trailer
+# (the fenced block the system prompt asks the reviewer for) fills in what
+# GitHub cannot know: risk, finding counts, and each panelist's model.
+out="$(FAKE_GH_MY_REVIEW='9:APPROVED' FAKE_CLAUDE_TRAILER='8' run_autoreview --auto)"
+assert_contains "the trailer request reaches the reviewer" \
+  "$(claude_call_for '/auto-review 9')" "--append-system-prompt="
+assert_contains "an approval on GitHub is the verdict" "$out" "approved"
+assert_contains "the trailer supplies the verdict when GitHub has none" \
+  "$out" "commented"
+assert_contains "the synthesized risk is shown" "$out" "LOW"
+assert_contains "the finding counts are shown" "$out" "1 polish"
+assert_contains "the model that drove the review is shown" "$out" "claude-fable-5"
+assert_contains "each panelist's model and result are shown" \
+  "$out" "codex (gpt-5.5) 1 finding, top LOW"
+assert_contains "a clean panelist is shown too" "$out" "claude (claude-opus-4.7) clean"
+
+# A reviewer that never writes the block costs a "-" in the summary, nothing
+# more -- and GitHub reading back nothing is not a failure either.
+out="$(run_autoreview --auto)"
+assert_equals "a run with no trailer and no review still exits 0" "$(last_status)" "0"
+assert_not_contains "...and shows no panel it never heard about" "$out" "panel #"
+
+# The staleness rule -- a review my login submitted before the run must not
+# read as this run's verdict -- is pinned by the rust unit tests; the fake
+# always stamps "now". Here: the other review states map through too.
+out="$(FAKE_GH_MY_REVIEW='9:CHANGES_REQUESTED' run_autoreview --auto)"
+assert_contains "a blocking review reads as changes requested" \
+  "$out" "changes requested"
+
+# A readback gh cannot perform is announced rather than silently swapped for
+# the agent's own report -- an unattended run must show which verdicts are
+# self-reported only.
+out="$(FAKE_GH_VIEW_FAIL=1 FAKE_CLAUDE_TRAILER='9' run_autoreview --auto)"
+assert_contains "a failed readback is announced" \
+  "$out" "could not read PR #9's review back from GitHub; the verdict is the agent's own report"
+assert_contains "...and the agent's own report still fills the column" \
+  "$out" "commented"
+assert_contains "...while a PR with no trailer admits its verdict is unknown" \
+  "$out" "could not read PR #8's review back from GitHub; its verdict is unknown"
+assert_equals "...without failing the run" "$(last_status)" "0"
+
 # --- Babysit sessions -----------------------------------------------------
 # PR #8 has no session, so its review pins one -- and that is the id recorded,
 # in this run's own directory rather than one shared with every other run.
