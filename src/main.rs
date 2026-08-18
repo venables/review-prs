@@ -81,20 +81,88 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     let mut ui = ui::Ui::new();
     ui.hide_cursor();
 
-    rundir.start_pass(1)?;
-    let jobs = pool::run_pass(&numbers, cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
-    ui.print_summary(&jobs, &rundir.pass_dir);
+    // --babysit re-runs the whole pass on an interval, dropping PRs as they
+    // are approved (or closed -- waiting for an approval that is never coming
+    // would re-review forever), until nothing is left. The loop is this
+    // process, so an interval that never converges is one process you can
+    // see and kill.
+    let mut cfg = cfg.clone();
+    let mut queue = numbers;
+    let mut pass = 1u32;
+    let (failures, total) = loop {
+        rundir.start_pass(pass)?;
+        let jobs = pool::run_pass(&queue, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
+        ui.print_summary(&jobs, &rundir.pass_dir);
+        let failures = pool::failures(&jobs);
+
+        let Some(babysit) = cfg.babysit.clone() else {
+            break (failures, jobs.len());
+        };
+
+        // Read back from GitHub rather than inferred from what the agent
+        // said: the review either landed as an approval or it did not, and a
+        // run that believed its own report would babysit a PR it never
+        // actually approved.
+        let mut remaining = Vec::new();
+        for &n in &queue {
+            if let Some(why) = prlist::pr_babysit_done(n) {
+                println!("\nPR #{n} is {why}; dropping it from the babysit loop");
+            } else {
+                remaining.push(n);
+            }
+        }
+        if remaining.is_empty() {
+            println!("\nnothing left to babysit");
+            break (failures, jobs.len());
+        }
+        queue = remaining;
+        // The first pass recorded each review's session; every later pass
+        // resumes it whether or not --continue was passed. Re-reviewing from
+        // scratch each interval would throw away the findings the author is
+        // in the middle of answering.
+        cfg.continue_sessions = true;
+        println!("\nnext check in {} ({} PR(s) left)", babysit.normalized, queue.len());
+        interruptible_sleep(&rx, std::time::Duration::from_secs(babysit.secs), &ui);
+        pass += 1;
+    };
     ui.show_cursor();
 
     // Exit nonzero when any review in the final pass did not complete
     // cleanly, so a cron job or a CI step can tell a finished sweep from a
     // broken one.
-    let failures = pool::failures(&jobs);
     if failures > 0 {
-        eprintln!("error: {failures} of {} review(s) failed", jobs.len());
+        eprintln!("error: {failures} of {total} review(s) failed");
         return Ok(1);
     }
     Ok(0)
+}
+
+/// The babysit interval sleep, listening on the same channel the pass engine
+/// uses -- a signal mid-interval must end the loop the same way it ends a
+/// pass, not wait out the timer.
+fn interruptible_sleep(
+    rx: &std::sync::mpsc::Receiver<pool::Event>,
+    dur: std::time::Duration,
+    ui: &ui::Ui,
+) {
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match rx.recv_timeout(left) {
+            Ok(pool::Event::Signal(_)) => {
+                println!();
+                eprintln!("interrupted; stopping running reviews");
+                ui.show_cursor();
+                std::process::exit(130);
+            }
+            // A stale exit event from a pass that already finished.
+            Ok(pool::Event::JobExited { .. }) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 fn main() {
