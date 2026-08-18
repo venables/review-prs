@@ -7,6 +7,24 @@ TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$TESTS_DIR/.."
 failed=0
 
+# The rust crate first: its unit tests pin the pieces the bash suite then
+# exercises end to end, and a binary that does not build makes the rest moot.
+echo "cargo"
+if (cd "$ROOT" && cargo build --quiet); then
+  echo "  ok    autoreview builds"
+else
+  echo "  FAIL  autoreview does not build"
+  failed=1
+fi
+if (cd "$ROOT" && cargo test --quiet >/dev/null 2>&1); then
+  echo "  ok    cargo test passes"
+else
+  echo "  FAIL  cargo test failed"
+  (cd "$ROOT" && cargo test --quiet 2>&1 | tail -20)
+  failed=1
+fi
+echo
+
 for f in "$TESTS_DIR"/*.test.sh; do
   bash "$f" || failed=1
   echo
