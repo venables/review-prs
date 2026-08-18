@@ -11,6 +11,8 @@
 
 mod cli;
 mod interval;
+mod prlist;
+mod repo;
 mod session;
 
 fn main() {
