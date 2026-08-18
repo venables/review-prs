@@ -9,6 +9,8 @@
 // derivation in src/ mirror lib/*.sh byte for byte, and the golden unit tests
 // pin the session ids to lib/session.sh's output.
 
+mod interval;
+
 fn main() {
     eprintln!("autoreview: not implemented yet");
     std::process::exit(2);
