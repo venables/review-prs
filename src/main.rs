@@ -9,10 +9,28 @@
 // derivation in src/ mirror lib/*.sh byte for byte, and the golden unit tests
 // pin the session ids to lib/session.sh's output.
 
+mod cli;
 mod interval;
 mod session;
 
 fn main() {
+    let cfg = match cli::parse(std::env::args().skip(1), &cli::real_env) {
+        Ok(cli::Parsed::Help) => {
+            print!("{}", cli::HELP);
+            std::process::exit(0);
+        }
+        Ok(cli::Parsed::Run(cfg)) => cfg,
+        Err(e) => {
+            eprintln!("{}", e.msg);
+            if e.show_help {
+                eprint!("{}", cli::HELP);
+            }
+            std::process::exit(1);
+        }
+    };
+    for note in &cfg.startup_notes {
+        eprintln!("{note}");
+    }
     eprintln!("autoreview: not implemented yet");
     std::process::exit(2);
 }

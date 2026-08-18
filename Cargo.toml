@@ -7,7 +7,6 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
 md-5 = "0.10"
 nix = { version = "0.30", features = ["signal"] }
 serde = { version = "1", features = ["derive"] }
