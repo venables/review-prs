@@ -2,8 +2,18 @@
 name = "autoreview"
 version = "0.10.0"
 edition = "2024"
-description = "Review a repo's open PRs headlessly, with progress and a real exit status"
+description = "Review a repo's open PRs, headlessly or fanned out into terminal tabs"
 license = "MIT"
+
+# Two front-ends over one library: they must agree on the PR list and on which
+# session a PR belongs to, and sharing a build is what guarantees it.
+[lib]
+name = "autoreview"
+path = "src/lib.rs"
+
+[[bin]]
+name = "autoreview"
+path = "src/bin/autoreview.rs"
 
 [dependencies]
 anyhow = "1"
