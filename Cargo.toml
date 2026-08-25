@@ -1,6 +1,6 @@
 [package]
 name = "autoreview"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 description = "Review a repo's open PRs headlessly, with progress and a real exit status"
 license = "MIT"
