@@ -3,67 +3,27 @@
 // shows live per-PR progress, prints a summary, and exits nonzero if any
 // review failed.
 //
-// This is the sibling of `review-prs` (bash, in this repo), which fans the
-// same PRs out into one terminal tab each. The two agree on what is worth
-// reviewing and on which session a PR belongs to: the selection and session
-// derivation in src/ mirror lib/*.sh, and golden unit tests pin the session
-// ids to lib/session.sh's output.
+// This is the sibling of `review-prs`, the other binary in this crate, which
+// fans the same PRs out into one terminal tab each. The two share the library:
+// same PR list, same ranking, same picker, same derived session ids.
 //
 // Pick this one when there is no terminal to spawn into (ssh, cron, CI), when
 // the exit status has to mean "the reviews succeeded" rather than "the tabs
 // opened", or when a dozen PRs would mean a dozen tabs. Pick review-prs when
 // you want to watch a review happen and steer it mid-flight.
 
-mod cli;
-mod interval;
-mod job;
-mod picker;
-mod pool;
-mod prlist;
-mod report;
-mod repo;
-mod rundir;
-mod session;
-mod signals;
-mod ui;
+use autoreview::cli::Config;
+use autoreview::rundir::RunDir;
+use autoreview::{cli, pool, prlist, repo, select, signals, ui};
 
-use cli::Config;
-use repo::RepoContext;
-use rundir::RunDir;
-
-fn mark_resumable(rows: &mut [prlist::Row], ctx: &RepoContext) {
-    // Marking costs one hash and one glob per PR, so skip the whole loop when
-    // no session store exists -- there is nothing to find, and a box without
-    // Claude Code should not pay for the lookup on every picker run.
-    if !session::projects_dir().is_dir() {
-        return;
+fn select_prs(cfg: &Config) -> select::Opts<'static> {
+    select::Opts {
+        include_approved: cfg.include_approved,
+        include_dependabot: cfg.include_dependabot,
+        pick: cfg.pick,
+        continue_sessions: cfg.continue_sessions,
+        sweep_empty_hint: "; pass --pick to choose from every open PR",
     }
-    for row in rows {
-        let id = session::pr_session_id(&ctx.repo_root, &ctx.owner, &ctx.name, row.number);
-        row.resumable = session::session_exists(&id);
-    }
-}
-
-/// The chosen PR numbers, plus every fetched PR's title for the live board.
-type Selection = (Vec<u64>, std::collections::HashMap<u64, String>);
-
-fn select_prs(cfg: &Config, ctx: &RepoContext) -> anyhow::Result<Option<Selection>> {
-    let Some(prs) = prlist::fetch_prs(ctx, cfg.include_approved, cfg.include_dependabot)? else {
-        return Ok(None);
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let mut rows = prlist::build_rows(&prs, &ctx.me, now);
-    let titles = rows.iter().map(|r| (r.number, r.title.clone())).collect();
-    let numbers = if cfg.pick {
-        mark_resumable(&mut rows, ctx);
-        picker::run(&rows, cfg.continue_sessions, cfg.include_dependabot)?
-    } else {
-        prlist::select_auto(&rows)
-    };
-    Ok(numbers.map(|n| (n, titles)))
 }
 
 fn run(cfg: &Config) -> anyhow::Result<i32> {
@@ -77,7 +37,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     }
     let ctx = repo::load()?;
 
-    let Some((numbers, titles)) = select_prs(cfg, &ctx)? else {
+    let Some((numbers, titles)) = select::run(&ctx, &select_prs(cfg))? else {
         return Ok(0);
     };
 

@@ -325,18 +325,19 @@ pub fn build_rows(prs: &[PrNode], me: &str, now_epoch: i64) -> Vec<Row> {
     rows
 }
 
-/// The default sweep: every NEW/UPDATED PR. SEEN PRs are skipped on purpose --
+/// The sweep: every NEW/UPDATED PR. SEEN PRs are skipped on purpose --
 /// nothing has changed since you last engaged, so an unattended sweep has no
 /// reason to re-review them. Prints the selection; None (after printing)
-/// means nothing to do and the caller exits 0.
-pub fn select_auto(rows: &[Row]) -> Option<Vec<u64>> {
+/// means nothing to do and the caller exits 0. The hint names the caller's own
+/// way to see the rest, which is a different flag in each front-end.
+pub fn select_auto(rows: &[Row], empty_hint: &str) -> Option<Vec<u64>> {
     let numbers: Vec<u64> = rows
         .iter()
         .filter(|r| matches!(r.engage, Engagement::New | Engagement::Updated))
         .map(|r| r.number)
         .collect();
     if numbers.is_empty() {
-        println!("no NEW or UPDATED PRs to review; pass --pick to choose from every open PR");
+        println!("no NEW or UPDATED PRs to review{empty_hint}");
         return None;
     }
     let list: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
@@ -445,7 +446,7 @@ mod tests {
     fn select_auto_takes_new_and_updated_only() {
         let prs = filtered(false, false);
         let rows = build_rows(&prs, "me", parse_iso("2026-08-10T12:00:00Z").unwrap());
-        assert_eq!(select_auto(&rows), Some(vec![9, 8]));
+        assert_eq!(select_auto(&rows, ""), Some(vec![9, 8]));
     }
 
     #[test]
