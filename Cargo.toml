@@ -19,6 +19,10 @@ path = "src/bin/autoreview.rs"
 name = "review-prs"
 path = "src/bin/review-prs.rs"
 
+[[bin]]
+name = "panel"
+path = "src/bin/panel.rs"
+
 [dependencies]
 anyhow = "1"
 comfy-table = { version = "8.0.0", features = ["custom_styling"] }
