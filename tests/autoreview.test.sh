@@ -416,6 +416,90 @@ assert_equals "...and an approved PR is not re-reviewed by a stale sweep" \
 
 default_prs
 
+# --- A refresh that fails does not end the run ----------------------------
+# The loop is meant to outlive a transient API error. Concluding "nothing left
+# to babysit" from one bad call would stop the run and report it as finished --
+# and a cron wrapper would read that as success. Costs one interval, because
+# the first refresh only happens after one.
+default_prs
+reset_spawn_log
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && FAKE_GH_APPROVED="9" FAKE_GH_GRAPHQL_FAIL_AFTER=1 "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --babysit=1 >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+waited=0
+while [[ "$waited" -lt 1200 ]]; do
+  # "looking again" is printed after the warning, so waiting on it means the
+  # kill below cannot land between the two and fail the second assertion.
+  grep -q "looking again" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+pkill -P "$bg" >/dev/null 2>&1 || true
+kill "$bg" >/dev/null 2>&1 || true
+wait "$bg" 2>/dev/null || true
+
+out="$(cat "$SANDBOX/out/bg")"
+assert_contains "a failed refresh is announced" "$out" "could not refresh the PR list"
+assert_contains "...and the run says it will look again" "$out" "looking again in 1m"
+assert_not_contains "...rather than reporting the run finished" \
+  "$out" "nothing left to babysit"
+
+# --- A quiet PR does not keep the process alive for ever ------------------
+# Before the queue went live, the cap ended a run because every open PR was
+# re-reviewed each interval. Now an untouched PR is not reviewed at all, so
+# something else has to bound the wait -- or a cron-started run never exits and
+# the next one piles on top of it.
+#
+# Costs two intervals, not one: #8 is still actionable when the fixture is
+# emptied, so the run sleeps, reviews it in pass 2, takes the uncounted check
+# that follows a pass, and only then waits the one idle interval that counts.
+default_prs
+reset_spawn_log
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && FAKE_GH_APPROVED="9" "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --babysit=1 --max-idle=1 \
+    >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+# Once the first pass has settled, make the repo quiet: nothing actionable.
+waited=0
+while [[ "$waited" -lt 600 ]]; do
+  grep -q "next check in" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
+# Budget for both intervals, both passes, and a loaded CI runner: this waits
+# for the run to end on its own, so expiring early would read as a kill and
+# fail the exit-status assertion for the wrong reason.
+waited=0
+while [[ "$waited" -lt 4000 ]]; do
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+wait "$bg" 2>/dev/null
+status=$?
+
+out="$(cat "$SANDBOX/out/bg")"
+assert_contains "a run with nothing to do stops itself" \
+  "$out" "nothing has changed in 1 idle check since the last review"
+assert_contains "...and says what it is leaving open" "$out" "1 PR still open"
+assert_equals "...exiting cleanly, because nothing failed" "$status" "0"
+default_prs
+
+# --- A failed final refresh is reported, not hidden ------------------------
+# The answer does not depend on the refresh here -- everything was approved --
+# but a log that shows a clean end and no failed look would hide that a PR
+# opened during the last pass was never looked for.
+reset_spawn_log
+out="$(FAKE_GH_APPROVED="9 8" FAKE_GH_GRAPHQL_FAIL_AFTER=1 run_autoreview --auto --babysit=1)"
+assert_equals "an all-approved run still exits 0" "$(last_status)" "0"
+assert_contains "...and ends" "$out" "nothing left to babysit"
+assert_contains "...while admitting the last look failed" "$out" "could not refresh the PR list"
+
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
 out="$(run_autoreview --auto)"

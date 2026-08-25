@@ -100,11 +100,12 @@ setup_sandbox() {
   unset HERDR_ENV TERM_PROGRAM REVIEW_PRS_CMD REVIEW_PRS_AUTO_CMD || true
   unset AUTOREVIEW_CMD AUTOREVIEW_AUTO_CMD AUTOREVIEW_JOBS AUTOREVIEW_TIMEOUT \
         AUTOREVIEW_MAX_BUDGET_USD AUTOREVIEW_LOG_DIR \
-        AUTOREVIEW_BABYSIT_INTERVAL || true
+        AUTOREVIEW_BABYSIT_INTERVAL AUTOREVIEW_MAX_PASSES \
+        AUTOREVIEW_MAX_IDLE || true
   unset FAKE_CLAUDE_FAIL FAKE_CLAUDE_IS_ERROR FAKE_CLAUDE_SLEEP \
         FAKE_CLAUDE_GARBAGE FAKE_CLAUDE_KILL_JOB FAKE_CLAUDE_TRAILER \
         FAKE_GH_APPROVED FAKE_GH_CLOSED FAKE_GH_MY_REVIEW \
-        FAKE_GH_VIEW_FAIL || true
+        FAKE_GH_VIEW_FAIL FAKE_GH_GRAPHQL_FAIL_AFTER || true
   # The host may have a real dash-p and an inherited override for it; the
   # sandbox must only ever see its fake on PATH.
   unset DASHP_BIN || true
@@ -119,6 +120,11 @@ teardown_sandbox() {
 }
 
 reset_spawn_log() {
+  # A fake dash-p killed between mkdir and rmdir leaves its lock directory
+  # behind, and every later log_line in this sandbox would then wait out the
+  # full timeout before writing. The babysit tests kill runs by design.
+  rmdir "$CLAUDE_LOG.lock" "$CLAUDE_LOG.events.lock" 2>/dev/null || true
+  rm -f "$SANDBOX/out/graphql-calls"
   : >"$SPAWN_LOG"
   : >"$SPAWN_LOG.labels"
   : >"$SANDBOX/out/header"
@@ -185,6 +191,17 @@ case "$sub" in
         printf '%s\n' "${FAKE_GH_LOGIN:-me}"
         ;;
       graphql)
+        # $FAKE_GH_GRAPHQL_FAIL_AFTER=N lets the first N calls through and
+        # fails the rest: the initial selection succeeds and the babysit
+        # refresh does not, which is the shape a transient API error has.
+        calls="$SANDBOX/out/graphql-calls"
+        seen="$(cat "$calls" 2>/dev/null || printf '0')"
+        seen=$((seen + 1))
+        printf '%s' "$seen" >"$calls"
+        if [[ -n "${FAKE_GH_GRAPHQL_FAIL_AFTER:-}" && "$seen" -gt "$FAKE_GH_GRAPHQL_FAIL_AFTER" ]]; then
+          echo "fake gh: the PR list is unavailable" >&2
+          exit 1
+        fi
         if [[ -n "$jq_filter" ]]; then
           jq -r "$jq_filter" "$SANDBOX/fixtures/prs.json"
         else
@@ -322,14 +339,20 @@ write_fake_dashp() {
 # -- intermittently, which is the worst way to fail. mkdir is atomic on every
 # filesystem that matters, so it is the lock.
 log_line() {
-  local file="$1" line="$2" waited=0
-  while ! mkdir "$file.lock" 2>/dev/null; do
+  local file="$1" line="$2" waited=0 held=0
+  while [[ "$waited" -le 500 ]]; do
+    if mkdir "$file.lock" 2>/dev/null; then
+      held=1
+      break
+    fi
     sleep 0.01
     waited=$((waited + 1))
-    [[ "$waited" -gt 500 ]] && break
   done
   printf '%s\n' "$line" >>"$file"
-  rmdir "$file.lock" 2>/dev/null || true
+  # Only if this process took it: on the timeout path the lock belongs to
+  # someone else, and removing it would hand the log to two writers at once.
+  [[ "$held" -eq 1 ]] && rmdir "$file.lock" 2>/dev/null
+  return 0
 }
 # Stands in for dash-p, which drives claude for the built-in reviewer: records
 # the call, writes the meta envelope, and reports failures the way the real

@@ -27,6 +27,10 @@ PRs (nothing has changed since you last engaged) are left alone.
                       from scratch. Marked RESUMABLE in the picker.
   --jobs N, -j N      Reviews to run at once (default 2, or $AUTOREVIEW_JOBS).
                       Keep it low: a panel review is itself several agents.
+  --max-idle N        How many checks in a row may find nothing to do before
+                      --babysit stops (default 3, or $AUTOREVIEW_MAX_IDLE).
+                      A PR nobody is touching should not keep a process alive
+                      forever, least of all one started by cron.
   --max-passes N      How often --babysit may review one PR before leaving it
                       alone (default 3, or $AUTOREVIEW_MAX_PASSES). Every
                       review is activity on the PR, so an author who answers
@@ -82,6 +86,8 @@ pub struct Config {
     pub jobs: u32,
     /// How often --babysit may review one PR before leaving it alone.
     pub max_passes: u32,
+    /// How many consecutive checks may find nothing to do before the run ends.
+    pub max_idle: u32,
     pub timeout_secs: u64,
     pub budget: Option<String>,
     pub log_dir: Option<PathBuf>,
@@ -195,6 +201,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     let mut jobs_raw = env_nonempty(env, "AUTOREVIEW_JOBS").unwrap_or_else(|| "2".into());
     let mut max_passes_raw =
         env_nonempty(env, "AUTOREVIEW_MAX_PASSES").unwrap_or_else(|| "3".into());
+    let mut max_idle_raw = env_nonempty(env, "AUTOREVIEW_MAX_IDLE").unwrap_or_else(|| "3".into());
     let mut timeout_raw = env_nonempty(env, "AUTOREVIEW_TIMEOUT").unwrap_or_else(|| "3600".into());
     let mut budget_raw = env_nonempty(env, "AUTOREVIEW_MAX_BUDGET_USD");
     let mut log_dir_raw = env_nonempty(env, "AUTOREVIEW_LOG_DIR");
@@ -219,6 +226,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--help" | "-h" => return Ok(Parsed::Help),
             "--jobs" | "-j" => jobs_raw = require_value("--jobs", it.next())?,
             "--max-passes" => max_passes_raw = require_value("--max-passes", it.next())?,
+            "--max-idle" => max_idle_raw = require_value("--max-idle", it.next())?,
             "--timeout" => timeout_raw = require_value("--timeout", it.next())?,
             "--budget" => budget_raw = Some(require_value("--budget", it.next())?),
             "--log-dir" => log_dir_raw = Some(require_value("--log-dir", it.next())?),
@@ -230,6 +238,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
                     other.strip_prefix("--jobs=").or_else(|| other.strip_prefix("-j="))
                 {
                     jobs_raw = require_value("--jobs", Some(v.to_string()))?;
+                } else if let Some(v) = other.strip_prefix("--max-idle=") {
+                    max_idle_raw = require_value("--max-idle", Some(v.to_string()))?;
                 } else if let Some(v) = other.strip_prefix("--max-passes=") {
                     max_passes_raw = require_value("--max-passes", Some(v.to_string()))?;
                 } else if let Some(v) = other.strip_prefix("--timeout=") {
@@ -250,6 +260,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
 
     let jobs = require_int("--jobs", &jobs_raw, 1, 1024)? as u32;
     let max_passes = require_int("--max-passes", &max_passes_raw, 1, 1000)? as u32;
+    let max_idle = require_int("--max-idle", &max_idle_raw, 1, 100_000)? as u32;
     // The cap matches what dash-p is handed when the timeout is disabled, and
     // keeps the deadline arithmetic far from overflow. Nobody waits 31 years.
     let timeout_secs = require_int("--timeout", &timeout_raw, 0, 999_999_999)?;
@@ -307,6 +318,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         continue_sessions,
         jobs,
         max_passes,
+        max_idle,
         timeout_secs,
         budget: budget_raw,
         log_dir: log_dir_raw.map(PathBuf::from),
@@ -357,6 +369,8 @@ mod tests {
         let c = cfg(&[]);
         assert!(!c.pick && c.babysit.is_none() && !c.continue_sessions);
         assert_eq!(c.jobs, 2);
+        assert_eq!(c.max_passes, 3);
+        assert_eq!(c.max_idle, 3);
         assert_eq!(c.timeout_secs, 3600);
         assert!(c.budget.is_none() && c.log_dir.is_none());
     }
