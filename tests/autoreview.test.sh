@@ -363,6 +363,59 @@ assert_not_contains "a pass after a failed review does not re-check it" \
   "$(claude_calls)" "/recheck-pr 9"
 assert_not_contains "...and resumes nothing" "$(claude_calls)" "--resume $sid9"
 
+# --- New work joins the queue mid-run -------------------------------------
+# The queue used to be fixed when the run started, so a PR opened a minute
+# later waited for a whole new invocation of autoreview. Costs a minute of wall
+# clock, like the pass test above: one interval has to actually elapse.
+default_prs
+reset_spawn_log
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && FAKE_GH_APPROVED="9" "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --babysit=1 >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+
+# Wait for the first pass to settle into its interval, then open a PR.
+waited=0
+while [[ "$waited" -lt 600 ]]; do
+  grep -q "next check in" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+jq '.data.repository.pullRequests.nodes += [{
+      "number":12,"title":"Opened mid-run","isDraft":false,
+      "updatedAt":"2026-08-11T10:00:00Z","reviewDecision":null,
+      "author":{"login":"frank"},
+      "comments":{"nodes":[]},"reviews":{"nodes":[]},
+      "commits":{"nodes":[{"commit":{"committedDate":"2026-08-11T10:00:00Z","author":{"user":{"login":"frank"}}}}]}
+    }]' "$SANDBOX/fixtures/prs.json" >"$SANDBOX/fixtures/prs.next"
+mv "$SANDBOX/fixtures/prs.next" "$SANDBOX/fixtures/prs.json"
+
+waited=0
+while [[ "$waited" -lt 1800 ]]; do
+  grep -q -- "/auto-review 12" "$CLAUDE_LOG" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+pkill -P "$bg" >/dev/null 2>&1 || true
+kill "$bg" >/dev/null 2>&1 || true
+wait "$bg" 2>/dev/null || true
+
+out="$(cat "$SANDBOX/out/bg")"
+assert_contains "a PR opened mid-run joins the queue" "$out" "joined the queue: #12"
+assert_contains "...and is reviewed without restarting the run" \
+  "$(claude_calls)" "/auto-review 12"
+assert_contains "...while an approved PR still leaves" "$out" "PR #9 is approved"
+# The sweep still lists #9 as NEW -- the fake gh's GraphQL fixture does not know
+# about the approval -- so this is the guard against a stale list putting a
+# finished PR straight back into the queue that just dropped it.
+reviews_of_nine="$(claude_calls | grep -c -- "/auto-review 9" || true)"
+assert_equals "...and an approved PR is not re-reviewed by a stale sweep" \
+  "$reviews_of_nine" "1"
+
+default_prs
+
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
 out="$(run_autoreview --auto)"

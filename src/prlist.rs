@@ -143,9 +143,9 @@ pub struct Row {
     pub resumable: bool,
 }
 
-/// Fetch, filter, and say why when nothing is left. Returns None (after
-/// printing) when there is nothing to review -- the caller exits 0.
-pub fn fetch_prs(ctx: &RepoContext, include_approved: bool, include_dependabot: bool) -> Result<Option<Vec<PrNode>>> {
+/// Fetch and filter, saying nothing. What a refresh wants: a babysit loop
+/// that explained "no matching open PRs" on every interval would be noise.
+pub fn fetch(ctx: &RepoContext, include_approved: bool, include_dependabot: bool) -> Result<Vec<PrNode>> {
     let out = Command::new("gh")
         .args(["api", "graphql", "-F"])
         .arg(format!("owner={}", ctx.owner))
@@ -172,6 +172,17 @@ pub fn fetch_prs(ctx: &RepoContext, include_approved: bool, include_dependabot: 
         .filter(|pr| include_approved || pr.review_decision.as_deref() != Some("APPROVED"))
         .collect();
 
+    Ok(prs)
+}
+
+/// The same fetch, but it says why when nothing is left. Returns None (after
+/// printing) when there is nothing to review -- the caller exits 0.
+pub fn fetch_prs(
+    ctx: &RepoContext,
+    include_approved: bool,
+    include_dependabot: bool,
+) -> Result<Option<Vec<PrNode>>> {
+    let prs = fetch(ctx, include_approved, include_dependabot)?;
     if prs.is_empty() {
         let mut hint = String::new();
         if !include_approved {

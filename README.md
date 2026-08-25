@@ -218,7 +218,7 @@ autoreview                  # review every NEW/UPDATED PR
 autoreview --jobs 3         # ...three at a time (default 2)
 autoreview --pick           # picker, then review each selection headlessly
 autoreview --continue       # resume earlier sessions for a second look
-autoreview --babysit=15     # re-run every 15 min until every PR is approved
+autoreview --babysit=15     # re-run every 15 min, picking up new PRs as they open
 autoreview --help           # usage
 ```
 
@@ -229,8 +229,8 @@ and `--pick` is for the times you want a subset. `--auto` / `-A` still parse —
 an old alias or cron line keeps working — they just name the default now.
 
 It takes the same selection flags as `review-prs` (`--continue`, `--all`,
-`--dependabot`, `--babysit`) plus five of its own: `--pick`, `--jobs`,
-`--timeout`, `--budget` and `--log-dir`.
+`--dependabot`, `--babysit`) plus six of its own: `--pick`, `--jobs`,
+`--timeout`, `--budget`, `--log-dir` and `--max-passes`.
 
 On a terminal the pass is a live board -- finished reviews settle into
 permanent result lines, running ones spin, and a progress bar tracks the
@@ -359,12 +359,41 @@ run an in-session `/loop`, and a headless process needs neither.
 
 ### Babysit, headless
 
-`--babysit` re-runs the whole pass on an interval, dropping PRs as they become
-`APPROVED` and resuming the rest, until nothing is left. Approval is read back
-from GitHub rather than inferred from what the agent said — the review either
-landed as an approval or it did not. A PR that is closed, or merged without an
-approving review, is dropped too; waiting for an approval that is never coming
-would re-review it on every interval forever.
+`--babysit` re-runs the pass on an interval until there is nothing left to do.
+Each interval the queue is **rebuilt**, not just shrunk:
+
+- **PRs leave** when `gh pr view` says they are approved or closed. Approval is
+  read back from GitHub rather than inferred from what the agent said — the
+  review either landed or it did not. A PR merged without an approving review
+  leaves too; waiting for an approval that is never coming would re-review it
+  every interval forever.
+- **PRs join** when the sweep now ranks them actionable — a PR opened while the
+  last pass was running, or one the author has just pushed to. Before this, the
+  queue was fixed when the run started and a PR opened a minute later waited
+  for a whole new invocation.
+
+The two directions come from different sources on purpose. Leaving is decided
+per PR by `gh pr view`, which is authoritative. Joining is decided by the sweep,
+which is a snapshot and can lag by a poll — so a PR that has left is finished
+for the run, and a stale list cannot put it back into the queue that just
+dropped it.
+
+Nothing new is needed to decide "should I look again": a review autoreview
+posts becomes *your* latest activity on that PR, so an author pushing a fix
+afterwards flips it back to `UPDATED` on its own. The sweep filter already
+means "actionable now".
+
+### The re-review cap
+
+Every review is activity on the PR, so an author who answers one makes it
+actionable again — which would make autoreview review it again, unattended, for
+as long as the loop runs. `--max-passes` (default 3, or
+`$AUTOREVIEW_MAX_PASSES`) is the ceiling: after that many passes on one PR in
+one run, it says so and leaves it alone.
+
+A transient API error does not end the loop and does not silently narrow it
+either: the refresh keeps the current queue and tries again next interval,
+giving up only after three consecutive failures.
 
 The loop is the autoreview process itself, not an in-session `/loop` inside a
 tab, so an interval that never converges is one process you can see and kill.
