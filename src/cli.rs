@@ -9,11 +9,15 @@ use std::path::PathBuf;
 
 pub const HELP: &str = r#"autoreview: review open PRs headlessly, with progress and a real exit status.
 
-Usage: autoreview [--auto] [--babysit[=MINUTES]] [--continue] [--jobs N]
+Usage: autoreview [--pick] [--babysit[=MINUTES]] [--continue] [--jobs N]
                   [--timeout SECONDS] [--budget USD] [--log-dir DIR]
                   [--all] [--dependabot] [--help]
 
-  --auto, -A          Skip the picker; review every NEW/UPDATED PR.
+Every NEW or UPDATED PR is reviewed by default -- the actionable ones. SEEN
+PRs (nothing has changed since you last engaged) are left alone.
+
+  --pick, -p          Choose from a list instead of reviewing every one.
+  --auto, -A          Accepted and ignored: it is the default now.
   --babysit[=MIN], -b Re-run the pass every MIN minutes (default 30, or
                       $AUTOREVIEW_BABYSIT_INTERVAL), dropping PRs as they are
                       approved or closed, until none are left. A bare number is
@@ -34,7 +38,7 @@ Usage: autoreview [--auto] [--babysit[=MINUTES]] [--continue] [--jobs N]
 
 Each PR is reviewed by a dash-p subprocess driving claude headlessly:
   dash-p --output-format json --meta-file ... --timeout ... \
-    --dangerously-skip-permissions --session-id UUID -- "/panel-review N"
+    --dangerously-skip-permissions --session-id UUID -- "/auto-review N"
 where UUID is derived from the repo directory plus owner/name#N, so the same PR
 in this checkout always maps to the same session -- and `claude --resume UUID`
 reopens it interactively later. Set $DASHP_BIN to point at a different dash-p.
@@ -44,11 +48,11 @@ GitHub (approved / commented / changes requested), and the reviewer is asked
 to report its synthesized risk, finding counts, and each panelist's model,
 which are shown alongside the model, time and cost dash-p accounts for.
 
-Override the reviewer via $AUTOREVIEW_CMD, or $AUTOREVIEW_AUTO_CMD for
---auto/--babysit runs (the PR number replaces the first "{}", or is appended if
-absent):
-  AUTOREVIEW_CMD='my-review'                           (append form)
-  AUTOREVIEW_CMD='gh pr checkout {} && my-review {}'   (placeholder form)
+Override the reviewer via $AUTOREVIEW_AUTO_CMD for unattended runs (the default,
+and --babysit), or $AUTOREVIEW_CMD for --pick runs (the PR number replaces the
+first "{}", or is appended if absent):
+  AUTOREVIEW_AUTO_CMD='my-review'                          (append form)
+  AUTOREVIEW_AUTO_CMD='gh pr checkout {} && my-review {}'   (placeholder form)
 An overridden command owns its own session handling; it receives the id as
 $REVIEW_PRS_SESSION_ID and a 0/1 $REVIEW_PRS_SESSION_RESUME.
 
@@ -62,7 +66,9 @@ Your own PRs are always hidden -- this tool is for reviewing others' work.
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub auto: bool,
+    /// Show the picker instead of sweeping every NEW/UPDATED PR. The sweep is
+    /// the default; picking is what marks a run as attended.
+    pub pick: bool,
     pub babysit: Option<Interval>,
     pub continue_sessions: bool,
     pub jobs: u32,
@@ -80,9 +86,11 @@ pub struct Config {
 }
 
 impl Config {
-    /// Unattended runs pick the auto prompt and the auto override.
+    /// Unattended runs take the auto prompt and the auto override. Reaching
+    /// for the picker is the one thing that proves somebody is watching --
+    /// and a babysit loop outlives that person either way.
     pub fn unattended(&self) -> bool {
-        self.auto || self.babysit.is_some()
+        !self.pick || self.babysit.is_some()
     }
 }
 
@@ -143,7 +151,7 @@ fn require_value(flag: &str, value: Option<String>) -> Result<String, CliError> 
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Parsed, CliError> {
-    let mut auto = false;
+    let mut pick = false;
     let mut babysit = false;
     let mut continue_sessions = false;
     let mut include_approved = false;
@@ -162,7 +170,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--auto" | "-A" => auto = true,
+            "--pick" | "-p" => pick = true,
+            // The sweep used to be opt-in. Both spellings stay accepted so
+            // an old alias or cron line keeps working; they now say what the
+            // tool already does.
+            "--auto" | "-A" => {}
             "--babysit" | "-b" => babysit = true,
             "--continue" | "-C" => continue_sessions = true,
             "--all" | "-a" => include_approved = true,
@@ -235,14 +247,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     // would be the expensive kind of surprise, so say which one is running.
     let cmd = env_nonempty(env, "AUTOREVIEW_CMD");
     let auto_cmd = env_nonempty(env, "AUTOREVIEW_AUTO_CMD");
-    let unattended = auto || babysit;
+    let unattended = !pick || babysit;
     let mut startup_notes = Vec::new();
     let review_cmd = if unattended {
         if cmd.is_some() && auto_cmd.is_none() {
-            let mode = if auto { "--auto" } else { "--babysit" };
-            startup_notes.push(format!(
-                "note: $AUTOREVIEW_CMD is set but $AUTOREVIEW_AUTO_CMD is not; {mode} runs the built-in reviewer"
-            ));
+            startup_notes.push(
+                "note: $AUTOREVIEW_CMD is set but $AUTOREVIEW_AUTO_CMD is not; this unattended run uses the built-in reviewer".to_string()
+            );
         }
         auto_cmd
     } else {
@@ -250,7 +261,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     };
 
     Ok(Parsed::Run(Box::new(Config {
-        auto,
+        pick,
         babysit: babysit_interval,
         continue_sessions,
         jobs,
@@ -302,10 +313,27 @@ mod tests {
     #[test]
     fn defaults() {
         let c = cfg(&[]);
-        assert!(!c.auto && c.babysit.is_none() && !c.continue_sessions);
+        assert!(!c.pick && c.babysit.is_none() && !c.continue_sessions);
         assert_eq!(c.jobs, 2);
         assert_eq!(c.timeout_secs, 3600);
         assert!(c.budget.is_none() && c.log_dir.is_none());
+    }
+
+    #[test]
+    fn sweeping_is_the_default_and_picking_is_the_flag() {
+        assert!(!cfg(&[]).pick);
+        assert!(cfg(&[]).unattended());
+        for spelling in [["--pick"], ["-p"]] {
+            let c = cfg(&spelling);
+            assert!(c.pick, "{spelling:?} should show the picker");
+            assert!(!c.unattended(), "{spelling:?} is an attended run");
+        }
+        // The old opt-in spellings still parse; they just say the default.
+        for spelling in [["--auto"], ["-A"]] {
+            assert!(!cfg(&spelling).pick, "{spelling:?} should stay a sweep");
+        }
+        // A babysit loop outlives whoever started it, picker or not.
+        assert!(cfg(&["--pick", "--babysit"]).unattended());
     }
 
     #[test]
@@ -407,15 +435,15 @@ mod tests {
             Ok(Parsed::Run(c)) => c,
             _ => panic!(),
         };
-        let c = get(&["--auto"], &[("AUTOREVIEW_CMD", "my-review")]);
+        let c = get(&[], &[("AUTOREVIEW_CMD", "my-review")]);
         assert_eq!(c.review_cmd, None);
-        assert!(c.startup_notes[0].contains("--auto runs the built-in reviewer"));
+        assert!(c.startup_notes[0].contains("this unattended run uses the built-in reviewer"));
 
-        let c = get(&["--auto"], &[("AUTOREVIEW_AUTO_CMD", "auto-r")]);
+        let c = get(&[], &[("AUTOREVIEW_AUTO_CMD", "auto-r")]);
         assert_eq!(c.review_cmd.as_deref(), Some("auto-r"));
         assert!(c.startup_notes.is_empty());
 
-        let c = get(&[], &[("AUTOREVIEW_CMD", "my-review")]);
+        let c = get(&["--pick"], &[("AUTOREVIEW_CMD", "my-review")]);
         assert_eq!(c.review_cmd.as_deref(), Some("my-review"));
         assert!(c.startup_notes.is_empty());
     }

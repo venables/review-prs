@@ -57,18 +57,18 @@ fn select_prs(cfg: &Config, ctx: &RepoContext) -> anyhow::Result<Option<Selectio
         .unwrap_or(0);
     let mut rows = prlist::build_rows(&prs, &ctx.me, now);
     let titles = rows.iter().map(|r| (r.number, r.title.clone())).collect();
-    let numbers = if cfg.auto {
-        prlist::select_auto(&rows)
-    } else {
+    let numbers = if cfg.pick {
         mark_resumable(&mut rows, ctx);
         picker::run(&rows, cfg.continue_sessions, cfg.include_dependabot)?
+    } else {
+        prlist::select_auto(&rows)
     };
     Ok(numbers.map(|n| (n, titles)))
 }
 
 fn run(cfg: &Config) -> anyhow::Result<i32> {
-    // gum is required by the picker alone, so an --auto sweep runs on a box
-    // that has never seen it. pgrep is not optional: refusing to resume a
+    // gum is required by the picker alone, so a sweep runs on a box that has
+    // never seen it. pgrep is not optional: refusing to resume a
     // session another process holds is a safety check, not a nicety.
     repo::require_deps(&["gh", "pgrep"])?;
     let dashp = repo::dashp_bin();

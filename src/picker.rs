@@ -1,5 +1,5 @@
 //! The interactive picker, still driven through `gum choose` -- same UX as
-//! review-prs, and gum is required only here, so an --auto sweep runs on a
+//! review-prs, and gum is required only here, so the default sweep runs on a
 //! box that has never seen it. The row alignment and the dimming are native
 //! now (no `column`, no `gum style` subprocess).
 

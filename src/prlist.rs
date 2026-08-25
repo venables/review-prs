@@ -325,8 +325,8 @@ pub fn build_rows(prs: &[PrNode], me: &str, now_epoch: i64) -> Vec<Row> {
     rows
 }
 
-/// The auto sweep: every NEW/UPDATED PR. SEEN PRs are skipped on purpose --
-/// nothing has changed since you last engaged, so an automated sweep has no
+/// The default sweep: every NEW/UPDATED PR. SEEN PRs are skipped on purpose --
+/// nothing has changed since you last engaged, so an unattended sweep has no
 /// reason to re-review them. Prints the selection; None (after printing)
 /// means nothing to do and the caller exits 0.
 pub fn select_auto(rows: &[Row]) -> Option<Vec<u64>> {
@@ -336,7 +336,7 @@ pub fn select_auto(rows: &[Row]) -> Option<Vec<u64>> {
         .map(|r| r.number)
         .collect();
     if numbers.is_empty() {
-        println!("no NEW or UPDATED PRs to auto-review");
+        println!("no NEW or UPDATED PRs to review; pass --pick to choose from every open PR");
         return None;
     }
     let list: String = numbers.iter().map(|n| format!("#{n} ")).collect();

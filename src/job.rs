@@ -263,9 +263,9 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
 
-    fn cfg_with(timeout: u64, budget: Option<&str>, auto: bool) -> Config {
+    fn cfg_with(timeout: u64, budget: Option<&str>, pick: bool) -> Config {
         Config {
-            auto,
+            pick,
             babysit: None,
             continue_sessions: false,
             jobs: 2,
@@ -290,10 +290,10 @@ mod tests {
     #[test]
     fn prompts_follow_the_mode() {
         let mut job = Job::new(9);
-        assert_eq!(job.prompt(&cfg_with(0, None, false)), "/panel-review 9");
-        assert_eq!(job.prompt(&cfg_with(0, None, true)), "/auto-review 9");
+        assert_eq!(job.prompt(&cfg_with(0, None, true)), "/panel-review 9");
+        assert_eq!(job.prompt(&cfg_with(0, None, false)), "/auto-review 9");
         job.resume = true;
-        assert_eq!(job.prompt(&cfg_with(0, None, true)), "/recheck-pr 9");
+        assert_eq!(job.prompt(&cfg_with(0, None, false)), "/recheck-pr 9");
     }
 
     #[test]
@@ -301,7 +301,7 @@ mod tests {
         let rd = rundir();
         let mut job = Job::new(9);
         job.flag = SessionFlag::Pin("7442b624-5cba-5d44-ae67-9c390cfe70a1".into());
-        let argv = dashp_args(&job, &cfg_with(3600, Some("2.50"), true), &rd);
+        let argv = dashp_args(&job, &cfg_with(3600, Some("2.50"), false), &rd);
         let joined = argv.join(" ");
         assert!(joined.contains("--output-format json"));
         assert!(joined.contains("--meta-file"));

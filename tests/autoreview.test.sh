@@ -10,12 +10,17 @@ setup_sandbox
 trap teardown_sandbox EXIT
 
 # --- Which PRs get reviewed, and with what prompt -------------------------
-out="$(run_autoreview --auto)"
+# No flag at all: the sweep is the default, the picker is opt-in.
+out="$(run_autoreview)"
 assert_contains "NEW PRs are reviewed" "$(claude_calls)" "/auto-review 9"
 assert_contains "UPDATED/CHANGES PRs are reviewed" "$(claude_calls)" "/auto-review 8"
 assert_not_contains "SEEN PRs are skipped" "$(claude_calls)" "/auto-review 6"
 assert_contains "a clean run reports each PR" "$out" "done    #9"
 assert_equals "a clean run exits 0" "$(last_status)" "0"
+
+# The old opt-in spelling still parses, so a cron line or alias keeps working.
+run_autoreview --auto >/dev/null
+assert_contains "--auto is still accepted" "$(claude_calls)" "/auto-review 9"
 
 assert_contains "reviews always get a meta envelope" \
   "$(claude_call_for '/auto-review 9')" "--meta-file"
@@ -26,9 +31,14 @@ assert_contains "reviews carry the timeout" \
 assert_contains "a first review pins --session-id" \
   "$(claude_call_for '/auto-review 9')" "--session-id"
 
-FAKE_GUM_PICK="#9" run_autoreview >/dev/null
-assert_contains "the picker path runs a panel review" \
+FAKE_GUM_PICK="#9" run_autoreview --pick >/dev/null
+assert_contains "--pick runs the picker, and a panel review on what it chose" \
   "$(claude_calls)" "/panel-review 9"
+assert_not_contains "...and reviews nothing else" "$(claude_calls)" "/panel-review 8"
+
+out="$(run_autoreview --pick)"
+assert_contains "--pick with an empty selection reviews nothing" \
+  "$out" "no PRs selected"
 
 # --- Session continuity ---------------------------------------------------
 run_autoreview --auto >/dev/null
@@ -172,8 +182,8 @@ assert_contains "an unattended run says when it falls back to the built-in revie
 assert_contains "...and the built-in reviewer is what actually ran" \
   "$(claude_calls)" "/auto-review 9"
 
-AUTOREVIEW_CMD='my-review' run_autoreview >/dev/null
-assert_equals "an attended run uses the override without complaint" \
+FAKE_GUM_PICK="#9" AUTOREVIEW_CMD='my-review' run_autoreview --pick >/dev/null
+assert_equals "an attended --pick run uses the override without complaint" \
   "$(claude_calls)" ""
 
 # --- The summary ----------------------------------------------------------
@@ -211,7 +221,7 @@ assert_not_contains "...nor the derived one" "$out" "$sid9"
 # report would show "approved" for an approval that never landed. The trailer
 # (the fenced block the system prompt asks the reviewer for) fills in what
 # GitHub cannot know: risk, finding counts, and each panelist's model.
-out="$(FAKE_GH_MY_REVIEW='9:APPROVED' FAKE_CLAUDE_TRAILER='8' run_autoreview --auto)"
+out="$(FAKE_GH_MY_REVIEW='9:APPROVED' FAKE_CLAUDE_TRAILER='8' run_autoreview)"
 assert_contains "the trailer request reaches the reviewer" \
   "$(claude_call_for '/auto-review 9')" "--append-system-prompt="
 assert_contains "an approval on GitHub is the verdict" "$out" "approved"
