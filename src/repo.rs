@@ -141,6 +141,19 @@ fn repo_root_from(out: &std::process::Output) -> std::result::Result<PathBuf, St
     Ok(PathBuf::from(root))
 }
 
+/// The repo root, without the GitHub context `load` also gathers. panel wants
+/// the directory and nothing else -- it never calls gh.
+pub fn git_root() -> Result<PathBuf> {
+    let toplevel = Command::new("git").args(["rev-parse", "--show-toplevel"]).output()?;
+    match repo_root_from(&toplevel) {
+        Ok(root) => Ok(root),
+        Err(msg) => {
+            eprintln!("{msg}");
+            bail!(AlreadyReported);
+        }
+    }
+}
+
 pub fn load() -> Result<RepoContext> {
     let repo_view = Command::new("gh")
         .args(["repo", "view", "--json", "owner,name"])
@@ -156,14 +169,7 @@ pub fn load() -> Result<RepoContext> {
 
     // gh can answer from $GH_REPO outside any checkout; an empty repo root
     // would hash into every session id and fail every spawn one PR at a time.
-    let toplevel = Command::new("git").args(["rev-parse", "--show-toplevel"]).output()?;
-    let repo_root = match repo_root_from(&toplevel) {
-        Ok(root) => root,
-        Err(msg) => {
-            eprintln!("{msg}");
-            bail!(AlreadyReported);
-        }
-    };
+    let repo_root = git_root()?;
 
     // gh can exit 0 and still hand back an empty login, which would silently
     // mislabel every PR's engagement -- so check both the status and the value.
