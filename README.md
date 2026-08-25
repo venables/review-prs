@@ -30,7 +30,7 @@ with a headless subprocess per PR.
 
 - [`gh`](https://cli.github.com) — authenticated (`gh auth login`)
 - [`gum`](https://github.com/charmbracelet/gum) — the interactive picker.
-  `autoreview --auto` never picks, so it does not need gum.
+  `autoreview` only picks under `--pick`, so a plain sweep does not need gum.
 - [`dash-p`](https://github.com/venabots/dash-p) — **`autoreview` only**: the
   built-in reviewer runs through it (`brew install venabots/tap/dash-p`; set
   `$DASHP_BIN` to point elsewhere). Not needed when `$AUTOREVIEW_CMD` replaces
@@ -218,16 +218,22 @@ of verdicts, findings, models and cost. It exits nonzero if any review
 failed.
 
 ```sh
-autoreview                  # picker, then review each selection headlessly
-autoreview --auto           # review every NEW/UPDATED PR
-autoreview --auto --jobs 3  # ...three at a time (default 2)
+autoreview                  # review every NEW/UPDATED PR
+autoreview --jobs 3         # ...three at a time (default 2)
+autoreview --pick           # picker, then review each selection headlessly
 autoreview --continue       # resume earlier sessions for a second look
 autoreview --babysit=15     # re-run every 15 min until every PR is approved
 autoreview --help           # usage
 ```
 
-It takes the same selection flags as `review-prs` (`--auto`, `--continue`,
-`--all`, `--dependabot`, `--babysit`) plus four of its own: `--jobs`,
+**Sweeping is the default here, and the picker is the flag.** `review-prs`
+opens a tab per PR, so choosing which tabs to open is the point; `autoreview`
+has no tabs to open, so the ordinary run is "review whatever is actionable"
+and `--pick` is for the times you want a subset. `--auto` / `-A` still parse —
+an old alias or cron line keeps working — they just name the default now.
+
+It takes the same selection flags as `review-prs` (`--continue`, `--all`,
+`--dependabot`, `--babysit`) plus five of its own: `--pick`, `--jobs`,
 `--timeout`, `--budget` and `--log-dir`.
 
 On a terminal the pass is a live board -- finished reviews settle into
@@ -235,41 +241,62 @@ permanent result lines, running ones spin, and a progress bar tracks the
 pass:
 
 ```
-auto-reviewing 2 PR(s): #9 #8
-reviewing 2 PR(s), 2 at a time · logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
+2 PRs to review: #9 #8
+reviewing 2 PRs · logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 
   ✓ #9 approved · risk LOW · 4m12s · $0.51  Add retry logic
   ⠹ #8 Fix flaky test · reviewing 1m47s
   ━━━━━━━━━━━━╸───────────  1/2 · 1 running
 ```
 
-and the summary is a pair of tables -- what each review concluded, and which
-models did the reviewing:
+The header only mentions concurrency when it actually holds reviews back: with
+five PRs and `--jobs 2` it reads `reviewing 5 PRs, 2 at a time`.
+
+The summary is a pair of tables -- what each review concluded, and which models
+did the reviewing. Every `#N` is an OSC 8 hyperlink to the PR, so a terminal
+that supports them (Ghostty, iTerm2, WezTerm, kitty, VS Code) opens it on
+cmd-click. Piped output, `$NO_COLOR` and `TERM=dumb` get plain text instead:
 
 ```
-╭────┬────────┬───────────┬──────┬──────────────┬───────┬───────┬────────────────╮
-│ PR ┆ RESULT ┆ VERDICT   ┆ RISK ┆ FINDINGS     ┆ TIME  ┆ COST  ┆ MODEL          │
-╞════╪════════╪═══════════╪══════╪══════════════╪═══════╪═══════╪════════════════╡
-│ #9 ┆ done   ┆ approved  ┆ LOW  ┆ 1 polish     ┆ 4m12s ┆ $0.51 ┆ claude-fable-5 │
-│ #8 ┆ done   ┆ commented ┆ MED  ┆ 2 should-fix ┆ 6m03s ┆ $0.88 ┆ claude-fable-5 │
-╰────┴────────┴───────────┴──────┴──────────────┴───────┴───────┴────────────────╯
-╭────┬──────────┬─────────────────┬────────┬──────────┬────────╮
-│ PR ┆ PANELIST ┆ MODEL           ┆ RESULT ┆ FINDINGS ┆ TOP    │
-╞════╪══════════╪═════════════════╪════════╪══════════╪════════╡
-│ #9 ┆ codex    ┆ gpt-5.5         ┆ ok     ┆ 1        ┆ LOW    │
-│ #9 ┆ claude   ┆ claude-opus-4.7 ┆ ok     ┆ 0        ┆ -      │
-│ #8 ┆ codex    ┆ gpt-5.5         ┆ ok     ┆ 3        ┆ MEDIUM │
-│ #8 ┆ claude   ┆ claude-opus-4.7 ┆ ok     ┆ 2        ┆ MEDIUM │
-╰────┴──────────┴─────────────────┴────────┴──────────┴────────╯
+╭────┬────────┬────────────────┬────────┬──────────────┬───────┬───────┬────────────────╮
+│ PR ┆ RESULT ┆ VERDICT        ┆ RISK   ┆ FINDINGS     ┆ TIME  ┆ COST  ┆ MODEL          │
+╞════╪════════╪════════════════╪════════╪══════════════╪═══════╪═══════╪════════════════╡
+│ #9 ┆ done   ┆ approved       ┆ LOW    ┆ 1 polish     ┆ 4m12s ┆ $0.51 ┆ claude-fable-5 │
+│ #8 ┆ done   ┆ commented      ┆ MEDIUM ┆ 2 should-fix ┆ 6m03s ┆ $0.88 ┆ claude-fable-5 │
+│ #7 ┆ done   ┆ nothing posted ┆ LOW    ┆ none         ┆ 2m10s ┆ $0.31 ┆ claude-fable-5 │
+╰────┴────────┴────────────────┴────────┴──────────────┴───────┴───────┴────────────────╯
+╭────┬─────────────────┬──────────┬──────────┬────────╮
+│ PR ┆ MODEL           ┆ STATUS   ┆ FINDINGS ┆ TOP    │
+╞════╪═════════════════╪══════════╪══════════╪════════╡
+│ #9 ┆ gpt-5.5         ┆ answered ┆ 1        ┆ LOW    │
+│ #9 ┆ claude-opus-4.7 ┆ answered ┆ 0        ┆ -      │
+│ #8 ┆ gpt-5.5         ┆ answered ┆ 3        ┆ MEDIUM │
+│ #8 ┆ claude-opus-4.7 ┆ failed   ┆ -        ┆ -      │
+╰────┴─────────────────┴──────────┴──────────┴────────╯
 reopen any review with: claude --resume <SESSION>
   #9  cc10f740-28c3-58c6-ae64-d9ff37df22a7
   #8  fa5ced7b-32dd-578b-a3b9-d4d23195dce1
 logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 ```
 
+Two columns worth reading carefully:
+
+- **RESULT** is the review process: `done`, `timed out`, `failed (exit 10)`.
+- **VERDICT** is what landed on the PR: `approved`, `commented`,
+  `changes requested`, or `nothing posted` when the review finished without
+  leaving a review behind. `nothing posted` is not a rejection; it means the
+  reviewer had nothing to submit, or that GitHub has no record of a submission.
+
+The panel table's **STATUS** answers only "did this panelist come back with a
+review", not "did it like the PR" — `answered`, `failed`, or `-` when the
+reviewer did not say. The panelist's CLI name is dropped: the model identifies
+the row, and a panelist that never reported one falls back to its name
+(`opencode`).
+
 Without a TTY -- cron, CI, piped output -- the board becomes one plain line
 per state change and the summary a plain aligned table with the same columns,
-plus one `panel #N:` line per PR with panel data.
+plus one `panel #N:` line per PR with panel data, which keeps both the CLI
+name and the model: `panel #9: codex (gpt-5.5) 1 finding, top LOW`.
 
 ### Verdicts and models
 
@@ -323,9 +350,13 @@ has no human to correct a prompt that failed to trigger the skill.
 
 | Run                                                  | Prompt            |
 | ---------------------------------------------------- | ----------------- |
-| First review                                         | `/panel-review N` |
-| `--auto` / `--babysit`                               | `/auto-review N`  |
+| The default sweep, and `--babysit`                   | `/auto-review N`  |
+| A first review under `--pick`                        | `/panel-review N` |
 | `--continue`, and every babysit pass after the first | `/recheck-pr N`   |
+
+Reaching for `--pick` is the one thing that proves somebody is watching, so it
+is what marks a run attended — and a `--babysit` loop outlives that person
+either way, so it stays unattended.
 
 There is no `pr-review-tab` here: that skill exists to close its own tab and to
 run an in-session `/loop`, and a headless process needs neither.
@@ -361,14 +392,14 @@ most intervals — without reading each other's results:
 
 ### Overrides
 
-`$AUTOREVIEW_CMD`, and `$AUTOREVIEW_AUTO_CMD` for `--auto`/`--babysit` runs,
-replace the built-in reviewer. Same substitution rules as `$REVIEW_PRS_CMD` —
-the PR number replaces the first `{}`, or is appended if there is no
-placeholder:
+`$AUTOREVIEW_AUTO_CMD` for unattended runs (the default sweep and `--babysit`),
+and `$AUTOREVIEW_CMD` for `--pick` runs, replace the built-in reviewer. Same
+substitution rules as `$REVIEW_PRS_CMD` — the PR number replaces the first `{}`,
+or is appended if there is no placeholder:
 
 ```sh
-AUTOREVIEW_CMD='my-review' autoreview --auto
-AUTOREVIEW_CMD='gh pr checkout {} && my-review {}' autoreview
+AUTOREVIEW_AUTO_CMD='my-review' autoreview
+AUTOREVIEW_CMD='gh pr checkout {} && my-review {}' autoreview --pick
 ```
 
 An override owns its own session handling and receives
