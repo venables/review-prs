@@ -13,8 +13,10 @@
 // you want to watch a review happen and steer it mid-flight.
 
 use autoreview::cli::Config;
+use autoreview::queue::Queue;
 use autoreview::rundir::RunDir;
-use autoreview::{cli, pool, prlist, repo, select, signals, ui};
+use autoreview::{cli, pool, prlist, queue, repo, select, signals, ui};
+use std::collections::HashMap;
 
 fn select_prs(cfg: &Config) -> select::Opts<'static> {
     select::Opts {
@@ -23,6 +25,52 @@ fn select_prs(cfg: &Config) -> select::Opts<'static> {
         pick: cfg.pick,
         continue_sessions: cfg.continue_sessions,
         sweep_empty_hint: "; pass --pick to choose from every open PR",
+    }
+}
+
+/// What the sweep would pick up right now, said quietly -- a babysit loop
+/// that re-announced the whole list on every interval would be noise. Also
+/// returns the titles, so a PR that joined mid-run has one on the board.
+fn actionable_now(
+    cfg: &Config,
+    ctx: &repo::RepoContext,
+) -> anyhow::Result<(Vec<u64>, HashMap<u64, String>)> {
+    let prs = prlist::fetch(ctx, cfg.include_approved, cfg.include_dependabot)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let rows = prlist::build_rows(&prs, &ctx.me, now);
+    let titles = rows.iter().map(|r| (r.number, r.title.clone())).collect();
+    let numbers = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.engage,
+                prlist::Engagement::New | prlist::Engagement::Updated
+            )
+        })
+        .map(|r| r.number)
+        .collect();
+    Ok((numbers, titles))
+}
+
+/// Say what changed since the last pass, so a queue that grew explains itself
+/// rather than a count quietly going up.
+fn report_intake(intake: &queue::Intake, cfg: &Config) {
+    if !intake.joined.is_empty() {
+        let list: Vec<String> = intake.joined.iter().map(|n| format!("#{n}")).collect();
+        println!(
+            "{} joined the queue: {}",
+            ui::count(intake.joined.len(), "new or updated PR"),
+            list.join(" ")
+        );
+    }
+    for pr in &intake.capped {
+        println!(
+            "PR #{pr} has had {} in this run; leaving it alone",
+            ui::count(cfg.max_passes as usize, "review")
+        );
     }
 }
 
@@ -54,12 +102,16 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // see and kill.
     let mut cfg = cfg.clone();
     let mut queue = numbers;
+    let mut titles = titles;
+    let mut tracker = Queue::new(cfg.max_passes);
+    let mut refresh_failures = 0u32;
     let mut pass = 1u32;
     let (failures, total) = loop {
         rundir.start_pass(pass)?;
         let jobs = pool::run_pass(&queue, &titles, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
         ui.print_summary(&jobs, &rundir.pass_dir);
         let failures = pool::failures(&jobs);
+        tracker.record_pass(&queue);
 
         let Some(babysit) = cfg.babysit.clone() else {
             break (failures, jobs.len());
@@ -69,19 +121,48 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         // said: the review either landed as an approval or it did not, and a
         // run that believed its own report would babysit a PR it never
         // actually approved.
-        let mut remaining = Vec::new();
+        let mut still_open = Vec::new();
         for &n in &queue {
             if let Some(why) = prlist::pr_babysit_done(n) {
                 println!("\nPR #{n} is {why}; dropping it from the babysit loop");
+                tracker.mark_done(n);
             } else {
-                remaining.push(n);
+                still_open.push(n);
             }
         }
-        if remaining.is_empty() {
+
+        // Then look for work that did not exist when the run started. A PR
+        // opened while the last pass ran would otherwise wait for a whole new
+        // invocation of autoreview.
+        let fresh = match actionable_now(&cfg, &ctx) {
+            Ok((numbers, fresh_titles)) => {
+                refresh_failures = 0;
+                titles.extend(fresh_titles);
+                numbers
+            }
+            Err(e) => {
+                // A transient API error must not end a loop that is meant to
+                // outlive one, and must not silently narrow it either: keep
+                // what is already queued and look again next interval.
+                refresh_failures += 1;
+                eprintln!(
+                    "\nwarning: could not refresh the PR list ({e:#}); keeping the current queue"
+                );
+                if refresh_failures >= 3 {
+                    eprintln!("error: the PR list has failed to refresh 3 times; stopping");
+                    break (failures, jobs.len());
+                }
+                Vec::new()
+            }
+        };
+
+        let intake = tracker.next(&still_open, &fresh);
+        report_intake(&intake, &cfg);
+        if intake.queue.is_empty() {
             println!("\nnothing left to babysit");
             break (failures, jobs.len());
         }
-        queue = remaining;
+        queue = intake.queue;
         // The first pass recorded each review's session; every later pass
         // resumes it whether or not --continue was passed. Re-reviewing from
         // scratch each interval would throw away the findings the author is

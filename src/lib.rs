@@ -14,6 +14,7 @@ pub mod job;
 pub mod picker;
 pub mod pool;
 pub mod prlist;
+pub mod queue;
 pub mod report;
 pub mod repo;
 pub mod rundir;

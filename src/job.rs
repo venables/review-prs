@@ -268,6 +268,7 @@ mod tests {
             babysit: None,
             continue_sessions: false,
             jobs: 2,
+            max_passes: 3,
             timeout_secs: timeout,
             budget: budget.map(String::from),
             log_dir: None,
