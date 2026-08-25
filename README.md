@@ -4,16 +4,18 @@ Pick open GitHub PRs from a multi-select list and fan each one out into its own
 terminal tab running a review command per PR. Built for batch-reviewing a repo's
 open pull requests without manually opening tabs and typing commands.
 
-Two binaries over one library, so they cannot disagree about which PRs are
+Three binaries over one library, so they cannot disagree about which PRs are
 worth reviewing or which session a PR belongs to:
 
-| Command                     | Runs each review in          | Use when                                                                |
-| --------------------------- | ---------------------------- | ----------------------------------------------------------------------- |
-| `review-prs`                | a terminal tab you can steer | you want to watch a review happen and interrupt it                      |
-| [`autoreview`](#autoreview) | a headless dash-p process    | there is no terminal (ssh, cron, CI), or a dozen PRs means a dozen tabs |
+| Command                     | Reviews                    | Use when                                                                |
+| --------------------------- | -------------------------- | ----------------------------------------------------------------------- |
+| `review-prs`                | a repo's PRs, one tab each | you want to watch a review happen and interrupt it                      |
+| [`autoreview`](#autoreview) | a repo's PRs, headlessly   | there is no terminal (ssh, cron, CI), or a dozen PRs means a dozen tabs |
+| [`panel`](#panel)           | one change, several models | you want independent second opinions on a single diff                   |
 
-Pairs nicely with the [`panel-review`](https://github.com/catena-labs/dev-skills)
-skill, which is the default review command both run.
+`review-prs` and `autoreview` review a repo's PRs; each PR's review is a
+[`panel-review`](https://github.com/catena-labs/dev-skills) by default.
+[`panel`](#panel) is that panel on its own, for one diff, without the skill.
 
 ## What it does
 
@@ -452,6 +454,69 @@ summary shows `-` for them under an overridden reviewer -- it owns its own
 sessions -- and the trailer is not read either. The verdict column still
 works: it is read back from GitHub, which does not care who reviewed.
 
+## panel
+
+`panel` reviews **one change with several models at once**. Every backend CLI
+on `PATH` (codex, claude, opencode) reviews the same diff in parallel through
+dash-p, blind to the others. Their reports print as they land. One more model
+call then reads all of them, verifies the questionable claims against the code,
+and writes the report.
+
+```sh
+panel                         # review what you have not committed yet
+panel --base main             # review what this branch added
+panel --panelist codex --panelist claude:opus-4.8
+panel --focus "the retry path"
+panel --no-synthesis          # the raw reports, no synthesis
+panel --help
+```
+
+### Why it is shaped this way
+
+The same review used to be an agent skill: a coordinator model read 656 lines
+of instructions and drove a 1094-line bash script that fanned the panelists
+out. That put a model in charge of work that needs no judgment at all —
+spawning processes, polling them, retrying a quota blip, collecting output —
+and made the fan-out only as reliable as the coordinator's willingness to
+follow instructions.
+
+So the mechanical half is a program and the judgment half is one model call:
+
+```
+panel  ─┬─ dash-p → codex     ─┐
+        ├─ dash-p → claude    ─┼─→ dash-p → claude (synthesis, read-only, in the repo)
+        └─ dash-p → opencode  ─┘
+```
+
+The synthesis runs **in the repository**, not on the text alone. Verifying a
+finding means reading the code it is about — a synthesizer handed only the
+panelists' prose can merge their claims but cannot check any of them.
+
+It is told two things a naive pipe would drop: which panelists failed, so their
+silence is not read as agreement, and how many answered, so "flagged by 2 of 3"
+means what it says.
+
+### Isolation
+
+A committed target (`--base`) gives each panelist its own throwaway git
+worktree pinned to the same commit, with write and exec: panelists run the test
+suite, grep for callers, and edit files to investigate, and nothing survives
+the run. One worktree each rather than one shared, because parallel reviewers
+racing on `target/` and `node_modules` produce flaky findings and leak edits
+into each other's reading.
+
+Uncommitted work has no ref to pin, so panelists read your actual working tree
+with `--perms read-only` and change nothing.
+
+Either way the worktrees are removed when the run ends — including on ctrl-C,
+which stops the panelists first.
+
+### What it does not do yet
+
+`--pr` (review a GitHub PR by number, with panelists fetching it themselves),
+review approaches (`/decompose`), and `$PANEL_REVIEW_PANELISTS`-style env
+configuration all still live in the skill. This is the common path only.
+
 ## Columns
 
 ```
@@ -534,8 +599,8 @@ bash tests/run.sh
 One crate, one library, two binaries:
 
 ```
-src/lib.rs         the shared core both binaries are built on
-src/bin/           the two entry points: review-prs, autoreview
+src/lib.rs         the shared core all three binaries are built on
+src/bin/           the three entry points: review-prs, autoreview, panel
 
 src/prlist.rs      the GraphQL query, engagement ranking, the sweep
 src/picker.rs      the gum picker
@@ -546,6 +611,8 @@ src/interval.rs    babysit-interval parsing
 src/cli.rs         autoreview's flags
 
 src/tabs/          review-prs: cli, per-tab command, terminal spawners
+src/panel/         panel: cli, target, worktrees, fan-out, synthesis
+prompts/           the panelist and synthesis prompts, compiled in
 src/pool.rs        autoreview: the event-driven job pool
 src/job.rs         autoreview: one review, spawned and classified
 src/report.rs      autoreview: verdict readback and the agent's trailer
