@@ -2,6 +2,7 @@
 # Session continuity: derived ids, --continue, and the prompts each mode seeds.
 
 set -euo pipefail
+# shellcheck source=helpers.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers.sh"
 
 echo "session-continuity"

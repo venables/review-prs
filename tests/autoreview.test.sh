@@ -3,6 +3,7 @@
 # timeouts, overrides and the babysit loop.
 
 set -euo pipefail
+# shellcheck source=helpers.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers.sh"
 
 echo "autoreview"

@@ -91,7 +91,8 @@ setup_sandbox() {
   # editor holding this file open, a grep, an agent reading this diff -- and
   # fail the test on a machine where nothing leaked. The sandbox name makes it
   # unique per run, and it exists nowhere on disk.
-  export FAKE_SLEEP_TAG="fake-claude-sleep-$(basename "$SANDBOX")"
+  FAKE_SLEEP_TAG="fake-claude-sleep-$(basename "$SANDBOX")"
+  export FAKE_SLEEP_TAG
 
   # Force the cmux spawner: it is the only one that is fully scriptable. Herdr
   # detection and the Ghostty AppleScript path are out of scope here.
