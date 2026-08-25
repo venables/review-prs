@@ -11,6 +11,7 @@
 pub mod cli;
 pub mod interval;
 pub mod job;
+pub mod panel;
 pub mod picker;
 pub mod pool;
 pub mod prlist;
