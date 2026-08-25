@@ -9,9 +9,9 @@
 set -euo pipefail
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REVIEW_PRS="$TESTS_DIR/../review-prs"
-# The rust binary; tests/run.sh builds it and exports the path, the default
-# covers running one test file by hand after a `cargo build`.
+# Both binaries; tests/run.sh builds them and exports the paths, the defaults
+# cover running one test file by hand after a `cargo build`.
+REVIEW_PRS="${REVIEW_PRS:-$TESTS_DIR/../target/debug/review-prs}"
 AUTOREVIEW="${AUTOREVIEW:-$TESTS_DIR/../target/debug/autoreview}"
 
 pass_count=0
