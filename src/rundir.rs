@@ -30,7 +30,10 @@ fn random_suffix(attempt: u32) -> String {
         .collect()
 }
 
-fn make_unique_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
+/// A directory nobody else holds, under `parent`. Shared with panel, which
+/// wants one for the same reason autoreview does: two runs against one
+/// --log-dir must not read each other's results.
+pub fn make_unique_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
     for attempt in 0..100 {
         let candidate = parent.join(format!("{prefix}{}", random_suffix(attempt)));
         match std::fs::create_dir(&candidate) {
