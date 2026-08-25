@@ -119,6 +119,31 @@ pub fn real_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// argv as strings, or the offending argument.
+///
+/// `std::env::args()` panics on an argument that is not valid UTF-8, and a
+/// typo deserves an error and exit 1 rather than a rust panic. Converting
+/// lossily instead would be worse than either: a mangled `--log-dir` value
+/// would name a *different* directory and the run would quietly use it.
+pub fn args_utf8<I: IntoIterator<Item = std::ffi::OsString>>(
+    argv: I,
+) -> Result<Vec<String>, std::ffi::OsString> {
+    argv.into_iter().map(|a| a.into_string()).collect()
+}
+
+/// This process's arguments, or a refusal on stderr and exit 1. Both binaries
+/// want exactly this, and one definition keeps the message from drifting into
+/// two.
+pub fn args_or_exit() -> Vec<String> {
+    match args_utf8(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(bad) => {
+            eprintln!("error: argument is not valid UTF-8: {}", bad.to_string_lossy());
+            std::process::exit(1);
+        }
+    }
+}
+
 fn env_nonempty(env: EnvFn, name: &str) -> Option<String> {
     env(name).filter(|v| !v.is_empty())
 }
@@ -396,6 +421,21 @@ mod tests {
     fn help_flag() {
         assert!(matches!(run(&["--help"]).ok().unwrap(), Parsed::Help));
         assert!(matches!(run(&["-h"]).ok().unwrap(), Parsed::Help));
+    }
+
+    #[test]
+    fn a_non_utf8_argument_is_refused_not_mangled() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let good = [OsString::from("--jobs"), OsString::from("3")];
+        assert_eq!(args_utf8(good).unwrap(), vec!["--jobs", "3"]);
+
+        // Lossily converting this would leave "--log-dir" pointing at a
+        // U+FFFD-named directory the caller never asked for, and the run would
+        // use it without a word.
+        let bad = [OsString::from("--log-dir"), OsString::from_vec(vec![0xff, 0xfe])];
+        assert_eq!(args_utf8(bad).unwrap_err().into_vec(), vec![0xff, 0xfe]);
     }
 
     #[test]

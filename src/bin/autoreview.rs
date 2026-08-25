@@ -136,7 +136,7 @@ fn interruptible_sleep(
 }
 
 fn main() {
-    let cfg = match cli::parse(std::env::args().skip(1), &cli::real_env) {
+    let cfg = match cli::parse(cli::args_or_exit(), &cli::real_env) {
         Ok(cli::Parsed::Help) => {
             print!("{}", cli::HELP);
             std::process::exit(0);

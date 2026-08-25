@@ -11,7 +11,7 @@ use autoreview::repo::AlreadyReported;
 use autoreview::tabs::{self, cli};
 
 fn main() {
-    let cfg = match cli::parse(std::env::args().skip(1), &autoreview::cli::real_env) {
+    let cfg = match cli::parse(autoreview::cli::args_or_exit(), &autoreview::cli::real_env) {
         Ok(cli::Parsed::Help) => {
             print!("{}", cli::HELP);
             std::process::exit(0);
