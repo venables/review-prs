@@ -27,20 +27,21 @@ pub fn run(cfg: &Config) -> Result<i32> {
     // that has never seen it; picker::run asks for it when it is reached.
     repo::require_deps(&["gh"])?;
 
-    // Before the picker, not after it: with no terminal to spawn into there is
-    // nothing this tool can do, and finding that out after choosing PRs wastes
-    // the choosing.
+    let ctx = repo::load()?;
+    let Some((numbers, _titles)) = select::run(&ctx, &select_opts(cfg))? else {
+        return Ok(0);
+    };
+
+    // After the selection, not before it. Detecting earlier would save the one
+    // wasted pick you make in a terminal this tool cannot drive -- but it would
+    // also turn "nothing to review here" into a failure for anyone running from
+    // one, and a run with no work has always exited 0.
     let spawner = match spawner::detect() {
         Ok(s) => s,
         Err(msg) => {
             eprintln!("{msg}");
             bail!(AlreadyReported);
         }
-    };
-
-    let ctx = repo::load()?;
-    let Some((numbers, _titles)) = select::run(&ctx, &select_opts(cfg))? else {
-        return Ok(0);
     };
 
     if let Some(label) = &cfg.workspace {

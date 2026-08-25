@@ -22,6 +22,41 @@ assert_not_contains "draft PRs are hidden" "$out" "#2"
 out="$(run_review_prs --auto --dependabot)"
 assert_contains "--dependabot includes bot PRs" "$out" "#3"
 
+# --- What the sweep says for itself ---------------------------------------
+# Pinned because it is the line a wrapper greps, and because it deliberately
+# no longer matches the bash this replaced: the "N PR(s)" shape went away
+# across both tools, so the sweep says its count in plain english.
+out="$(run_review_prs --auto)"
+assert_contains "the sweep names what it picked" "$out" "2 PRs to review: #9 #8"
+assert_not_contains "...without the PR(s) shape" "$out" "PR(s)"
+
+# Nothing actionable is not an error, and it says how to see the rest. PR #6 is
+# the SEEN one, so a repo holding only it has nothing for a sweep to do.
+jq '.data.repository.pullRequests.nodes |= map(select(.number == 6))' \
+  "$SANDBOX/fixtures/prs.json" >"$SANDBOX/fixtures/seen-only.json"
+mv "$SANDBOX/fixtures/seen-only.json" "$SANDBOX/fixtures/prs.json"
+out="$(run_review_prs --auto)"
+assert_equals "a sweep with nothing actionable exits 0" "$(last_status)" "0"
+assert_contains "...and says so" "$out" "no NEW or UPDATED PRs to review"
+assert_contains "...and names the way to see the rest" "$out" "run without --auto"
+
+# --- No terminal ----------------------------------------------------------
+# The terminal is only a problem once there is something to spawn, so a run
+# with no work exits 0 from a terminal this tool could never have driven.
+out="$(CMUX_SURFACE_ID='' run_review_prs --auto)"
+assert_equals "nothing to review exits 0 even with no terminal" "$(last_status)" "0"
+# Pin the reason for the 0, not just the 0: a fixture that later went empty
+# would still exit 0, and this test would pass without covering anything.
+assert_contains "...because the sweep found nothing to do" \
+  "$out" "no NEW or UPDATED PRs to review"
+assert_not_contains "...and says nothing about terminals" "$out" "no supported terminal"
+
+default_prs
+out="$(CMUX_SURFACE_ID='' run_review_prs --auto)"
+assert_equals "PRs to spawn with no terminal exits 1" "$(last_status)" "1"
+assert_contains "...and says what it looked for" "$out" "no supported terminal detected"
+assert_contains "...and points at the headless sibling" "$out" "use: autoreview"
+
 FAKE_GUM_PICK="#5" run_review_prs --all >/dev/null
 assert_contains "--all includes approved PRs" "$(spawned_cmd 'panel review 5')" "panel review 5"
 
@@ -84,7 +119,7 @@ assert_equals "a clean sweep exits 0" "$(last_status)" "0"
 
 out="$(FAKE_CMUX_FAIL_SEND=1 run_review_prs --auto)"
 assert_equals "a sweep whose tabs all fail exits 1" "$(last_status)" "1"
-assert_contains "the failure count is reported" "$out" "failed to spawn"
+assert_contains "the failure count is reported" "$out" "2 of 2 tabs failed to spawn"
 
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
