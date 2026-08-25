@@ -48,7 +48,8 @@ The summary shows what each review concluded. RESULT is the review process
 GitHub -- approved, commented, changes requested, or "nothing posted" when the
 review left nothing behind, which is not a rejection. The reviewer is also
 asked to report its synthesized risk, finding counts, and each panelist's
-model, shown alongside the model, time and cost dash-p accounts for.
+model, shown alongside the model, time and cost dash-p accounts for. On a
+terminal that supports OSC 8 hyperlinks, each PR number opens the PR.
 
 Override the reviewer via $AUTOREVIEW_AUTO_CMD for unattended runs (the default,
 and --babysit), or $AUTOREVIEW_CMD for --pick runs (the PR number replaces the

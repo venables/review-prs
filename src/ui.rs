@@ -58,6 +58,23 @@ fn pass_headline(total: usize, jobs_max: u32) -> String {
     }
 }
 
+/// The base every PR hyperlink is built on. Owner and name come back from the
+/// GitHub API and end up inside an escape sequence, so they are stripped of
+/// anything that could close it early.
+pub fn pr_url_base(owner: &str, name: &str) -> String {
+    format!(
+        "https://github.com/{}/{}/pull",
+        crate::report::sanitize_for_display(owner),
+        crate::report::sanitize_for_display(name)
+    )
+}
+
+/// An OSC 8 hyperlink: the text stays the text, and the terminal makes it
+/// clickable. Terminals that do not understand the sequence swallow it.
+fn hyperlink(url: &str, text: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
 /// The RESULT cell, both modes. A reaped job's review already exited; only
 /// its verdict readback is still in flight, and an interrupt summary must
 /// not report it as a review that was cut short.
@@ -143,6 +160,9 @@ fn opt_label(v: Option<&str>) -> String {
 
 pub struct Ui {
     pub tty: bool,
+    /// Where a "#9" links to, or None when hyperlinks are off (no terminal,
+    /// or a terminal that asked for plain output).
+    pr_url_base: Option<String>,
     board: Option<Board>,
 }
 
@@ -158,8 +178,22 @@ struct Board {
 }
 
 impl Ui {
-    pub fn new() -> Ui {
-        Ui { tty: std::io::stdout().is_terminal(), board: None }
+    pub fn new(pr_url_base: String) -> Ui {
+        let tty = std::io::stdout().is_terminal();
+        // Piped output must stay greppable, and a reader who set $NO_COLOR (or
+        // is on TERM=dumb) asked for text, not escape sequences -- which is
+        // exactly what console::colors_enabled already answers.
+        let linked = tty && console::colors_enabled();
+        Ui { tty, pr_url_base: linked.then_some(pr_url_base), board: None }
+    }
+
+    /// The "#9" a summary shows, clickable where the terminal allows it.
+    fn pr_label(&self, pr: u64) -> String {
+        let text = format!("#{pr}");
+        match &self.pr_url_base {
+            Some(base) => hyperlink(&format!("{base}/{pr}"), &text),
+            None => text,
+        }
     }
 
     /// A note the user should see now: spawn failures, session fallbacks.
@@ -348,14 +382,14 @@ impl Ui {
     }
 
     /// What each review concluded. Split out from the printing so a test can
-    /// read the rendered table back rather than assert on what it hopes was
-    /// printed.
+    /// read the rendered table back -- the PR cells carry hyperlinks, whose
+    /// whole risk is that a terminal counts them as visible width.
     fn results_table(&self, jobs: &[Job]) -> Table {
         let mut table = new_table();
         table.set_header(vec!["PR", "RESULT", "VERDICT", "RISK", "FINDINGS", "TIME", "COST", "MODEL"]);
         for job in jobs {
             table.add_row(vec![
-                Cell::new(format!("#{}", job.pr)).add_attribute(Attribute::Bold),
+                Cell::new(self.pr_label(job.pr)).add_attribute(Attribute::Bold),
                 result_cell(job),
                 verdict_cell(job.verdict.as_deref()),
                 risk_cell(job.trailer.as_ref().and_then(|t| t.risk.as_deref())),
@@ -380,7 +414,7 @@ impl Ui {
             let Some(t) = &job.trailer else { continue };
             for p in &t.panel {
                 panel.add_row(vec![
-                    Cell::new(format!("#{}", job.pr)).add_attribute(Attribute::Bold),
+                    Cell::new(self.pr_label(job.pr)).add_attribute(Attribute::Bold),
                     Cell::new(panel_model_label(p)),
                     // Whether the panelist came back with a review at all --
                     // not whether it liked the PR. A panelist that never said
@@ -408,10 +442,15 @@ impl Ui {
         let resumable: Vec<&Job> = jobs.iter().filter(|j| j.sid.is_some()).collect();
         if !resumable.is_empty() {
             println!("{}", style("reopen any review with: claude --resume <SESSION>").dim());
+            // Padded by the number's own width: the label may carry a
+            // hyperlink, whose bytes are not columns.
+            let widest =
+                resumable.iter().map(|j| j.pr.to_string().len()).max().unwrap_or(0);
             for job in resumable {
                 println!(
-                    "  {}  {}",
-                    style(format!("#{}", job.pr)).cyan(),
+                    "  {}{}  {}",
+                    style(self.pr_label(job.pr)).cyan(),
+                    " ".repeat(widest - job.pr.to_string().len()),
                     job.sid.as_deref().unwrap_or("-")
                 );
             }
@@ -686,10 +725,53 @@ mod tests {
         assert_eq!(verdict_label(Some("approved")), "approved");
     }
 
+    fn linked_ui() -> Ui {
+        Ui {
+            tty: true,
+            pr_url_base: Some("https://github.com/acme/widgets/pull".into()),
+            board: None,
+        }
+    }
+
     fn done_job(pr: u64) -> Job {
         let mut job = Job::new(pr);
         job.state = JobState::Done;
         job
+    }
+
+    #[test]
+    fn pr_cells_link_to_the_pull_request() {
+        let ui = linked_ui();
+        assert_eq!(
+            ui.pr_label(9),
+            "\x1b]8;;https://github.com/acme/widgets/pull/9\x1b\\#9\x1b]8;;\x1b\\"
+        );
+        // Off the terminal there is nothing to click and escapes would only
+        // break grep.
+        let plain = Ui { tty: false, pr_url_base: None, board: None };
+        assert_eq!(plain.pr_label(9), "#9");
+    }
+
+    #[test]
+    fn a_linked_table_still_lines_up() {
+        // The whole risk of an in-cell hyperlink: 40-odd invisible bytes that
+        // a naive width count would pad around.
+        let out = linked_ui().results_table(&[done_job(9), done_job(123)]).to_string();
+        let widths: Vec<usize> =
+            out.lines().map(console::measure_text_width).collect();
+        let plain: Vec<usize> = Ui { tty: false, pr_url_base: None, board: None }
+            .results_table(&[done_job(9), done_job(123)])
+            .to_string()
+            .lines()
+            .map(console::measure_text_width)
+            .collect();
+        assert_eq!(widths.len(), plain.len());
+        // Borders carry no links, so every border row must match exactly.
+        for (i, line) in out.lines().enumerate() {
+            if !line.contains('\x1b') {
+                assert_eq!(widths[i], plain[i], "row {i} changed width: {line}");
+            }
+        }
     }
 
     #[test]
@@ -701,7 +783,10 @@ mod tests {
             );
             j
         };
-        let out = Ui { tty: false, board: None }.panel_table(&[job]).unwrap().to_string();
+        let out = Ui { tty: false, pr_url_base: None, board: None }
+            .panel_table(&[job])
+            .unwrap()
+            .to_string();
         assert!(out.contains("MODEL") && !out.contains("PANELIST"));
         assert!(out.contains("gpt-5.5"));
         // A panelist that never reported a model still has to identify itself.
