@@ -90,6 +90,57 @@ pub fn dashp_bin() -> String {
         .unwrap_or_else(|| "dash-p".into())
 }
 
+/// The repo root out of `git rev-parse --show-toplevel`, or the message that
+/// says why not. Pure, so each way it can go wrong is unit-testable -- the
+/// order especially, since two of the three cases can be true at once.
+fn repo_root_from(out: &std::process::Output) -> std::result::Result<PathBuf, String> {
+    // The status first: a git that failed has nothing to say about encoding,
+    // and reporting its stdout's bytes instead of its failure would send you
+    // looking in the wrong place.
+    if !out.status.success() {
+        let detail = combined_output(out);
+        let mut msg = String::from("error: not inside a git checkout");
+        if !detail.is_empty() {
+            msg.push('\n');
+            msg.push_str(&detail);
+        }
+        return Err(msg);
+    }
+    // Refused rather than lossily converted. Every review runs in this
+    // directory, and a path with a U+FFFD standing in for a byte names a
+    // directory nobody has: autoreview would fail to spawn into it, and
+    // review-prs would hand each tab a `cd` that cannot succeed. Saying so
+    // once here beats failing once per PR with no explanation.
+    //
+    // The narrow cost: a checkout whose path is not valid UTF-8 is refused
+    // where the bash review-prs passed the raw bytes through. macOS rejects
+    // such names outright, so this only reaches an unusual Linux checkout.
+    let Ok(root_utf8) = std::str::from_utf8(&out.stdout) else {
+        return Err("error: the repo path is not valid UTF-8\n  \
+                    reviews run in it and it is sent to a shell, so it has to be exact"
+            .into());
+    };
+    // Exactly the one newline git adds, not every trailing whitespace-ish
+    // byte. A directory name may legally end in a space -- or in a newline of
+    // its own -- and eating either would name a directory nobody has, which is
+    // the corruption the refusal above exists to prevent.
+    let root = root_utf8.strip_suffix('\n').unwrap_or(root_utf8);
+    if root.is_empty() {
+        // Distinct from the failure above: git succeeded and said nothing,
+        // which gh can produce by answering from $GH_REPO outside any checkout.
+        // Its output rides along -- a warning on stderr is the only thing that
+        // would explain a silent success.
+        let detail = combined_output(out);
+        let mut msg = String::from("error: git rev-parse --show-toplevel printed nothing");
+        if !detail.is_empty() {
+            msg.push('\n');
+            msg.push_str(&detail);
+        }
+        return Err(msg);
+    }
+    Ok(PathBuf::from(root))
+}
+
 pub fn load() -> Result<RepoContext> {
     let repo_view = Command::new("gh")
         .args(["repo", "view", "--json", "owner,name"])
@@ -106,13 +157,13 @@ pub fn load() -> Result<RepoContext> {
     // gh can answer from $GH_REPO outside any checkout; an empty repo root
     // would hash into every session id and fail every spawn one PR at a time.
     let toplevel = Command::new("git").args(["rev-parse", "--show-toplevel"]).output()?;
-    let root_str = String::from_utf8_lossy(&toplevel.stdout).trim().to_string();
-    if !toplevel.status.success() || root_str.is_empty() {
-        eprintln!("error: not inside a git checkout");
-        eprintln!("{}", combined_output(&toplevel));
-        bail!(AlreadyReported);
-    }
-    let repo_root = PathBuf::from(root_str);
+    let repo_root = match repo_root_from(&toplevel) {
+        Ok(root) => root,
+        Err(msg) => {
+            eprintln!("{msg}");
+            bail!(AlreadyReported);
+        }
+    };
 
     // gh can exit 0 and still hand back an empty login, which would silently
     // mislabel every PR's engagement -- so check both the status and the value.
@@ -129,4 +180,50 @@ pub fn load() -> Result<RepoContext> {
     }
 
     Ok(RepoContext { owner, name, repo_root, me })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn output(code: i32, stdout: &[u8], stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_failed_git_is_reported_as_a_failed_git() {
+        // Even when its stdout is not valid UTF-8. Both are true here, and
+        // naming the encoding would send you looking in the wrong place.
+        let err = repo_root_from(&output(128, &[0xff], "fatal: not a git repository")).unwrap_err();
+        assert!(err.starts_with("error: not inside a git checkout"));
+        assert!(err.contains("fatal: not a git repository"));
+    }
+
+    #[test]
+    fn a_non_utf8_root_is_refused_rather_than_mangled() {
+        let err = repo_root_from(&output(0, &[b'/', 0xff, b'\n'], "")).unwrap_err();
+        assert!(err.starts_with("error: the repo path is not valid UTF-8"));
+    }
+
+    #[test]
+    fn a_git_that_succeeded_and_said_nothing_says_which_command() {
+        let err = repo_root_from(&output(0, b"\n", "")).unwrap_err();
+        assert!(err.contains("printed nothing"));
+    }
+
+    #[test]
+    fn exactly_one_trailing_newline_is_stripped() {
+        assert_eq!(repo_root_from(&output(0, b"/repo\n", "")).unwrap(), PathBuf::from("/repo"));
+        // A directory name may legally end in a space, or in a newline of its
+        // own. Eating either would name a directory nobody has -- git adds one
+        // newline, so exactly one comes off.
+        assert_eq!(repo_root_from(&output(0, b"/repo \n", "")).unwrap(), PathBuf::from("/repo "));
+        assert_eq!(repo_root_from(&output(0, b"/repo\n\n", "")).unwrap(), PathBuf::from("/repo\n"));
+        assert_eq!(repo_root_from(&output(0, b"/repo\r\n", "")).unwrap(), PathBuf::from("/repo\r"));
+    }
 }
