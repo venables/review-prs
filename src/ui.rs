@@ -41,6 +41,23 @@ pub fn cost_str(cost: Option<f64>) -> String {
     }
 }
 
+/// "1 PR" / "3 PRs". Every count the user reads goes through here: "1 PR(s)"
+/// is the shape that made someone stop and reread the line.
+pub fn count(n: usize, singular: &str) -> String {
+    if n == 1 { format!("{n} {singular}") } else { format!("{n} {singular}s") }
+}
+
+/// The pass header. The concurrency is only worth saying when it actually
+/// holds reviews back -- "1 PR, 2 at a time" describes nothing.
+fn pass_headline(total: usize, jobs_max: u32) -> String {
+    let subject = count(total, "PR");
+    if (jobs_max as usize) < total {
+        format!("reviewing {subject}, {jobs_max} at a time")
+    } else {
+        format!("reviewing {subject}")
+    }
+}
+
 /// The RESULT cell, both modes. A reaped job's review already exited; only
 /// its verdict readback is still in flight, and an interrupt summary must
 /// not report it as a review that was cut short.
@@ -79,6 +96,22 @@ pub fn findings_label(trailer: Option<&Trailer>) -> String {
     } else {
         parts.join(", ")
     }
+}
+
+/// What landed on the PR, or the fact that nothing did. "-" read as a verdict
+/// of its own -- a refusal to approve -- when it only ever meant "no review
+/// was posted".
+pub fn verdict_label(verdict: Option<&str>) -> &str {
+    verdict.filter(|v| !v.is_empty()).unwrap_or("nothing posted")
+}
+
+/// Which panelist a row belongs to. The model is the identifying half; the
+/// CLI's own name is the fallback for a panelist that never reported one.
+pub fn panel_model_label(p: &Panelist) -> &str {
+    fn named(s: Option<&str>) -> Option<&str> {
+        s.filter(|v| !v.is_empty())
+    }
+    named(p.model.as_deref()).or_else(|| named(p.name.as_deref())).unwrap_or("unknown")
 }
 
 /// One panelist, in words: "codex (gpt-5.5) 3 findings, top MEDIUM".
@@ -163,14 +196,13 @@ impl Ui {
     /// Print the pass header and stand up the live board.
     pub fn begin_pass(&mut self, total: usize, jobs_max: u32, pass_dir: &std::path::Path) {
         if !self.tty {
-            println!("reviewing {total} PR(s), {jobs_max} at a time");
+            println!("{}", pass_headline(total, jobs_max));
             println!("logs: {}\n", pass_dir.display());
             return;
         }
         println!(
-            "{} {} {}",
-            style(format!("reviewing {total} PR(s),")).bold(),
-            style(format!("{jobs_max} at a time")).bold(),
+            "{} {}",
+            style(pass_headline(total, jobs_max)).bold(),
             style(format!("· logs: {}", pass_dir.display())).dim()
         );
         println!();
@@ -292,7 +324,7 @@ impl Ui {
             rows.push(vec![
                 format!("#{}", job.pr),
                 result_label(job),
-                opt_label(job.verdict.as_deref()),
+                verdict_label(job.verdict.as_deref()).to_string(),
                 opt_label(job.trailer.as_ref().and_then(|t| t.risk.as_deref())),
                 findings_label(job.trailer.as_ref()),
                 fmt_dur(job.elapsed_secs),
@@ -315,8 +347,10 @@ impl Ui {
         println!("reopen any review with: claude --resume <SESSION>");
     }
 
-    fn print_summary_tables(&self, jobs: &[Job], pass_dir: &std::path::Path) {
-        println!();
+    /// What each review concluded. Split out from the printing so a test can
+    /// read the rendered table back rather than assert on what it hopes was
+    /// printed.
+    fn results_table(&self, jobs: &[Job]) -> Table {
         let mut table = new_table();
         table.set_header(vec!["PR", "RESULT", "VERDICT", "RISK", "FINDINGS", "TIME", "COST", "MODEL"]);
         for job in jobs {
@@ -331,27 +365,43 @@ impl Ui {
                 Cell::new(opt_label(job.model.as_deref())),
             ]);
         }
-        println!("{table}");
+        table
+    }
 
-        if jobs.iter().any(|j| j.trailer.as_ref().is_some_and(|t| !t.panel.is_empty())) {
-            let mut panel = new_table();
-            panel.set_header(vec!["PR", "PANELIST", "MODEL", "RESULT", "FINDINGS", "TOP"]);
-            for job in jobs {
-                let Some(t) = &job.trailer else { continue };
-                for p in &t.panel {
-                    panel.add_row(vec![
-                        Cell::new(format!("#{}", job.pr)).add_attribute(Attribute::Bold),
-                        Cell::new(p.name.as_deref().unwrap_or("?")),
-                        Cell::new(p.model.as_deref().unwrap_or("unknown")),
-                        match p.ok {
-                            Some(false) => Cell::new("failed").fg(Color::Red),
-                            _ => Cell::new("ok").fg(Color::Green),
-                        },
-                        Cell::new(p.findings.map_or("-".into(), |n| n.to_string())),
-                        risk_cell(p.top.as_deref().filter(|_| p.findings.unwrap_or(0) > 0)),
-                    ]);
-                }
+    /// Which models did the reviewing, one row per panelist. None when no
+    /// review reported a panel.
+    fn panel_table(&self, jobs: &[Job]) -> Option<Table> {
+        if !jobs.iter().any(|j| j.trailer.as_ref().is_some_and(|t| !t.panel.is_empty())) {
+            return None;
+        }
+        let mut panel = new_table();
+        panel.set_header(vec!["PR", "MODEL", "STATUS", "FINDINGS", "TOP"]);
+        for job in jobs {
+            let Some(t) = &job.trailer else { continue };
+            for p in &t.panel {
+                panel.add_row(vec![
+                    Cell::new(format!("#{}", job.pr)).add_attribute(Attribute::Bold),
+                    Cell::new(panel_model_label(p)),
+                    // Whether the panelist came back with a review at all --
+                    // not whether it liked the PR. A panelist that never said
+                    // gets a "-" rather than being read as a success.
+                    match p.ok {
+                        Some(true) => Cell::new("answered").fg(Color::Green),
+                        Some(false) => Cell::new("failed").fg(Color::Red),
+                        None => Cell::new("-").add_attribute(Attribute::Dim),
+                    },
+                    Cell::new(p.findings.map_or("-".into(), |n| n.to_string())),
+                    risk_cell(p.top.as_deref().filter(|_| p.findings.unwrap_or(0) > 0)),
+                ]);
             }
+        }
+        Some(panel)
+    }
+
+    fn print_summary_tables(&self, jobs: &[Job], pass_dir: &std::path::Path) {
+        println!();
+        println!("{}", self.results_table(jobs));
+        if let Some(panel) = self.panel_table(jobs) {
             println!("{panel}");
         }
 
@@ -392,8 +442,8 @@ fn verdict_cell(verdict: Option<&str>) -> Cell {
         Some("approved") => Cell::new("approved").fg(Color::Green).add_attribute(Attribute::Bold),
         Some("changes requested") => Cell::new("changes requested").fg(Color::Yellow),
         Some("commented") => Cell::new("commented").fg(Color::Cyan),
-        Some(other) => Cell::new(other),
-        None => Cell::new("-").add_attribute(Attribute::Dim),
+        Some(other) if !other.is_empty() => Cell::new(other),
+        _ => Cell::new(verdict_label(None)).add_attribute(Attribute::Dim),
     }
 }
 
@@ -612,6 +662,63 @@ mod tests {
         // without being C0 controls; they must go too.
         assert_eq!(short_title("fix\u{202E}cod.exe"), "fixcod.exe");
         assert_eq!(short_title("a\u{200B}b\u{FEFF}c"), "abc");
+    }
+
+    #[test]
+    fn counts_read_as_english() {
+        assert_eq!(count(1, "PR"), "1 PR");
+        assert_eq!(count(0, "PR"), "0 PRs");
+        assert_eq!(count(3, "review"), "3 reviews");
+    }
+
+    #[test]
+    fn the_pass_header_only_claims_a_limit_that_binds() {
+        assert_eq!(pass_headline(1, 2), "reviewing 1 PR");
+        assert_eq!(pass_headline(2, 2), "reviewing 2 PRs");
+        assert_eq!(pass_headline(5, 2), "reviewing 5 PRs, 2 at a time");
+    }
+
+    #[test]
+    fn an_empty_verdict_says_nothing_landed() {
+        // A bare "-" read as a verdict of its own; it never was one.
+        assert_eq!(verdict_label(None), "nothing posted");
+        assert_eq!(verdict_label(Some("")), "nothing posted");
+        assert_eq!(verdict_label(Some("approved")), "approved");
+    }
+
+    fn done_job(pr: u64) -> Job {
+        let mut job = Job::new(pr);
+        job.state = JobState::Done;
+        job
+    }
+
+    #[test]
+    fn the_panel_table_names_models_not_clis() {
+        let job = {
+            let mut j = done_job(9);
+            j.trailer = parse_trailer(
+                "```autoreview\n{\"panel\":[{\"name\":\"codex\",\"model\":\"gpt-5.5\",\"ok\":true,\"findings\":1,\"top\":\"LOW\"},{\"name\":\"opencode\",\"ok\":false}]}\n```",
+            );
+            j
+        };
+        let out = Ui { tty: false, board: None }.panel_table(&[job]).unwrap().to_string();
+        assert!(out.contains("MODEL") && !out.contains("PANELIST"));
+        assert!(out.contains("gpt-5.5"));
+        // A panelist that never reported a model still has to identify itself.
+        assert!(out.contains("opencode"));
+        // "ok" said nothing about whether the panelist actually replied.
+        assert!(out.contains("answered") && out.contains("failed") && !out.contains("ok"));
+    }
+
+    #[test]
+    fn panelists_fall_back_to_their_cli_name() {
+        let t = parse_trailer(
+            "```autoreview\n{\"panel\":[{\"name\":\"codex\",\"model\":\"gpt-5.5\"},{\"name\":\"opencode\",\"model\":\"\"},{}]}\n```",
+        )
+        .unwrap();
+        assert_eq!(panel_model_label(&t.panel[0]), "gpt-5.5");
+        assert_eq!(panel_model_label(&t.panel[1]), "opencode");
+        assert_eq!(panel_model_label(&t.panel[2]), "unknown");
     }
 
     #[test]

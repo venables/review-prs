@@ -43,10 +43,12 @@ where UUID is derived from the repo directory plus owner/name#N, so the same PR
 in this checkout always maps to the same session -- and `claude --resume UUID`
 reopens it interactively later. Set $DASHP_BIN to point at a different dash-p.
 
-The summary shows what each review concluded: the verdict is read back from
-GitHub (approved / commented / changes requested), and the reviewer is asked
-to report its synthesized risk, finding counts, and each panelist's model,
-which are shown alongside the model, time and cost dash-p accounts for.
+The summary shows what each review concluded. RESULT is the review process
+(done / timed out / failed); VERDICT is what landed on the PR, read back from
+GitHub -- approved, commented, changes requested, or "nothing posted" when the
+review left nothing behind, which is not a rejection. The reviewer is also
+asked to report its synthesized risk, finding counts, and each panelist's
+model, shown alongside the model, time and cost dash-p accounts for.
 
 Override the reviewer via $AUTOREVIEW_AUTO_CMD for unattended runs (the default,
 and --babysit), or $AUTOREVIEW_CMD for --pick runs (the PR number replaces the

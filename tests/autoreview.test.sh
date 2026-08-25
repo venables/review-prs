@@ -17,6 +17,9 @@ assert_contains "UPDATED/CHANGES PRs are reviewed" "$(claude_calls)" "/auto-revi
 assert_not_contains "SEEN PRs are skipped" "$(claude_calls)" "/auto-review 6"
 assert_contains "a clean run reports each PR" "$out" "done    #9"
 assert_equals "a clean run exits 0" "$(last_status)" "0"
+assert_contains "the sweep names what it picked" "$out" "2 PRs to review: #9 #8"
+assert_contains "the pass header counts in english" "$out" "reviewing 2 PRs"
+assert_not_contains "...without the PR(s) shape" "$out" "PR(s)"
 
 # The old opt-in spelling still parses, so a cron line or alias keeps working.
 run_autoreview --auto >/dev/null
@@ -66,7 +69,7 @@ assert_contains "the summary says how to reopen one" "$out" "claude --resume"
 out="$(FAKE_CLAUDE_FAIL="9" run_autoreview --auto)"
 assert_equals "a failed review exits 1" "$(last_status)" "1"
 assert_contains "a failed review is named" "$out" "FAILED  #9"
-assert_contains "the failure count is reported" "$out" "1 of 2 review(s) failed"
+assert_contains "the failure count is reported" "$out" "1 of 2 reviews failed"
 assert_contains "the other PR still ran" "$(claude_calls)" "/auto-review 8"
 
 # A turn that reports is_error is exit 10 from dash-p -- the envelope-level
@@ -239,6 +242,8 @@ assert_contains "a clean panelist is shown too" "$out" "claude (claude-opus-4.7)
 out="$(run_autoreview --auto)"
 assert_equals "a run with no trailer and no review still exits 0" "$(last_status)" "0"
 assert_not_contains "...and shows no panel it never heard about" "$out" "panel #"
+# A bare "-" in the VERDICT column read as a verdict of its own.
+assert_contains "...and says outright that no review was posted" "$out" "nothing posted"
 
 # The staleness rule -- a review my login submitted before the run must not
 # read as this run's verdict -- is pinned by the rust unit tests; the fake
@@ -334,7 +339,7 @@ assert_contains "the loop ends with nothing left" "$out" "nothing left to babysi
 # One PR still unapproved: the loop waits for the interval instead of exiting.
 out="$(FAKE_GH_APPROVED="9" run_autoreview_until "next check in" 10 --auto --babysit=1)"
 assert_contains "an unapproved PR keeps the loop going" "$out" "next check in 1m"
-assert_contains "only the unapproved PR is left" "$out" "(1 PR(s) left)"
+assert_contains "only the unapproved PR is left" "$out" "(1 PR left)"
 
 # The one behaviour no single pass can show: the pass after the first resumes
 # the session its predecessor actually ran in, rather than the derived id, which

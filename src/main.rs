@@ -127,7 +127,11 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         // scratch each interval would throw away the findings the author is
         // in the middle of answering.
         cfg.continue_sessions = true;
-        println!("\nnext check in {} ({} PR(s) left)", babysit.normalized, queue.len());
+        println!(
+            "\nnext check in {} ({} left)",
+            babysit.normalized,
+            ui::count(queue.len(), "PR")
+        );
         interruptible_sleep(&rx, std::time::Duration::from_secs(babysit.secs), &ui);
         pass += 1;
     };
@@ -137,7 +141,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // cleanly, so a cron job or a CI step can tell a finished sweep from a
     // broken one.
     if failures > 0 {
-        eprintln!("error: {failures} of {total} review(s) failed");
+        eprintln!("error: {failures} of {} failed", ui::count(total, "review"));
         return Ok(1);
     }
     Ok(0)

@@ -339,8 +339,8 @@ pub fn select_auto(rows: &[Row]) -> Option<Vec<u64>> {
         println!("no NEW or UPDATED PRs to review; pass --pick to choose from every open PR");
         return None;
     }
-    let list: String = numbers.iter().map(|n| format!("#{n} ")).collect();
-    println!("auto-reviewing {} PR(s): {}", numbers.len(), list);
+    let list: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
+    println!("{} to review: {}", crate::ui::count(numbers.len(), "PR"), list.join(" "));
     Some(numbers)
 }
 
