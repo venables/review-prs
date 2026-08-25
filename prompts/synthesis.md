@@ -31,22 +31,42 @@ Never repeat a claim you could have falsified in thirty seconds with a read.
 **Misinterpretation check.** Read the diff yourself and form your own view of
 what it does. Compare that against each panelist's `Goal:` line. A panelist can
 tag itself `Goal (clear)` and still have misread the change, which produces
-confidently wrong findings underneath. Where they disagree, say so in a callout
-and treat that panelist's findings with extra skepticism.
+confidently wrong findings underneath.
+
+This is your reading against a panelist's, which is a different question from
+`### Goal check` (where panelists disagree with *each other*). When it triggers,
+put a bold `**Misinterpretation detected:**` paragraph directly after
+`### Risk`, name the panelist and what it got wrong, and treat its findings with
+extra skepticism -- drop the ones whose substance depends on the misreading.
+When nothing is wrong, write nothing: there is no "no misinterpretations"
+line.
 
 ## Drop these
 
 - Any finding with no `file:line` and no named root-cause location.
-- Any finding with no `Fix:`.
+- Any finding with no `Fix:` (a LOW finding is exempt -- see the shape below).
 - Style nits a linter or formatter would catch.
 - Anything a panelist that FAILED did not actually produce. A failed panelist
   contributed nothing; do not count it toward consensus.
+
+A panelist that answered `NO_FINDINGS` is **not** a dropped panelist. It
+reviewed the change and found nothing, which is a result: count it in the
+roster, and say so if it changes how the findings read. A clean report has no
+`file:line` and no `Fix:` by design -- that is not a reason to discard it.
 
 ## Output
 
 Emit only these sections, in this order. **Most are conditional** — emit a
 heading only when it has content. Blank sections and "none" placeholders bury
 the signal.
+
+1. `### Overview` (always)
+2. `### Risk` (always)
+3. A misinterpretation callout, when one is warranted (see below)
+4. `### Goal check` (only when goals are contested)
+5. `### Approach check` (only when questionable and verified)
+6. `### must-fix` / `### should-fix` / `### polish` (each only when non-empty)
+7. `### Disagreements` (only when panelists actually contradict each other)
 
 ### Overview
 

@@ -27,7 +27,7 @@ pub fn build_prompt(target_label: &str, outcomes: &[Outcome], focus: Option<&str
 
     p.push_str("\n\n## This run\n\n");
     p.push_str(&format!("- Target line to quote: {target_label}\n"));
-    let answered = outcomes.iter().filter(|o| o.ok()).count();
+    let answered = outcomes.iter().filter(|o| o.answered()).count();
     p.push_str(&format!(
         "- Panelists: {} of {} returned a review\n",
         answered,
@@ -37,10 +37,28 @@ pub fn build_prompt(target_label: &str, outcomes: &[Outcome], focus: Option<&str
         p.push_str(&format!("- The reviewers were asked to focus on: {focus}\n"));
     }
 
-    let failed: Vec<&Outcome> = outcomes.iter().filter(|o| !o.ok()).collect();
-    if !failed.is_empty() {
+    let silent: Vec<&Outcome> = outcomes.iter().filter(|o| !o.answered()).collect();
+    if !silent.is_empty() {
         p.push_str("\nThese panelists contributed nothing. Do not count them toward consensus:\n\n");
-        for o in failed {
+        for o in silent {
+            p.push_str(&format!(
+                "- {} ({}): {}\n",
+                o.id,
+                o.model,
+                o.failure.clone().unwrap_or_default()
+            ));
+        }
+    }
+
+    // A report that arrived with a bad exit status is still a report. It
+    // counts toward consensus; the reader is told the run was not clean so a
+    // truncated review is not mistaken for a thorough one.
+    let unclean: Vec<&Outcome> =
+        outcomes.iter().filter(|o| o.answered() && !o.clean()).collect();
+    if !unclean.is_empty() {
+        p.push_str("\nThese panelists returned a review but did not exit cleanly. Count them, \
+                    and treat a report that stops mid-sentence as truncated:\n\n");
+        for o in unclean {
             p.push_str(&format!(
                 "- {} ({}): {}\n",
                 o.id,
@@ -171,5 +189,25 @@ mod tests {
         assert!(p.contains("- opencode (glm-5.3): timed out"));
         // An empty report contributes no section at all.
         assert!(!p.contains("### opencode / glm-5.3\n"));
+    }
+
+    #[test]
+    fn a_review_with_a_bad_exit_is_counted_and_flagged() {
+        let outcomes = vec![
+            outcome("codex", "gpt-5", "Model: gpt-5\n- [HIGH] a.rs:1 — bug", None),
+            outcome(
+                "claude",
+                "opus-5",
+                "Model: opus-5\n- [MEDIUM] b.rs:2 — other",
+                Some("exited 3 after producing output"),
+            ),
+        ];
+        let p = build_prompt("uncommitted changes on main", &outcomes, None);
+        // Both reviewed, so both count -- the second just did not exit well.
+        assert!(p.contains("- Panelists: 2 of 2 returned a review"));
+        assert!(!p.contains("contributed nothing. Do not count"));
+        assert!(p.contains("did not exit cleanly"));
+        assert!(p.contains("- claude (opus-5): exited 3 after producing output"));
+        assert!(p.contains("### claude / opus-5"));
     }
 }

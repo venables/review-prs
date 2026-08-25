@@ -37,7 +37,15 @@ pub fn make_unique_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
     for attempt in 0..100 {
         let candidate = parent.join(format!("{prefix}{}", random_suffix(attempt)));
         match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => {
+                // 0700, not whatever the umask says. Under a shared /tmp this
+                // directory holds the full diff, every prompt and (for panel)
+                // a checkout per panelist; 0755 offers all of it to anyone
+                // with an account on the box.
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700));
+                return Ok(candidate);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e).context(format!("creating {}", candidate.display())),
         }
@@ -128,6 +136,19 @@ mod tests {
         let d = std::env::temp_dir().join(format!("ar-rundir-{}-{}", std::process::id(), random_suffix(7)));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_run_directory_is_private_to_its_owner() {
+        // It holds the full diff, every prompt, and for panel a checkout per
+        // panelist. Under a shared /tmp, 0755 offers all of that to anyone
+        // with an account on the box.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmp_base();
+        let dir = make_unique_dir(&base, "mode-test.").unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "run directory mode was {mode:o}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

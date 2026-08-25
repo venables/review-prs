@@ -66,6 +66,17 @@ pub fn resolve(target: &Target, repo_root: &Path) -> Result<Resolved> {
             sha: None,
         },
         Target::Base(base) => {
+            // A base that starts with a dash reaches git as an option, not a
+            // ref: `--output=<path>` makes git write the diff to a file and
+            // print nothing, and the run would then stop with "nothing to
+            // review", which names the wrong cause entirely.
+            if base.starts_with('-') {
+                bail!("--base expects a ref, and \"{base}\" starts with a dash");
+            }
+            let verified = git(repo_root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")])?;
+            if !verified.status.success() {
+                bail!("--base: no commit named \"{base}\" in this repository");
+            }
             // Three dots: the diff of what this branch added, not of every
             // change on the base since it forked. Reviewing the latter would
             // flag other people's commits as this branch's work.
@@ -92,9 +103,32 @@ pub fn resolve(target: &Target, repo_root: &Path) -> Result<Resolved> {
     // An empty diff is not a review anyone wants: every panelist would spend
     // a model call to report nothing, and the synthesis would agree with them.
     if resolved.diff.trim().is_empty() {
+        // A change that only adds files is the common way to land here, and
+        // "the diff is empty" is a baffling thing to be told while looking at
+        // the new files. Name them.
+        let untracked = untracked_files(repo_root);
+        if !untracked.is_empty() {
+            bail!(
+                "nothing to review: the diff for {} is empty. {} not tracked by git yet, so no diff covers them: {}. Add them with `git add` first.",
+                resolved.label,
+                crate::ui::count(untracked.len(), "file is"),
+                untracked.join(", ")
+            );
+        }
         bail!("nothing to review: the diff for {} is empty", resolved.label);
     }
     Ok(resolved)
+}
+
+/// The files git is not tracking, so an empty diff can say why it is empty.
+fn untracked_files(repo_root: &Path) -> Vec<String> {
+    git_stdout(repo_root, &["ls-files", "--others", "--exclude-standard"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(10)
+        .map(str::to_string)
+        .collect()
 }
 
 fn branch(repo_root: &Path) -> String {
