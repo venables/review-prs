@@ -2,6 +2,7 @@
 # Flags, filtering, command overrides, and exit status.
 
 set -euo pipefail
+# shellcheck source=helpers.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers.sh"
 
 echo "cli"

@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Run every test file, then lint every script. Exits nonzero if anything fails.
+# Run every test file, then lint the suite itself. Exits nonzero if anything
+# fails.
 
 set -uo pipefail
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$TESTS_DIR/.."
+# Resolved rather than "$TESTS_DIR/..": it is also the prefix the lint output
+# strips to name each file relatively.
+ROOT="$(cd "$TESTS_DIR/.." && pwd)"
 failed=0
 
-# The rust crate first: its unit tests pin the pieces the bash suite then
-# exercises end to end, and a binary that does not build makes the rest moot.
+# The rust crate first: its unit tests pin the pieces this suite then exercises
+# end to end, and binaries that do not build make the rest moot.
 echo "cargo"
 if (cd "$ROOT" && cargo build --quiet); then
-  echo "  ok    autoreview builds"
+  echo "  ok    both binaries build"
 else
-  echo "  FAIL  autoreview does not build"
+  echo "  FAIL  the crate does not build"
   failed=1
 fi
 if (cd "$ROOT" && cargo test --quiet >/dev/null 2>&1); then
@@ -26,25 +29,17 @@ fi
 echo
 
 export AUTOREVIEW="$ROOT/target/debug/autoreview"
+export REVIEW_PRS="$ROOT/target/debug/review-prs"
 
 for f in "$TESTS_DIR"/*.test.sh; do
   bash "$f" || failed=1
   echo
 done
 
-# The bash entry point plus the libraries it sources (autoreview is rust and
-# linted by cargo). Libraries are listed explicitly rather than globbed so a
-# new one that nothing sources still gets parsed and linted.
-scripts=(
-  "$ROOT/review-prs"
-  "$ROOT/lib/interval.sh"
-  "$ROOT/lib/repo.sh"
-  "$ROOT/lib/session.sh"
-  "$ROOT/lib/pr-list.sh"
-)
-
+# Both tools are rust now and linted by cargo; this suite is the only bash
+# left in the repo, so it is what gets linted.
 echo "lint"
-for f in "${scripts[@]}"; do
+for f in "$TESTS_DIR"/*.sh; do
   if bash -n "$f"; then
     echo "  ok    ${f#"$ROOT"/} parses"
   else
@@ -54,14 +49,12 @@ for f in "${scripts[@]}"; do
 done
 
 if command -v shellcheck >/dev/null 2>&1; then
-  # Only the entry point is handed to shellcheck: -x follows its
-  # `# shellcheck source=` directives into lib/, which is the only context where
-  # a library's globals are actually defined. Checking a library on its own
-  # would report every one of them unset.
-  #
-  # SC2016 fires on the single-quoted GraphQL query and on literal "$VAR" names
-  # inside help text and messages. Both are intentional.
-  if shellcheck -x --exclude=SC2016 "$ROOT/review-prs"; then
+  # -x follows each test file's `# shellcheck source=` directive into
+  # helpers.sh, which is the only context where the harness's globals are
+  # actually defined; --source-path resolves that directive against this
+  # directory rather than the caller's cwd. SC2016 fires on literal "$VAR"
+  # names inside the strings the tests assert on, which is the point of them.
+  if shellcheck -x --source-path="$TESTS_DIR" --exclude=SC2016 "$TESTS_DIR"/*.sh; then
     echo "  ok    shellcheck clean"
   else
     echo "  FAIL  shellcheck reported problems"
