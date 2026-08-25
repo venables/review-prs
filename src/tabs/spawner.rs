@@ -229,12 +229,15 @@ fn spawn_in_ghostty(cmd: &str) -> Result<(), String> {
     args.push("--".into());
     args.push(cmd.into());
 
-    if !run_quiet("osascript", &args) {
+    let opened = run_quiet("osascript", &args);
+    // The AppleScript returns before the new tab has taken the keystroke, so
+    // pacing the spawns keeps a fan-out from racing itself. Unconditional: a
+    // failed attempt may still have activated the window, and the next spawn
+    // races it exactly the same way.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if !opened {
         return Err("error: osascript failed to open a Ghostty tab".into());
     }
-    // The AppleScript returns before the new tab has taken the keystroke;
-    // pacing the spawns keeps a fan-out from racing itself.
-    std::thread::sleep(std::time::Duration::from_millis(300));
     Ok(())
 }
 
