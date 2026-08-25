@@ -7,6 +7,8 @@
 use crate::pool::Event;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 
 pub fn install(tx: Sender<Event>) {
@@ -18,4 +20,17 @@ pub fn install(tx: Sender<Event>) {
             }
         }
     });
+}
+
+/// A flag that turns true on INT, TERM or HUP, for a loop that polls rather
+/// than owning a channel. panel's fan-out is that loop, and what it must do on
+/// any of the three is the same: stop the panelists, then let the worktrees go
+/// -- worktrees registered in the user's real repository, which is why leaving
+/// them behind is worse than an unfinished review.
+pub fn install_flag() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    for sig in [SIGINT, SIGTERM, SIGHUP] {
+        let _ = signal_hook::flag::register(sig, Arc::clone(&flag));
+    }
+    flag
 }

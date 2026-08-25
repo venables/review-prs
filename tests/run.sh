@@ -14,7 +14,7 @@ failed=0
 # end to end, and binaries that do not build make the rest moot.
 echo "cargo"
 if (cd "$ROOT" && cargo build --quiet); then
-  echo "  ok    both binaries build"
+  echo "  ok    all three binaries build"
 else
   echo "  FAIL  the crate does not build"
   failed=1
@@ -30,6 +30,7 @@ echo
 
 export AUTOREVIEW="$ROOT/target/debug/autoreview"
 export REVIEW_PRS="$ROOT/target/debug/review-prs"
+export PANEL="$ROOT/target/debug/panel"
 
 for f in "$TESTS_DIR"/*.test.sh; do
   bash "$f" || failed=1

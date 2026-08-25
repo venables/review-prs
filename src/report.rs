@@ -117,6 +117,13 @@ pub fn sanitize_for_display(s: &str) -> String {
     s.chars().filter(|c| !is_display_risky(*c)).collect()
 }
 
+/// The same filter over many lines. Model output is printed whole, and the
+/// newlines in it are not the risk -- the escape sequences and the bidi
+/// overrides that could repaint or reorder the report around them are.
+pub fn sanitize_block(s: &str) -> String {
+    s.lines().map(sanitize_for_display).collect::<Vec<_>>().join("\n")
+}
+
 fn is_display_risky(c: char) -> bool {
     c.is_control()
         || matches!(

@@ -106,9 +106,19 @@ pub fn run(cfg: &Config) -> Result<i32> {
     }
     println!();
 
-    let outcomes = fanout::run(&panel, &cwds, &cfg, &dashp, &prompt_path, &dir)?;
+    // Installed before anything is spawned: a ctrl-C between the first spawn
+    // and the poll loop must still be seen.
+    let interrupted = crate::signals::install_flag();
+    let outcomes = fanout::run(&panel, &cwds, &cfg, &dashp, &prompt_path, &dir, &interrupted)?;
 
-    let answered = outcomes.iter().filter(|o| o.ok()).count();
+    if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("panel: interrupted; the worktrees are being removed");
+        // Ok, not Err: the panelist reports above are real and already
+        // printed. 130 is what a shell expects from an interrupted run.
+        return Ok(130);
+    }
+
+    let answered = outcomes.iter().filter(|o| o.answered()).count();
     if answered == 0 {
         eprintln!("error: no panelist returned a review; there is nothing to synthesize");
         eprintln!("  what each one did is in {}", dir.display());
@@ -122,7 +132,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
 
     let report = synthesis::run(&resolved.label, &outcomes, &cfg, &dashp, &repo_root, &dir)?;
     println!("# Synthesis\n");
-    println!("{report}");
+    println!("{}", crate::report::sanitize_block(&report));
     println!();
     println!("---");
     println!(

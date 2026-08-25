@@ -44,13 +44,33 @@ pub fn build(target_label: &str, isolated: bool, focus: Option<&str>, diff: &str
         p.push_str("\n\n## Reviewer focus\n\n");
         p.push_str(focus);
     }
-    p.push_str("\n\n## Diff\n\n```diff\n");
+    // A fence longer than any backtick run inside the diff. A context line
+    // that is itself ``` would otherwise close the block early and the rest of
+    // the diff would read as prose.
+    let fence = "`".repeat(longest_backtick_run(diff).max(2) + 1);
+    p.push_str("\n\n## Diff\n\n");
+    p.push_str(&fence);
+    p.push_str("diff\n");
     p.push_str(diff);
     if !diff.ends_with('\n') {
         p.push('\n');
     }
-    p.push_str("```\n");
+    p.push_str(&fence);
+    p.push('\n');
     p
+}
+
+fn longest_backtick_run(s: &str) -> usize {
+    let (mut longest, mut current) = (0, 0);
+    for c in s.chars() {
+        if c == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 #[cfg(test)]
@@ -79,5 +99,17 @@ mod tests {
         assert!(!ro.contains("## Reviewer focus"));
         // An unterminated diff still closes its fence.
         assert!(ro.ends_with("```diff\nd\n```\n"));
+    }
+
+    #[test]
+    fn a_diff_containing_a_fence_cannot_close_the_block() {
+        // A markdown file whose own fences are in the diff is the ordinary
+        // case here -- this repo's prompts are markdown.
+        let diff = "+```rust\n+code\n+```\n";
+        let p = build("t", false, None, diff);
+        assert!(p.contains("````diff\n"), "fence must outgrow the diff: {p}");
+        assert!(p.ends_with("````\n"));
+        assert_eq!(longest_backtick_run("no ticks"), 0);
+        assert_eq!(longest_backtick_run("a ``` b ```` c"), 4);
     }
 }
