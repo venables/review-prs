@@ -312,6 +312,25 @@ EOF
 write_fake_dashp() {
   cat >"$SANDBOX/bin/dash-p" <<'EOF'
 #!/usr/bin/env bash
+
+# Append one line to a shared log, atomically.
+#
+# --jobs 2 means two of these run at once, and each call line carries the whole
+# argv including the ~900-character trailer instruction. A plain `>>` of that
+# from two processes can split mid-write, which leaves a fragment in the log
+# and fails whichever assertion greps for a flag that landed in the other half
+# -- intermittently, which is the worst way to fail. mkdir is atomic on every
+# filesystem that matters, so it is the lock.
+log_line() {
+  local file="$1" line="$2" waited=0
+  while ! mkdir "$file.lock" 2>/dev/null; do
+    sleep 0.01
+    waited=$((waited + 1))
+    [[ "$waited" -gt 500 ]] && break
+  done
+  printf '%s\n' "$line" >>"$file"
+  rmdir "$file.lock" 2>/dev/null || true
+}
 # Stands in for dash-p, which drives claude for the built-in reviewer: records
 # the call, writes the meta envelope, and reports failures the way the real
 # one does -- in its exit code (0 ok, 10 agent-error), with the session id in
@@ -323,8 +342,8 @@ set -uo pipefail
 prompt="${!#}"
 n="${prompt##* }"
 
-printf '%s\n' "$*" >>"$CLAUDE_LOG"
-printf 'start %s\n' "$n" >>"$CLAUDE_LOG.events"
+log_line "$CLAUDE_LOG" "$*"
+log_line "$CLAUDE_LOG.events" "start $n"
 
 meta=""
 sid=""
@@ -381,7 +400,7 @@ case " ${FAKE_CLAUDE_GARBAGE:-} " in
   *" $n "*) status=10; label="agent-error"; sid="" ;;
 esac
 
-printf 'end %s\n' "$n" >>"$CLAUDE_LOG.events"
+log_line "$CLAUDE_LOG.events" "end $n"
 
 if [[ -n "$meta" ]]; then
   printf '{"harness":"claude","drive":"print","exit_status":"%s","session_id":"%s","total_cost_usd":0.42,"num_turns":3,"duration_ms":10,"model_resolved":"claude-fable-5"}\n' \
