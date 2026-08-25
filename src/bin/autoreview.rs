@@ -30,7 +30,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // gum is required by the picker alone, so a sweep runs on a box that has
     // never seen it. pgrep is not optional: refusing to resume a session
     // another process holds is a safety check, not a nicety.
-    repo::require_deps(&["gh", "pgrep"])?;
+    repo::require_deps(&["gh", "git", "pgrep"])?;
     let dashp = repo::dashp_bin();
     if cfg.review_cmd.is_none() {
         repo::require_deps(&[dashp.as_str()])?;

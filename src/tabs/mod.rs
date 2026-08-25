@@ -25,7 +25,7 @@ fn select_opts(cfg: &Config) -> select::Opts<'static> {
 pub fn run(cfg: &Config) -> Result<i32> {
     // gum is the picker's dependency alone, so an --auto sweep runs on a box
     // that has never seen it; picker::run asks for it when it is reached.
-    repo::require_deps(&["gh"])?;
+    repo::require_deps(&["gh", "git"])?;
 
     let ctx = repo::load()?;
     let Some((numbers, _titles)) = select::run(&ctx, &select_opts(cfg))? else {
