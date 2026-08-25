@@ -1,5 +1,5 @@
-//! Dependency checks and repo/user context, mirroring lib/repo.sh. The gh
-//! argv shapes are load-bearing: the test suite's fake gh dispatches on them.
+//! Dependency checks and repo/user context. The gh argv shapes are
+//! load-bearing: the test suite's fake gh dispatches on them.
 
 use anyhow::{Result, bail};
 use std::path::PathBuf;

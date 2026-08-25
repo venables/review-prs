@@ -1,8 +1,7 @@
-//! Flags, env defaults and validation, mirroring the bash arg loop exactly --
-//! the same spellings accepted, the same messages on the same exit codes. The
-//! parser is hand-rolled rather than clap: the contract is byte-exact error
-//! strings, exit 1 (not 2) on bad input, and an `=`-only value form for
-//! --babysit, all of which a 20-branch match gives for free.
+//! autoreview's flags, env defaults and validation. Hand-rolled rather than
+//! clap: the contract is byte-exact error strings, exit 1 (not 2) on bad
+//! input, and an `=`-only value form for --babysit, all of which a 20-branch
+//! match gives for free. review-prs has its own parser in tabs::cli.
 
 use crate::interval::{self, Interval};
 use std::path::PathBuf;
@@ -356,7 +355,9 @@ mod tests {
         assert_eq!(c.babysit.unwrap().normalized, "15m");
         let c = cfg(&["--babysit"]);
         assert_eq!(c.babysit.unwrap().normalized, "30m");
-        // "--babysit 15" leaves 15 a stray argument, exactly as bash did.
+        // "--babysit 15" leaves 15 a stray argument: the value form is
+        // "--babysit=15", and an interval that silently did nothing would be
+        // worse than a refusal.
         let e = run(&["--babysit", "15"]).err().unwrap();
         assert_eq!(e.msg, "unknown arg: 15");
         assert!(e.show_help);

@@ -4,10 +4,9 @@
 //! The built-in reviewer runs through dash-p, which owns the hard parts: it
 //! setsids claude, enforces the timeout with killpg, and reports the truth in
 //! a stable exit code -- 0 ok, 10 agent-error (including an is_error turn and
-//! garbage output), 20 timeout. The bash version's envelope-sniffing
-//! (job_reported_error, job_session_id fallbacks) disappears into that
-//! contract. An override is judged by its exit status alone; prose on stdout
-//! is its normal shape, not a failure.
+//! garbage output), 20 timeout -- so there is no envelope to sniff for a
+//! failure it has already reported. An override is judged by its exit status
+//! alone; prose on stdout is its normal shape, not a failure.
 
 use crate::cli::Config;
 use crate::report::Trailer;

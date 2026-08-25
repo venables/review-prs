@@ -1,7 +1,7 @@
-//! Review-session continuity, mirroring lib/session.sh -- byte for byte,
-//! because review-prs derives ids with that library and the two tools must
-//! agree on which session a PR belongs to. The golden tests below pin this
-//! module to lib/session.sh's actual output; change both together.
+//! Review-session continuity: the one derivation both front-ends use, so
+//! they always agree on which session a PR belongs to. The golden tests below
+//! pin the ids -- they are what a review already on disk was filed under, so
+//! changing this derivation orphans every existing session.
 //!
 //! A PR's session id is derived from the repo directory plus owner/name#NUM
 //! rather than recorded in a state file: the mapping is stable across runs
@@ -63,8 +63,7 @@ pub fn session_exists(id: &str) -> bool {
 /// treats an id as taken once the transcript file exists, so it does not stop
 /// a second process from reopening a live one -- two agents would then write
 /// one transcript. pgrep matches the id on any command line; a false match
-/// only costs a fresh review, so it fails safe. Kept as pgrep (not a process
-/// crate) for parity with lib/session.sh, which review-prs still uses.
+/// only costs a fresh review, so it fails safe.
 pub fn session_in_use(id: &str) -> bool {
     if id.is_empty() {
         return false;
@@ -103,7 +102,7 @@ pub struct PlannedSession {
     pub note: Option<String>,
 }
 
-/// The decision table from lib/session.sh's plan_session. Without --continue
+/// How a PR attaches to a session. Without --continue
 /// an existing session gets no flag at all and claude allocates a fresh id:
 /// reusing a taken id is a hard error, and quietly resuming would be a
 /// surprise.
@@ -154,12 +153,12 @@ pub fn plan_session(
 mod tests {
     use super::*;
 
-    // Golden values generated from lib/session.sh (md5 of
-    // "review-prs:<root>:<owner>/<name>#<n>", nibbles 12 and 16 dropped for
-    // the version/variant literals). If these fail, the two derivations have
-    // diverged and review-prs and autoreview no longer agree on sessions.
+    // md5 of "review-prs:<root>:<owner>/<name>#<n>", nibbles 12 and 16
+    // replaced by the version/variant literals. Pinned because sessions
+    // already on disk were filed under these ids: changing the derivation
+    // does not fail loudly, it quietly stops finding anyone's earlier review.
     #[test]
-    fn golden_session_ids_match_lib_session_sh() {
+    fn golden_session_ids_are_stable() {
         assert_eq!(
             pr_session_id(Path::new("/sandbox/repo"), "acme", "widgets", 9),
             "7442b624-5cba-5d44-ae67-9c390cfe70a1"

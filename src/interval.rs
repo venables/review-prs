@@ -1,6 +1,6 @@
-//! Babysit-interval parsing, mirroring lib/interval.sh. The two are a
-//! contract pair: review-prs normalizes the same strings for its tabs, so a
-//! value one accepts and the other rejects would split the tools' behavior.
+//! Babysit-interval parsing, shared by both front-ends: review-prs
+//! normalizes the same strings for its tabs that autoreview does for its
+//! loop, so a value one accepts and the other rejects cannot happen.
 
 /// A validated interval: the normalized display string ("30m", "1h") and its
 /// length in seconds.
@@ -36,8 +36,7 @@ pub fn normalize(raw: &str) -> Result<Interval, String> {
 
     // Checked arithmetic, and a parse that can refuse: an absurd interval
     // must not wrap into a near-zero sleep -- that is the hot loop this whole
-    // function exists to prevent. (The bash side would hand such a value to
-    // sleep, which refuses it; rejecting here is the same outcome, earlier.)
+    // function exists to prevent.
     let reject = || {
         format!(
             "error: invalid babysit interval: \"{raw}\" (expected a positive duration, e.g. 30, 30m, 1h)"

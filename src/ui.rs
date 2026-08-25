@@ -7,9 +7,8 @@
 //! cursor to move, so state changes print one plain line each and the summary
 //! is a plain aligned table.
 //!
-//! The plain strings are a contract: the bash test suite greps for them
-//! verbatim, and so do people's eyes -- keep them byte-identical across
-//! refactors.
+//! The plain strings are a contract: the test suite greps for them verbatim,
+//! and so do people's eyes -- keep them byte-identical across refactors.
 
 use crate::job::{Job, JobState};
 use crate::report::{Panelist, Trailer};
@@ -605,7 +604,7 @@ mod tests {
     use crate::report::parse_trailer;
 
     #[test]
-    fn durations_are_byte_identical_to_bash() {
+    fn durations_read_as_written() {
         assert_eq!(fmt_dur(3), "3s");
         assert_eq!(fmt_dur(63), "1m03s");
         assert_eq!(fmt_dur(252), "4m12s");

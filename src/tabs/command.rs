@@ -10,8 +10,8 @@ use crate::tabs::cli::Config;
 use std::path::Path;
 
 /// POSIX-safe quoting for the two strings that ride into the tab's shell: the
-/// repo path and the session id. This is what bash's `printf %q` did -- a path
-/// with a space or a quote in it has to stay one word.
+/// repo path and the session id. A path with a space or a quote in it has to
+/// reach the tab as one word.
 pub fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()
         && s.bytes()
