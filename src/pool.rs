@@ -1,9 +1,8 @@
 //! The pass engine: a bounded pool of review subprocesses, driven by events
 //! rather than polling. Each job gets a monitor thread whose entire body is
-//! `child.wait()` -- that one call replaces the bash version's status files,
-//! its zombie detection, and its "job vanished" special case: a job killed
-//! from outside is simply a wait() that returns a signal-death status, and
-//! the slot frees immediately.
+//! `child.wait()` -- which is what makes a job killed from outside ordinary
+//! rather than a special case: it is a wait() that returns a signal-death
+//! status, and the slot frees immediately.
 
 use crate::cli::Config;
 use crate::job::{self, GUARD_GRACE_SECS, Job, JobState};

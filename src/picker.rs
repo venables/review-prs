@@ -1,7 +1,6 @@
-//! The interactive picker, still driven through `gum choose` -- same UX as
-//! review-prs, and gum is required only here, so the default sweep runs on a
-//! box that has never seen it. The row alignment and the dimming are native
-//! now (no `column`, no `gum style` subprocess).
+//! The interactive picker, driven through `gum choose`. gum is required only
+//! here, so a sweep runs on a box that has never seen it. The row alignment
+//! and the dimming are native -- no `column`, no `gum style` subprocess.
 
 use crate::prlist::Row;
 use crate::repo;

@@ -1,6 +1,5 @@
-//! Fetching, ranking and selecting the PRs to review, mirroring
-//! lib/pr-list.sh (which review-prs still uses -- the two must agree on what
-//! is worth reviewing).
+//! Fetching and ranking the PRs worth reviewing. Both front-ends read this
+//! one list, so they cannot disagree about what is actionable.
 
 use crate::repo::RepoContext;
 use anyhow::{Context, Result, bail};
@@ -8,15 +7,14 @@ use serde::Deserialize;
 use std::process::Command;
 
 /// Author logins treated as bots: hidden unless --dependabot, dimmed when
-/// shown. An anchored prefix match, like lib/pr-list.sh's `^dependabot`.
+/// shown. An anchored prefix match: extend it as more coding bots appear.
 const BOT_LOGIN_PREFIX: &str = "dependabot";
 
 pub fn is_bot(login: &str) -> bool {
     login.starts_with(BOT_LOGIN_PREFIX)
 }
 
-// The same query lib/pr-list.sh sends: one GraphQL call for the open PRs and
-// enough activity to rank engagement.
+// One GraphQL call for the open PRs, and enough activity to rank engagement.
 const QUERY: &str = "
       query($owner:String!, $name:String!) {
         repository(owner:$owner, name:$name) {
@@ -237,7 +235,7 @@ pub fn parse_iso(ts: &str) -> Option<i64> {
     Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
 }
 
-/// "5h ago" shapes, floored like lib/pr-list.sh's jq rel().
+/// "5h ago" shapes, floored to the unit.
 pub fn rel(now_epoch: i64, ts: &str) -> String {
     let Some(t) = parse_iso(ts) else {
         return "-".into();
@@ -427,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_match_the_bash_pipeline() {
+    fn hidden_prs_stay_hidden() {
         let nums: Vec<u64> = filtered(false, false).iter().map(|p| p.number).collect();
         assert_eq!(nums, vec![9, 8, 6]);
         let nums: Vec<u64> = filtered(true, true).iter().map(|p| p.number).collect();

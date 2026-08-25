@@ -147,7 +147,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     let unattended = auto || babysit;
     let review_cmd = if unattended { auto_cmd } else { cmd };
 
-    // `-` not `:-` in the bash this replaces: an explicitly empty
+    // Unset and empty mean different things here: an explicitly empty
     // REVIEW_PRS_WORKSPACE= opts out entirely, leaving the workspace you
     // launched from with the title you gave it.
     let workspace = match env("REVIEW_PRS_WORKSPACE") {
@@ -215,7 +215,7 @@ mod tests {
     fn babysit_takes_its_value_only_with_equals() {
         assert_eq!(cfg(&["--babysit=15"]).babysit.unwrap().normalized, "15m");
         assert_eq!(cfg(&["--babysit"]).babysit.unwrap().normalized, "30m");
-        // "--babysit 15" leaves 15 a stray argument, exactly as bash did.
+        // "--babysit 15" leaves 15 a stray argument, as in autoreview.
         let e = run_env(&["--babysit", "15"], &[]).err().unwrap();
         assert_eq!(e.msg, "unknown arg: 15");
         assert!(e.show_help);
