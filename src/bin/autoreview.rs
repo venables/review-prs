@@ -74,6 +74,29 @@ fn report_intake(intake: &queue::Intake, cfg: &Config) {
     }
 }
 
+/// Which of these PRs are still worth watching. Approved, merged and closed
+/// are all finished, and finished is final for the run -- the sweep lags, and
+/// a stale list must not re-queue a PR on the interval that dropped it.
+fn drop_finished(prs: &[u64], tracker: &mut Queue) -> Vec<u64> {
+    let mut open = Vec::new();
+    for &n in prs {
+        if let Some(why) = prlist::pr_babysit_done(n) {
+            println!("\nPR #{n} is {why}; dropping it from the babysit loop");
+            tracker.mark_done(n);
+        } else {
+            open.push(n);
+        }
+    }
+    open
+}
+
+/// True when no PR on the watch list could ever be reviewed again: the list
+/// is empty, or everything left on it has had all its passes. Waiting on a
+/// capped PR is waiting for something that cannot happen.
+fn nothing_left(watching: &[u64], tracker: &Queue) -> bool {
+    watching.iter().all(|&n| tracker.is_capped(n))
+}
+
 fn run(cfg: &Config) -> anyhow::Result<i32> {
     // gum is required by the picker alone, so a sweep runs on a box that has
     // never seen it. pgrep is not optional: refusing to resume a session
@@ -103,7 +126,13 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     let mut cfg = cfg.clone();
     let mut queue = numbers;
     let mut titles = titles;
-    let mut tracker = Queue::new(cfg.max_passes);
+    // A --pick run may never grow past what was picked; a sweep may.
+    let picked = cfg.pick.then(|| queue.clone());
+    let mut tracker = Queue::new(cfg.max_passes, picked);
+    // Every PR this run is responsible for, which is not the same as the
+    // queue: a PR that went quiet is still open, still ours, and still worth
+    // waiting on. Rebuilding this from the last pass's queue would forget it.
+    let mut watching = queue.clone();
     let mut refresh_failures = 0u32;
     let mut pass = 1u32;
     let (failures, total) = loop {
@@ -117,63 +146,131 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             break (failures, jobs.len());
         };
 
-        // Read back from GitHub rather than inferred from what the agent
-        // said: the review either landed as an approval or it did not, and a
-        // run that believed its own report would babysit a PR it never
-        // actually approved.
-        let mut still_open = Vec::new();
-        for &n in &queue {
-            if let Some(why) = prlist::pr_babysit_done(n) {
-                println!("\nPR #{n} is {why}; dropping it from the babysit loop");
-                tracker.mark_done(n);
-            } else {
-                still_open.push(n);
-            }
-        }
-
-        // Then look for work that did not exist when the run started. A PR
-        // opened while the last pass ran would otherwise wait for a whole new
-        // invocation of autoreview.
-        let fresh = match actionable_now(&cfg, &ctx) {
-            Ok((numbers, fresh_titles)) => {
-                refresh_failures = 0;
-                titles.extend(fresh_titles);
-                numbers
-            }
-            Err(e) => {
-                // A transient API error must not end a loop that is meant to
-                // outlive one, and must not silently narrow it either: keep
-                // what is already queued and look again next interval.
-                refresh_failures += 1;
-                eprintln!(
-                    "\nwarning: could not refresh the PR list ({e:#}); keeping the current queue"
-                );
-                if refresh_failures >= 3 {
-                    eprintln!("error: the PR list has failed to refresh 3 times; stopping");
-                    break (failures, jobs.len());
-                }
-                Vec::new()
-            }
-        };
-
-        let intake = tracker.next(&still_open, &fresh);
-        report_intake(&intake, &cfg);
-        if intake.queue.is_empty() {
-            println!("\nnothing left to babysit");
-            break (failures, jobs.len());
-        }
-        queue = intake.queue;
         // The first pass recorded each review's session; every later pass
         // resumes it whether or not --continue was passed. Re-reviewing from
         // scratch each interval would throw away the findings the author is
         // in the middle of answering.
         cfg.continue_sessions = true;
-        println!(
-            "\nnext check in {} ({} left)",
-            babysit.normalized,
-            ui::count(queue.len(), "PR")
-        );
-        interruptible_sleep(&rx, std::time::Duration::from_secs(babysit.secs), &ui);
+
+        // One place decides what happens next, and it always looks before it
+        // decides: a PR opened during the pass that just ran is work, even
+        // when everything this run was watching has finished.
+        // Whether this stretch of waiting has already spent an interval, so
+        // work found by an idle poll is reviewed now rather than an interval
+        // later: the interval exists to give an author time to answer, and a
+        // PR that just arrived has nothing to answer.
+        let mut already_waited = false;
+        let mut idle_polls = 0u32;
+        let next_queue = loop {
+            // The watch list shrinks only here, and only on GitHub's word:
+            // the review either landed as an approval or it did not, and a
+            // run that believed its own report would babysit a PR it never
+            // approved.
+            watching = drop_finished(&watching, &mut tracker);
+            let exhausted = nothing_left(&watching, &tracker);
+
+            let fresh = match actionable_now(&cfg, &ctx) {
+                Ok((numbers, fresh_titles)) => {
+                    refresh_failures = 0;
+                    titles.extend(fresh_titles);
+                    numbers
+                }
+                Err(e) => {
+                    // A run with nothing left to watch is finished whatever
+                    // the list says, so a failed look here must not turn it
+                    // into a failed run.
+                    if exhausted {
+                        // Say the look failed even though the answer does not
+                        // depend on it: otherwise the log shows a clean end
+                        // and no hint that a PR opened during the last pass
+                        // was never looked for.
+                        eprintln!("\nwarning: could not refresh the PR list ({e:#})");
+                        println!("nothing left to babysit");
+                        break None;
+                    }
+                    // Otherwise conclude nothing from a failed look: deciding
+                    // "nothing left to babysit" would end the run on one bad
+                    // API call and report it as a finished one.
+                    refresh_failures += 1;
+                    eprintln!("\nwarning: could not refresh the PR list ({e:#})");
+                    if refresh_failures >= 3 {
+                        eprintln!("error: the PR list has failed to refresh 3 times; giving up");
+                        break None;
+                    }
+                    println!("looking again in {}", babysit.normalized);
+                    interruptible_sleep(&rx, std::time::Duration::from_secs(babysit.secs), &ui);
+                    already_waited = true;
+                    continue;
+                }
+            };
+
+            let intake = tracker.next(&watching, &fresh);
+            // A PR that joined is this run's responsibility from now on, so it
+            // is watched until it is approved or closed -- not only while it
+            // happens to be actionable.
+            watching.extend(intake.joined.iter().copied());
+            report_intake(&intake, &cfg);
+            if !intake.queue.is_empty() {
+                break Some(intake.queue);
+            }
+            if exhausted {
+                // Nothing open to wait for, or nothing left that may be
+                // reviewed again. No interval would change that.
+                println!("\nnothing left to babysit");
+                break None;
+            }
+            // An open PR nobody is touching must not keep a process alive for
+            // ever -- least of all one cron started, where the next run would
+            // pile on top of this one.
+            //
+            // The check right after a pass does not count. Our own review is
+            // the latest activity on everything we just reviewed, so that one
+            // is idle by construction and says nothing about whether the
+            // author is coming back. Counting it would make --max-idle 1 stop
+            // without ever waiting.
+            if already_waited {
+                idle_polls += 1;
+            }
+            if idle_polls >= cfg.max_idle {
+                println!(
+                    "\nnothing has changed in {} since the last review; stopping with {} still open",
+                    ui::count(idle_polls as usize, "idle check"),
+                    ui::count(watching.len(), "PR")
+                );
+                break None;
+            }
+            println!(
+                "\nnothing to review right now; next check in {} ({} still open)",
+                babysit.normalized,
+                ui::count(watching.len(), "PR")
+            );
+            interruptible_sleep(&rx, std::time::Duration::from_secs(babysit.secs), &ui);
+            already_waited = true;
+        };
+
+        let Some(next) = next_queue else {
+            // Either everything finished, or the list stopped answering. The
+            // first is a clean end; the second is not, and a cron wrapper has
+            // to be able to tell them apart.
+            if refresh_failures >= 3 {
+                ui.show_cursor();
+                return Ok(1);
+            }
+            break (failures, jobs.len());
+        };
+        queue = next;
+        // The interval is what gives the author time to answer, so it is
+        // spent before the next pass rather than before deciding there is one
+        // -- unless the wait above already spent one, in which case spending
+        // another would delay the work by twice the interval.
+        if !already_waited {
+            println!(
+                "\nnext check in {} ({} left)",
+                babysit.normalized,
+                ui::count(watching.len(), "PR")
+            );
+            interruptible_sleep(&rx, std::time::Duration::from_secs(babysit.secs), &ui);
+        }
         pass += 1;
     };
     ui.show_cursor();

@@ -230,7 +230,7 @@ an old alias or cron line keeps working — they just name the default now.
 
 It takes the same selection flags as `review-prs` (`--continue`, `--all`,
 `--dependabot`, `--babysit`) plus six of its own: `--pick`, `--jobs`,
-`--timeout`, `--budget`, `--log-dir` and `--max-passes`.
+`--timeout`, `--budget`, `--log-dir`, `--max-passes` and `--max-idle`.
 
 On a terminal the pass is a live board -- finished reviews settle into
 permanent result lines, running ones spin, and a progress bar tracks the
@@ -383,13 +383,28 @@ posts becomes *your* latest activity on that PR, so an author pushing a fix
 afterwards flips it back to `UPDATED` on its own. The sweep filter already
 means "actionable now".
 
-### The re-review cap
+A PR is queued **only while the sweep ranks it actionable**. After a review,
+that review is your own latest activity, so an untouched PR goes quiet by
+itself and costs nothing until its author moves — and comes back the moment
+they push.
 
-Every review is activity on the PR, so an author who answers one makes it
-actionable again — which would make autoreview review it again, unattended, for
-as long as the loop runs. `--max-passes` (default 3, or
-`$AUTOREVIEW_MAX_PASSES`) is the ceiling: after that many passes on one PR in
-one run, it says so and leaves it alone.
+`--pick --babysit` stays inside what you picked. A run told to watch two PRs
+does not quietly grow to five.
+
+### The two bounds
+
+Both exist because this runs unattended, and both end the run cleanly:
+
+- `--max-passes` (default 3, or `$AUTOREVIEW_MAX_PASSES`) — every review is
+  activity on the PR, so an author who answers one makes it actionable again,
+  which would make autoreview review it again for as long as the loop runs.
+  After that many passes on one PR, it says so and leaves it alone.
+- `--max-idle` (default 3, or `$AUTOREVIEW_MAX_IDLE`) — how many checks in a
+  row may find nothing to do. A PR nobody is touching should not keep a process
+  alive forever, least of all one cron started, where the next run would pile
+  on top of this one. The check straight after a pass does not count: your own
+  review is the newest thing on every PR you just reviewed, so that one is idle
+  by construction.
 
 A transient API error does not end the loop and does not silently narrow it
 either: the refresh keeps the current queue and tries again next interval,
