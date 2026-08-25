@@ -4,7 +4,8 @@ Pick open GitHub PRs from a multi-select list and fan each one out into its own
 terminal tab running a review command per PR. Built for batch-reviewing a repo's
 open pull requests without manually opening tabs and typing commands.
 
-Two entry points, same PR list:
+Two binaries over one library, so they cannot disagree about which PRs are
+worth reviewing or which session a PR belongs to:
 
 | Command                     | Runs each review in          | Use when                                                                |
 | --------------------------- | ---------------------------- | ----------------------------------------------------------------------- |
@@ -29,14 +30,12 @@ with a headless subprocess per PR.
 ## Requirements
 
 - [`gh`](https://cli.github.com) — authenticated (`gh auth login`)
-- [`gum`](https://github.com/charmbracelet/gum) — the interactive picker.
-  `autoreview` only picks under `--pick`, so a plain sweep does not need gum.
+- [`gum`](https://github.com/charmbracelet/gum) — the interactive picker only.
+  A sweep (`review-prs --auto`, plain `autoreview`) never reaches it.
 - [`dash-p`](https://github.com/venabots/dash-p) — **`autoreview` only**: the
   built-in reviewer runs through it (`brew install venabots/tap/dash-p`; set
   `$DASHP_BIN` to point elsewhere). Not needed when `$AUTOREVIEW_CMD` replaces
   the reviewer.
-- [`jq`](https://jqlang.github.io/jq/) — **`review-prs` only**: `autoreview`
-  parses JSON natively.
 - `pgrep` — refuses to resume a review session another process still holds;
   without it `--continue` loses that guard in both tools, and `autoreview`
   requires it. Standard on macOS; `procps` on slim Linux images.
@@ -59,14 +58,11 @@ brew install venabots/tap/review-prs
 
 ```sh
 git clone git@github.com:venabots/review-prs.git
-ln -s "$PWD/review-prs/review-prs" /usr/local/bin/review-prs
-(cd review-prs && cargo build --release)
-ln -s "$PWD/review-prs/target/release/autoreview" /usr/local/bin/autoreview
+cargo install --path review-prs
 ```
 
-Symlinks are fine: `review-prs` resolves itself through any links to find the
-shared `lib/` next to the real file — do not copy the script out of the
-checkout on its own. `autoreview` is a self-contained binary.
+That installs both binaries. Both are self-contained: nothing is read from the
+checkout at runtime, so a copy or a symlink anywhere on `$PATH` works.
 
 ## Usage
 
@@ -138,7 +134,7 @@ claude --dangerously-skip-permissions --session-id <uuid> "pr-review-tab <number
 That skill runs an auto-review and, **when the PR is approved, closes its tab**
 so a finished review cleans up after itself. (Tabs are closed via the enclosing
 multiplexer — `herdr tab close` / `cmux close-surface` — from inside the tab,
-which is why the behavior lives in the skill, not this script.)
+which is why the behavior lives in the skill, not in review-prs.)
 
 ### Babysit mode
 
@@ -205,14 +201,14 @@ Two limits worth knowing:
 
 Your own PRs are always excluded — this tool is for reviewing others' work.
 Dependabot PRs are hidden by default; pass `--dependabot` to include them, where
-they appear dimmed to mark them as lower-priority. (The bot match is a single
-anchored regex in the script — extend it as more AI coding bots show up.)
+they appear dimmed to mark them as lower-priority. (The bot match is one
+anchored prefix in `src/prlist.rs` — extend it as more AI coding bots show up.)
 
 ## autoreview
 
-`autoreview` reviews the same PRs without tabs. It is a Rust binary; each
-review runs as a [dash-p](https://github.com/venabots/dash-p) subprocess
-driving claude headlessly. The run shows a live per-PR board, reads each
+`autoreview` reviews the same PRs without tabs. Each review runs as a
+[dash-p](https://github.com/venabots/dash-p) subprocess driving claude
+headlessly. The run shows a live per-PR board, reads each
 review's verdict back from GitHub when it finishes, and ends with a summary
 of verdicts, findings, models and cost. It exits nonzero if any review
 failed.
@@ -370,8 +366,9 @@ landed as an approval or it did not. A PR that is closed, or merged without an
 approving review, is dropped too; waiting for an approval that is never coming
 would re-review it on every interval forever.
 
-The loop is this script, not an in-session `/loop` inside a tab, so an interval
-that never converges is one process you can see and kill. Interrupting it stops
+The loop is the autoreview process itself, not an in-session `/loop` inside a
+tab, so an interval that never converges is one process you can see and kill.
+Interrupting it stops
 the running reviews too, along with their children: an orphan keeps spending and
 keeps holding its session open, which would make the next `--continue` refuse to
 resume it.
@@ -404,9 +401,9 @@ AUTOREVIEW_CMD='gh pr checkout {} && my-review {}' autoreview --pick
 
 An override owns its own session handling and receives
 `$REVIEW_PRS_SESSION_ID` and `$REVIEW_PRS_SESSION_RESUME` — the same contract
-`review-prs` uses, so one wrapper works with both. Unlike `review-prs`, which
-can only reach a new tab through a command string, these arrive in the child's
-real environment. Cost, session and model are dash-p's accounting, so the
+`review-prs` uses, so one wrapper works with both. Here they arrive in the
+child's real environment; `review-prs` can only reach a new tab through a
+command string, so it exports them there instead. Cost, session and model are dash-p's accounting, so the
 summary shows `-` for them under an overridden reviewer -- it owns its own
 sessions -- and the trailer is not read either. The verdict column still
 works: it is read back from GitHub, which does not care who reviewed.
@@ -490,41 +487,50 @@ bash tests/run.sh
 
 ### Layout
 
+One crate, one library, two binaries:
+
 ```
-review-prs        bash entry point: the picker and the terminal-tab fan-out
-src/              rust entry point: autoreview, the headless runner
-lib/repo.sh       dependency checks, repo and user context (review-prs)
-lib/pr-list.sh    the GraphQL query, ranking, the picker, PR selection
-lib/session.sh    derived session ids, and how a PR attaches to one
-lib/interval.sh   babysit-interval parsing
+src/lib.rs         the shared core both binaries are built on
+src/bin/           the two entry points: review-prs, autoreview
+
+src/prlist.rs      the GraphQL query, engagement ranking, the sweep
+src/picker.rs      the gum picker
+src/select.rs      fetch, rank, then sweep or pick
+src/session.rs     derived session ids, and how a PR attaches to one
+src/repo.rs        dependency checks, repo and user context
+src/interval.rs    babysit-interval parsing
+src/cli.rs         autoreview's flags
+
+src/tabs/          review-prs: cli, per-tab command, terminal spawners
+src/pool.rs        autoreview: the event-driven job pool
+src/job.rs         autoreview: one review, spawned and classified
+src/report.rs      autoreview: verdict readback and the agent's trailer
+src/rundir.rs      autoreview: what one run writes under --log-dir
+src/ui.rs          autoreview: the live board and the summary
 ```
 
-The two tools must agree on what counts as an actionable PR and which session
-it belongs to, so `src/` mirrors `lib/` deliberately: the selection logic and
-the session-id derivation are the same in both, and golden unit tests pin the
-Rust ids to `lib/session.sh`'s output. Change either side with its mirror.
-Everything below the selection differs: `review-prs` spawns tabs, `autoreview`
-runs an event-driven job pool over dash-p subprocesses.
+The two tools have to agree on what counts as an actionable PR and which
+session it belongs to. That is not maintained — it is structural: they select
+and derive through the same code. What differs is everything below the
+selection, and it is what each binary is: `review-prs` spawns tabs,
+`autoreview` runs an event-driven job pool over dash-p subprocesses.
 
 ### Tests
 
 `tests/run.sh` builds the crate, runs `cargo test` (the unit layer: interval
-parsing, session goldens, ranking, CLI validation, argv shapes), then runs the
-bash suites — the real binaries against fake `gh`, `gum`, `cmux` and `dash-p`
-on `PATH`, inside a throwaway git repo, with `$CLAUDE_CONFIG_DIR` pointed at a
-throwaway session store. They never touch your repos, your Claude Code
-sessions, or GitHub. It finishes with `bash -n` over every script and
-`shellcheck -x` over `review-prs` — `-x` so it follows the `source=` directives
-into `lib/`, which is the only context where a library's globals are defined.
+parsing, session goldens, ranking, CLI validation, argv and tab-command
+shapes), then runs the bash suites — the real binaries against fake `gh`,
+`gum`, `cmux` and `dash-p` on `PATH`, inside a throwaway git repo, with
+`$CLAUDE_CONFIG_DIR` pointed at a throwaway session store. They never touch
+your repos, your Claude Code sessions, or GitHub. It finishes with `bash -n`
+and `shellcheck -x` over the suite itself, which is the only bash in the repo.
 
 The suite takes about a minute and a half, most of it one test: whether a
 babysit pass resumes the session the previous pass ran in can only be shown by
 running a second pass, and the shortest interval the tool accepts is a minute.
 
-CI runs the same command on macOS and Linux — macOS because it ships bash 3.2
-and catches bashisms `review-prs` must not use, Linux because it has `md5sum`
-rather than `md5` and so exercises the other branch of the hash helper that
-the bash side still carries.
+CI runs the same command on macOS and Linux. macOS is the primary target;
+Linux catches anything that quietly depended on it.
 
 ## License
 

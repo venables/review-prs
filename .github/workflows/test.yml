@@ -10,10 +10,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS is the primary target and ships bash 3.2, so it is the one that
-        # catches bashisms review-prs must not use. Linux runs md5sum instead
-        # of md5, which exercises the other branch of the bash hash helper (the
-        # rust autoreview hashes natively; golden tests keep the two aligned).
+        # macOS is the primary target; Linux catches anything that quietly
+        # depended on it. The test harness is bash 3.2 compatible because that
+        # is what macOS ships.
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
