@@ -10,6 +10,7 @@
 use crate::panel::cli::Config;
 use crate::panel::panelist::{self, Panelist};
 use crate::pool::stop_group;
+use crate::status::{Status, step};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Read;
@@ -196,7 +197,14 @@ fn never_ran(p: &Panelist, why: String, started: Instant) -> Outcome {
 /// Print one panelist's report as soon as it lands. Waiting for the slowest
 /// one is how a coordinator ends up staring at nothing for ten minutes while
 /// three reviews sit finished on disk.
-fn print_section(o: &Outcome) {
+///
+/// Suspended around the whole thing: the spinner draws on the last line of
+/// the terminal, and so does this.
+fn print_section(o: &Outcome, status: &Status) {
+    status.suspend(|| print_section_now(o));
+}
+
+fn print_section_now(o: &Outcome) {
     let exit = o.exit.map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
     // The model name is the panelist's own first line, so it is model output
     // too -- sanitized here and at the heartbeat below, or it is the one way
@@ -231,6 +239,7 @@ fn print_section(o: &Outcome) {
 /// Run every panelist, streaming reports, and return what each contributed.
 /// Order follows the panel list, not finishing order, so two runs of the same
 /// panel are comparable.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     panelists: &[Panelist],
     cwds: &[PathBuf],
@@ -239,6 +248,7 @@ pub fn run(
     prompt_path: &Path,
     out_dir: &Path,
     interrupted: &Arc<AtomicBool>,
+    status: &Status,
 ) -> Result<Vec<Outcome>> {
     let run = Run { cfg, dashp, prompt_path, out_dir };
     let mut running: Vec<Running> = Vec::new();
@@ -254,7 +264,7 @@ pub fn run(
             // Printed like any other panelist: stdout is the whole panel, and
             // a reader counting sections should not have to check stderr to
             // learn that one is missing.
-            print_section(&outcome);
+            print_section(&outcome, status);
             done.push(outcome);
             continue;
         }
@@ -268,7 +278,7 @@ pub fn run(
                 // One panelist that cannot start costs one voice, not the run.
                 eprintln!("panel: {} could not start: {e:#}", p.id);
                 let outcome = never_ran(p, format!("could not start: {e:#}"), started);
-                print_section(&outcome);
+                print_section(&outcome, status);
                 done.push(outcome);
             }
         }
@@ -291,12 +301,12 @@ pub fn run(
                     stop_group(r.pgid);
                     r.stopped = Some("interrupted");
                 }
-                let status = r.child.wait().ok().and_then(|s| s.code());
-                let outcome = finish(r, &panelists[r.idx], status);
+                let exit = r.child.wait().ok().and_then(|s| s.code());
+                let outcome = finish(r, &panelists[r.idx], exit);
                 // Printed like any other outcome. A panelist stopped mid-run
                 // may still have written most of a review, and dropping it
                 // from stdout would throw away work already paid for.
-                print_section(&outcome);
+                print_section(&outcome, status);
                 done.push(outcome);
             }
             break;
@@ -304,8 +314,8 @@ pub fn run(
 
         let mut still = Vec::new();
         for mut r in running {
-            let status = match r.child.try_wait() {
-                Ok(Some(status)) => Some(status.code()),
+            let finished = match r.child.try_wait() {
+                Ok(Some(code)) => Some(code.code()),
                 Ok(None) if Instant::now() >= r.deadline => {
                     // dash-p should have enforced its own timeout by now. It
                     // did not, so the group goes.
@@ -327,7 +337,7 @@ pub fn run(
                     Some(code)
                 }
             };
-            let Some(exit) = status else {
+            let Some(exit) = finished else {
                 still.push(r);
                 continue;
             };
@@ -346,17 +356,21 @@ pub fn run(
                     Ok(again) => still.push(again),
                     Err(e) => {
                         eprintln!("panel: {} could not be retried: {e:#}", p.id);
-                        print_section(&outcome);
+                        print_section(&outcome, status);
                         done.push(outcome);
                     }
                 }
             } else {
-                print_section(&outcome);
+                print_section(&outcome, status);
                 done.push(outcome);
             }
         }
         running = still;
         if !running.is_empty() {
+            // The long silence: every panelist is a model call, and the
+            // slowest decides the wall clock. Ticking says the run is alive.
+            let waited = running.iter().map(|r| r.started.elapsed().as_secs()).max().unwrap_or(0);
+            status.tick(step::reviewing(running.len(), waited));
             std::thread::sleep(Duration::from_millis(250));
         }
     }

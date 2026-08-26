@@ -129,6 +129,15 @@ assert_contains "the synthesis runs" "$out" "# Synthesis"
 assert_contains "...and its output is printed" "$out" "**Reviewing:** synthesized"
 assert_contains "the roster is reported" "$out" "3 of 3 answered"
 
+# What it is doing before the first report lands. Materializing a checkout per
+# panelist is the longest thing a panel run does before a model is asked
+# anything, and it used to be one line followed by a long silence.
+assert_contains "it says it is reading the repo" "$out" "reading the repo"
+assert_contains "...and building the diff" "$out" "building the diff"
+assert_contains "...and counts the worktrees as it makes them" \
+  "$out" "materializing worktree 1 of 4"
+assert_contains "...through the last one" "$out" "materializing worktree 4 of 4"
+
 # The prompt must never ride in argv: a large diff would fail the exec on
 # Linux with E2BIG, and macOS would never show it.
 assert_not_contains "the prompt is not an argument" "$(calls)" "Code review request"
