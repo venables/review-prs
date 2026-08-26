@@ -226,7 +226,8 @@ fn print_section_now(o: &Outcome) {
         println!();
     }
     // stderr, not stdout: a heartbeat is progress, and progress must not land
-    // in the middle of the report someone is piping to a file.
+    // in the middle of the report someone is piping to a file. Already inside
+    // the caller's suspend, so it does not need its own.
     eprintln!(
         "panel: {} ({}) done in {} (exit {})",
         o.id,
@@ -259,7 +260,7 @@ pub fn run(
         // arrived while the worktrees were being made would otherwise start
         // every panelist anyway and only then notice.
         if interrupted.load(Ordering::Relaxed) {
-            eprintln!("panel: interrupted before {} started", p.id);
+            status.say(format!("panel: interrupted before {} started", p.id));
             let outcome = never_ran(p, "interrupted before it started".into(), Instant::now());
             // Printed like any other panelist: stdout is the whole panel, and
             // a reader counting sections should not have to check stderr to
@@ -271,12 +272,12 @@ pub fn run(
         let started = Instant::now();
         match spawn(&run, idx, p, cwd, started, false) {
             Ok(r) => {
-                eprintln!("panel: {} started (cwd={})", p.id, cwd.display());
+                status.say(format!("panel: {} started (cwd={})", p.id, cwd.display()));
                 running.push(r);
             }
             Err(e) => {
                 // One panelist that cannot start costs one voice, not the run.
-                eprintln!("panel: {} could not start: {e:#}", p.id);
+                status.say(format!("panel: {} could not start: {e:#}", p.id));
                 let outcome = never_ran(p, format!("could not start: {e:#}"), started);
                 print_section(&outcome, status);
                 done.push(outcome);
@@ -290,7 +291,10 @@ pub fn run(
         // the user's real repository, and leaving them is worse than losing an
         // unfinished review.
         if interrupted.load(Ordering::Relaxed) {
-            eprintln!("\npanel: interrupted; stopping {}", crate::ui::count(running.len(), "panelist"));
+            status.say(format!(
+                "\npanel: interrupted; stopping {}",
+                crate::ui::count(running.len(), "panelist")
+            ));
             for r in &mut running {
                 // try_wait first, as the synthesis poll does: a panelist that
                 // already exited with a full report is finished, and marking
@@ -333,7 +337,7 @@ pub fn run(
                     // it, or it stays a zombie until this process exits.
                     let code = r.child.wait().ok().and_then(|s| s.code());
                     r.stopped = Some("could not be waited on");
-                    eprintln!("panel: {} could not be waited on: {e}", panelists[r.idx].id);
+                    status.say(format!("panel: {} could not be waited on: {e}", panelists[r.idx].id));
                     Some(code)
                 }
             };
@@ -345,17 +349,17 @@ pub fn run(
             let p = &panelists[r.idx];
             let outcome = finish(&mut r, p, exit);
             if worth_retrying(&outcome) && r.stopped.is_none() {
-                eprintln!(
+                status.say(format!(
                     "panel: {} produced nothing ({}); trying once more",
                     outcome.id,
                     outcome.failure.clone().unwrap_or_default()
-                );
+                ));
                 // The clock carries over: a retried panelist reports the time
                 // the user actually waited, not just the second attempt.
                 match spawn(&run, r.idx, p, &cwds[r.idx], r.started, true) {
                     Ok(again) => still.push(again),
                     Err(e) => {
-                        eprintln!("panel: {} could not be retried: {e:#}", p.id);
+                        status.say(format!("panel: {} could not be retried: {e:#}", p.id));
                         print_section(&outcome, status);
                         done.push(outcome);
                     }

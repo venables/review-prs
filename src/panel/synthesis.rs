@@ -165,7 +165,9 @@ pub fn run(
     if interrupted.load(Ordering::Relaxed) {
         anyhow::bail!("interrupted before the synthesis started");
     }
-    status.step(step::synthesizing(&cfg.synth_backend, 0));
+    // No elapsed time on the first line: off a terminal that is a log entry,
+    // and "0s" there reads as a measurement of something that finished.
+    status.step(format!("synthesizing with {}", cfg.synth_backend));
     let stdin = File::open(&prompt_path).context("opening the synthesis prompt")?;
     let mut argv = vec![
         "-H".to_string(),
