@@ -124,15 +124,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         }
     }
 
-    let ok = !timeout_raw.is_empty() && timeout_raw.bytes().all(|b| b.is_ascii_digit());
-    let timeout_secs = match timeout_raw.parse::<u64>() {
-        Ok(n) if ok && (1..=999_999_999).contains(&n) => n,
-        _ => {
-            return Err(err(format!(
-                "error: --timeout expects an integer >= 1, got \"{timeout_raw}\""
-            )));
-        }
-    };
+    // The shared checker, so a value over the maximum says that rather than
+    // reporting the wrong cause.
+    let timeout_secs = crate::cli::require_int("--timeout", &timeout_raw, 1, 999_999_999)?;
 
     // The synthesizer is a panelist spec too, so "claude:opus-4.8" works and
     // an unknown backend is refused the same way.
@@ -213,6 +207,10 @@ mod tests {
         assert_eq!(
             run(&["--timeout", "0"]).err().unwrap().msg,
             "error: --timeout expects an integer >= 1, got \"0\""
+        );
+        assert!(
+            run(&["--timeout", "9999999999"]).err().unwrap().msg.contains("expects an integer <="),
+            "a value over the maximum must say so, not blame the minimum"
         );
         assert_eq!(run(&["--base"]).err().unwrap().msg, "error: --base expects a value");
         assert!(run(&["--panelist", "nope"]).err().unwrap().msg.contains("unknown panelist backend"));

@@ -139,6 +139,12 @@ assert_contains "the diff target reaches the panelist" \
 assert_contains "a committed target gets write/exec in a worktree" \
   "$(calls)" "--dangerously-skip-permissions"
 assert_contains "...and runs in that worktree" "$(calls)" "worktree-codex"
+# The synthesis gets a worktree nobody reviewed in: a panelist may have edited
+# its own, and the synthesizer verifies findings against the reviewed code.
+assert_contains "the synthesis reads a tree no panelist touched" \
+  "$(calls)" "worktree-synthesis"
+assert_contains "...read-only, because verifying needs no writes" \
+  "$(calls)" "--perms read-only"
 assert_equals "no worktree is left behind" \
   "$(git -C "$SANDBOX/repo" worktree list | wc -l | tr -d ' ')" "1"
 
@@ -209,6 +215,11 @@ printf 'untracked\n' >"$SANDBOX/repo/new-file.txt"
 out="$(run_panel --staged)"
 assert_contains "an untracked-only change names the files" "$out" "new-file.txt"
 assert_contains "...and says how to include them" "$out" "git add"
+# A --base target needs a commit, not a stage: the advice follows the target.
+# --base HEAD is the empty-diff case for a committed target.
+out="$(run_panel --base HEAD)"
+assert_contains "a base target with an empty diff says to commit" \
+  "$out" "commit them first"
 rm -f "$SANDBOX/repo/new-file.txt"
 
 # --- Bad input --------------------------------------------------------------

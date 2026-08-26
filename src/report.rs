@@ -87,7 +87,9 @@ pub fn parse_trailer(answer: &str) -> Option<Trailer> {
 /// The trailer is agent output headed for the terminal, and this module's
 /// job is to distrust it: no field may flood the summary, and no panelist
 /// list may scroll it off the screen.
-const MAX_FIELD_CHARS: usize = 80;
+/// How long any one process-reported field may be before it is cut. Shared
+/// with panel, whose model names land in headings.
+pub const MAX_FIELD_CHARS: usize = 80;
 const MAX_PANELISTS: usize = 16;
 
 /// Agent-authored strings end up on the terminal, and control bytes in them
@@ -117,11 +119,20 @@ pub fn sanitize_for_display(s: &str) -> String {
     s.chars().filter(|c| !is_display_risky(*c)).collect()
 }
 
-/// The same filter over many lines. Model output is printed whole, and the
-/// newlines in it are not the risk -- the escape sequences and the bidi
-/// overrides that could repaint or reorder the report around them are.
+/// The same filter over many lines, keeping the whitespace that carries
+/// meaning. Newlines and tabs are not the risk -- the escape sequences and
+/// bidi overrides that could repaint or reorder the report around them are --
+/// and stripping tabs would quietly corrupt every Go or Makefile snippet a
+/// reviewer quotes back at you.
 pub fn sanitize_block(s: &str) -> String {
-    s.lines().map(sanitize_for_display).collect::<Vec<_>>().join("\n")
+    s.lines()
+        .map(|line| {
+            line.chars()
+                .filter(|c| *c == '\t' || !is_display_risky(*c))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_display_risky(c: char) -> bool {

@@ -61,10 +61,21 @@ pub fn run(cfg: &Config) -> Result<i32> {
     for spec in &specs {
         repo::require_deps(&[spec.backend.as_str()])?;
     }
+    // The synthesizer is a backend too, and finding out it is missing after
+    // every panelist has been paid for is the worst moment to find out.
+    if cfg.synthesize {
+        repo::require_deps(&[cfg.synth_backend.as_str()])?;
+    }
     let panel = panelist::resolve(&specs);
 
     let resolved = target::resolve(&cfg.target, &repo_root)?;
     cfg.isolated = resolved.isolated;
+
+    // Before anything is created: a signal during worktree setup would
+    // otherwise kill the process with the default disposition, Drop would
+    // never run, and the worktrees made so far would stay registered in the
+    // user's real repository.
+    let interrupted = crate::signals::install_flag();
 
     let dir = out_dir(&cfg)?;
     let prompt_text = prompt::build(
@@ -72,6 +83,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
         resolved.isolated,
         cfg.focus.as_deref(),
         &resolved.diff,
+        &resolved.untracked,
     );
     let prompt_path = dir.join("review.prompt");
     File::create(&prompt_path)
@@ -82,17 +94,47 @@ pub fn run(cfg: &Config) -> Result<i32> {
     // One worktree per panelist for a committed target; the user's own tree,
     // read-only, for uncommitted work. The value is held for the whole run so
     // the worktrees are removed even when a panelist fails.
-    let (_worktrees, cwds) = match &resolved.sha {
+    // One worktree per panelist, and one more for the synthesis: the
+    // synthesizer verifies findings against the code that was reviewed, and a
+    // panelist's worktree may hold that panelist's own investigation edits.
+    // For a working-tree target there is no ref to pin, so everyone reads the
+    // user's checkout.
+    let (_worktrees, cwds, synth_cwd) = match &resolved.sha {
         Some(sha) => {
-            eprintln!("panel: materializing {} ...", crate::ui::count(panel.len(), "worktree"));
-            let ids: Vec<String> = panel.iter().map(|p| p.id.clone()).collect();
-            let wts = Worktrees::create(&repo_root, &dir, &ids, sha)?;
-            let dirs = wts.dirs().to_vec();
-            (wts, dirs)
+            let mut ids: Vec<String> = panel.iter().map(|p| p.id.clone()).collect();
+            // Only when there is a synthesis to run: materializing a large
+            // repo one extra time is the slowest thing here, and --no-synthesis
+            // has nothing to put in it.
+            if cfg.synthesize {
+                ids.push("synthesis".into());
+            }
+            eprintln!("panel: materializing {} ...", crate::ui::count(ids.len(), "worktree"));
+            let wts = match Worktrees::create(&repo_root, &dir, &ids, sha, &interrupted) {
+                Ok(wts) => wts,
+                Err(e) => {
+                    // A ctrl-C reaches the running `git worktree add` too, so
+                    // this usually surfaces as git's own failure rather than
+                    // the explicit interrupt bail. Either way the user pressed
+                    // ctrl-C, and 130 is what says so.
+                    if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("panel: interrupted while creating worktrees");
+                        return Ok(130);
+                    }
+                    return Err(e);
+                }
+            };
+            let mut dirs = wts.dirs().to_vec();
+            let synth = if cfg.synthesize {
+                dirs.pop().expect("the synthesis worktree")
+            } else {
+                repo_root.clone()
+            };
+            (wts, dirs, synth)
         }
         None => (
             Worktrees::none(&repo_root),
             vec![repo_root.clone(); panel.len()],
+            repo_root.clone(),
         ),
     };
 
@@ -106,9 +148,6 @@ pub fn run(cfg: &Config) -> Result<i32> {
     }
     println!();
 
-    // Installed before anything is spawned: a ctrl-C between the first spawn
-    // and the poll loop must still be seen.
-    let interrupted = crate::signals::install_flag();
     let outcomes = fanout::run(&panel, &cwds, &cfg, &dashp, &prompt_path, &dir, &interrupted)?;
 
     if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
@@ -130,7 +169,29 @@ pub fn run(cfg: &Config) -> Result<i32> {
         return Ok(0);
     }
 
-    let report = synthesis::run(&resolved.label, &outcomes, &cfg, &dashp, &repo_root, &dir)?;
+    let report = match synthesis::run(
+        &resolved.label,
+        &resolved.diff,
+        &resolved.untracked,
+        &outcomes,
+        &cfg,
+        &dashp,
+        &synth_cwd,
+        &dir,
+        &interrupted,
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            // A synthesis this run stopped on purpose is an interrupt, not a
+            // failure: the panelist reports above are real and already
+            // printed, and 130 is what a shell expects.
+            if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("panel: interrupted during synthesis");
+                return Ok(130);
+            }
+            return Err(e);
+        }
+    };
     println!("# Synthesis\n");
     println!("{}", crate::report::sanitize_block(&report));
     println!();

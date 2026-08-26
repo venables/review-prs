@@ -167,12 +167,17 @@ fn env_nonempty(env: EnvFn, name: &str) -> Option<String> {
 /// cause. The max matters as much as the min: a --jobs past u32 would
 /// otherwise truncate to zero slots and stall the pool forever, and a
 /// timeout past the deadline arithmetic would overflow it.
-fn require_int(flag: &str, value: &str, min: u64, max: u64) -> Result<u64, CliError> {
+pub fn require_int(flag: &str, value: &str, min: u64, max: u64) -> Result<u64, CliError> {
     let ok = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
     let parsed = if ok { value.parse::<u64>().ok() } else { None };
     match parsed {
         Some(n) if n >= min && n <= max => Ok(n),
+        // Too big to parse at all is still too big: a digits-only value that
+        // overflows u64 must not be reported as below the minimum.
         Some(n) if n > max => Err(err(format!(
+            "error: {flag} expects an integer <= {max}, got \"{value}\""
+        ))),
+        None if ok => Err(err(format!(
             "error: {flag} expects an integer <= {max}, got \"{value}\""
         ))),
         _ => Err(err(format!(
@@ -444,6 +449,11 @@ mod tests {
             "error: --jobs expects an integer <= 1024, got \"4294967296\""
         );
         assert!(msg(&["--timeout", "99999999999999"]).contains("expects an integer <="));
+        // Too many digits to be a u64 at all is still too many, not too few.
+        assert!(
+            msg(&["--jobs", "99999999999999999999999"]).contains("expects an integer <="),
+            "a value that overflows u64 must not be reported as below the minimum"
+        );
     }
 
     #[test]

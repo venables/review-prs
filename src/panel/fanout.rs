@@ -28,7 +28,7 @@ const EXIT_TIMEOUT: i32 = 20;
 /// the same one job.rs documents -- an unbounded wait after the agent closes
 /// stdout without exiting. Without it, one wedged panelist hangs the run for
 /// as long as the terminal stays open.
-const GRACE_SECS: u64 = 5;
+pub const GRACE_SECS: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct Outcome {
@@ -198,10 +198,16 @@ fn never_ran(p: &Panelist, why: String, started: Instant) -> Outcome {
 /// three reviews sit finished on disk.
 fn print_section(o: &Outcome) {
     let exit = o.exit.map(|c| c.to_string()).unwrap_or_else(|| "killed".into());
-    println!("## {} / {} (exit {})", o.id, o.model, exit);
+    // The model name is the panelist's own first line, so it is model output
+    // too -- sanitized here and at the heartbeat below, or it is the one way
+    // an escape sequence still reaches the terminal.
+    let model = crate::report::sanitize_for_display(&o.model);
+    println!("## {} / {} (exit {})", o.id, model, exit);
     println!();
     if let Some(reason) = &o.failure {
-        println!("FAILED: {reason}");
+        // Sanitized like the body: the reason carries the last line of the
+        // child's stderr, which is process output and can hold escapes.
+        println!("FAILED: {}", crate::report::sanitize_for_display(reason));
         println!();
     }
     if o.answered() {
@@ -216,7 +222,7 @@ fn print_section(o: &Outcome) {
     eprintln!(
         "panel: {} ({}) done in {} (exit {})",
         o.id,
-        o.model,
+        model,
         crate::ui::fmt_dur(o.elapsed_secs),
         exit
     );
@@ -239,6 +245,19 @@ pub fn run(
     let mut done: Vec<Outcome> = Vec::new();
 
     for (idx, (p, cwd)) in panelists.iter().zip(cwds).enumerate() {
+        // Checked before each spawn as well as in the poll loop: a signal that
+        // arrived while the worktrees were being made would otherwise start
+        // every panelist anyway and only then notice.
+        if interrupted.load(Ordering::Relaxed) {
+            eprintln!("panel: interrupted before {} started", p.id);
+            let outcome = never_ran(p, "interrupted before it started".into(), Instant::now());
+            // Printed like any other panelist: stdout is the whole panel, and
+            // a reader counting sections should not have to check stderr to
+            // learn that one is missing.
+            print_section(&outcome);
+            done.push(outcome);
+            continue;
+        }
         let started = Instant::now();
         match spawn(&run, idx, p, cwd, started, false) {
             Ok(r) => {
@@ -248,7 +267,9 @@ pub fn run(
             Err(e) => {
                 // One panelist that cannot start costs one voice, not the run.
                 eprintln!("panel: {} could not start: {e:#}", p.id);
-                done.push(never_ran(p, format!("could not start: {e:#}"), started));
+                let outcome = never_ran(p, format!("could not start: {e:#}"), started);
+                print_section(&outcome);
+                done.push(outcome);
             }
         }
     }
@@ -261,10 +282,21 @@ pub fn run(
         if interrupted.load(Ordering::Relaxed) {
             eprintln!("\npanel: interrupted; stopping {}", crate::ui::count(running.len(), "panelist"));
             for r in &mut running {
-                stop_group(r.pgid);
-                r.stopped = Some("interrupted");
+                // try_wait first, as the synthesis poll does: a panelist that
+                // already exited with a full report is finished, and marking
+                // it "interrupted" would hide its real exit code and print
+                // FAILED over a review that succeeded.
+                let already = matches!(r.child.try_wait(), Ok(Some(_)));
+                if !already {
+                    stop_group(r.pgid);
+                    r.stopped = Some("interrupted");
+                }
                 let status = r.child.wait().ok().and_then(|s| s.code());
                 let outcome = finish(r, &panelists[r.idx], status);
+                // Printed like any other outcome. A panelist stopped mid-run
+                // may still have written most of a review, and dropping it
+                // from stdout would throw away work already paid for.
+                print_section(&outcome);
                 done.push(outcome);
             }
             break;
@@ -283,9 +315,16 @@ pub fn run(
                 }
                 Ok(None) => None,
                 Err(e) => {
+                    // Unwaitable, so it will never be reaped by the poll -- but
+                    // it is still running, and its worktree is about to be
+                    // removed underneath it.
+                    stop_group(r.pgid);
+                    // Reaped after the kill, the same way the synthesis does
+                    // it, or it stays a zombie until this process exits.
+                    let code = r.child.wait().ok().and_then(|s| s.code());
                     r.stopped = Some("could not be waited on");
                     eprintln!("panel: {} could not be waited on: {e}", panelists[r.idx].id);
-                    Some(None)
+                    Some(code)
                 }
             };
             let Some(exit) = status else {
