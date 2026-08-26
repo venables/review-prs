@@ -26,6 +26,9 @@ pub struct Resolved {
     pub isolated: bool,
     /// The commit every worktree pins to; None for working-tree targets.
     pub sha: Option<String>,
+    /// Files git is not tracking. No diff covers them, so the panelists are
+    /// told to read them from the tree instead.
+    pub untracked: Vec<String>,
 }
 
 fn git(repo_root: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -58,12 +61,16 @@ pub fn resolve(target: &Target, repo_root: &Path) -> Result<Resolved> {
             diff: git_stdout(repo_root, &["diff", "HEAD"])?,
             isolated: false,
             sha: None,
+            untracked: untracked_files(repo_root)?,
         },
         Target::Staged => Resolved {
             label: format!("staged changes on {}", branch(repo_root)),
             diff: git_stdout(repo_root, &["diff", "--cached"])?,
             isolated: false,
             sha: None,
+            // Nothing untracked is in the index, so nothing untracked is part
+            // of what this target reviews.
+            untracked: Vec::new(),
         },
         Target::Base(base) => {
             // A base that starts with a dash reaches git as an option, not a
@@ -95,7 +102,10 @@ pub fn resolve(target: &Target, repo_root: &Path) -> Result<Resolved> {
                 ),
                 diff,
                 isolated: true,
+                // A committed target is what the worktrees are pinned to;
+                // anything untracked is not part of it.
                 sha: Some(sha),
+                untracked: Vec::new(),
             }
         }
     };
@@ -106,13 +116,25 @@ pub fn resolve(target: &Target, repo_root: &Path) -> Result<Resolved> {
         // A change that only adds files is the common way to land here, and
         // "the diff is empty" is a baffling thing to be told while looking at
         // the new files. Name them.
-        let untracked = untracked_files(repo_root);
+        // Asked for here rather than taken from the target: an empty diff is
+        // the one moment untracked files explain themselves, even for a target
+        // that would not otherwise review them.
+        // Best-effort here alone: the run is already failing, and a second
+        // failure should not replace the reason with a git error.
+        let untracked = untracked_files(repo_root).unwrap_or_default();
         if !untracked.is_empty() {
+            let (subject, verb) = if untracked.len() == 1 { ("file", "is") } else { ("files", "are") };
+            // Staging is enough for a working-tree diff; a base-vs-HEAD diff
+            // only sees what has been committed.
+            let advice = match target {
+                Target::Base(_) => "commit them first",
+                _ => "add them with `git add` first",
+            };
             bail!(
-                "nothing to review: the diff for {} is empty. {} not tracked by git yet, so no diff covers them: {}. Add them with `git add` first.",
+                "nothing to review: the diff for {} is empty. {} {subject} {verb} not tracked by git yet, so no diff covers them: {}. To review them, {advice}.",
                 resolved.label,
-                crate::ui::count(untracked.len(), "file is"),
-                untracked.join(", ")
+                untracked.len(),
+                summarize(&untracked)
             );
         }
         bail!("nothing to review: the diff for {} is empty", resolved.label);
@@ -120,15 +142,36 @@ pub fn resolve(target: &Target, repo_root: &Path) -> Result<Resolved> {
     Ok(resolved)
 }
 
-/// The files git is not tracking, so an empty diff can say why it is empty.
-fn untracked_files(repo_root: &Path) -> Vec<String> {
-    git_stdout(repo_root, &["ls-files", "--others", "--exclude-standard"])
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .take(10)
+/// Every file git is not tracking. The error is propagated rather than read
+/// as "there are none": a review that quietly leaves out every new file
+/// because one git call failed is worse than one that refuses to start.
+fn untracked_files(repo_root: &Path) -> Result<Vec<String>> {
+    // -z, so git does not apply core.quotePath: a name with a non-ASCII or
+    // unusual character would otherwise reach the prompt in an escaped form
+    // that no read tool can open.
+    Ok(git_stdout(repo_root, &["ls-files", "--others", "--exclude-standard", "-z"])?
+        .split('\0')
+        // Only empty fields, not whitespace-only ones: " " is a legal
+        // filename, and dropping it would leave a file nobody reviews.
+        .filter(|l| !l.is_empty())
         .map(str::to_string)
-        .collect()
+        .collect())
+}
+
+/// A readable list for a message, saying how many it did not name rather than
+/// stopping silently.
+fn summarize(files: &[String]) -> String {
+    const SHOWN: usize = 10;
+    // Sanitized: -z removed git's quoting, and these names go to a terminal.
+    let names: Vec<String> = files
+        .iter()
+        .take(SHOWN)
+        .map(|f| crate::report::sanitize_for_display(f))
+        .collect();
+    if files.len() <= SHOWN {
+        return names.join(", ");
+    }
+    format!("{}, and {} more", names.join(", "), files.len() - SHOWN)
 }
 
 fn branch(repo_root: &Path) -> String {

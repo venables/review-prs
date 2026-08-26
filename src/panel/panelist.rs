@@ -140,7 +140,14 @@ pub fn dashp_args(p: &Panelist, cwd: &Path, timeout_secs: u64, isolated: bool) -
 pub fn extract_model(stdout: &str) -> Option<String> {
     let first = stdout.lines().next()?.trim();
     let rest = first.strip_prefix("Model:")?.trim();
-    if rest.is_empty() { None } else { Some(rest.to_string()) }
+    if rest.is_empty() {
+        return None;
+    }
+    // Bounded like the trailer's fields are. This goes into a section
+    // heading, a heartbeat and the synthesis roster, and a panelist whose
+    // first line is "Model:" plus ten thousand characters should not decide
+    // how wide any of them are.
+    Some(rest.chars().take(crate::report::MAX_FIELD_CHARS).collect())
 }
 
 #[cfg(test)]
@@ -202,5 +209,9 @@ mod tests {
         assert_eq!(extract_model("Goal: ...\nModel: quoted-later"), None);
         assert_eq!(extract_model("Model:\n"), None);
         assert_eq!(extract_model(""), None);
+        // Bounded: a section heading is not the place for a thousand
+        // characters a panelist chose.
+        let long = format!("Model: {}", "x".repeat(500));
+        assert_eq!(extract_model(&long).unwrap().chars().count(), crate::report::MAX_FIELD_CHARS);
     }
 }
