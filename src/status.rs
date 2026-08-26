@@ -52,6 +52,25 @@ impl Status {
         }
     }
 
+    /// A message that changes as time passes, drawn only where it can be
+    /// redrawn. Off a terminal this says nothing at all -- a line every
+    /// quarter second is not a log, it is a flood -- which is what separates
+    /// it from `step`.
+    pub fn tick(&self, msg: impl Into<String>) {
+        if let Some(bar) = &self.bar {
+            bar.set_message(msg.into());
+        }
+    }
+
+    /// Print something permanent without the spinner fighting it for the
+    /// last line of the terminal.
+    pub fn suspend<F: FnOnce() -> T, T>(&self, f: F) -> T {
+        match &self.bar {
+            Some(bar) => bar.suspend(f),
+            None => f(),
+        }
+    }
+
     /// Nothing more is coming. The spinner leaves no trace: what the run
     /// found is the report's job to say, not the progress line's.
     pub fn clear(&self) {
@@ -89,6 +108,26 @@ pub mod step {
 
     /// Both numbers when the filters removed something, because "found 3
     /// open PRs" on a repo showing 40 in the browser reads as a broken query.
+    /// Where the wait actually is for panel: N checkouts of the repository
+    /// before a single model has been asked anything.
+    pub fn materializing(done: usize, total: usize) -> String {
+        format!("materializing worktree {} of {total}", done + 1)
+    }
+
+    /// The two long silences in a panel run, both counted up so a reader can
+    /// see the run is alive rather than wedged.
+    pub fn reviewing(running: usize, elapsed: u64) -> String {
+        format!(
+            "{} still reviewing, {}",
+            crate::ui::count(running, "panelist"),
+            crate::ui::fmt_dur(elapsed)
+        )
+    }
+
+    pub fn synthesizing(backend: &str, elapsed: u64) -> String {
+        format!("synthesizing with {backend}, {}", crate::ui::fmt_dur(elapsed))
+    }
+
     pub fn found(open: usize, considered: usize) -> String {
         let found = format!("found {}", crate::ui::count(open, "open PR"));
         if considered == open {
@@ -112,6 +151,12 @@ mod tests {
         assert!(!step::found(2, 2).contains("PR(s)"));
         // Both numbers when they differ: most of those 40 are your own.
         assert_eq!(step::found(40, 3), "found 40 open PRs, 3 to consider");
+        // panel's own waits, counted from one rather than from zero.
+        assert_eq!(step::materializing(0, 4), "materializing worktree 1 of 4");
+        assert_eq!(step::materializing(3, 4), "materializing worktree 4 of 4");
+        assert_eq!(step::reviewing(3, 90), "3 panelists still reviewing, 1m30s");
+        assert_eq!(step::reviewing(1, 5), "1 panelist still reviewing, 5s");
+        assert_eq!(step::synthesizing("claude", 65), "synthesizing with claude, 1m05s");
     }
 
     #[test]
@@ -121,6 +166,10 @@ mod tests {
         // Drop calls it again after an explicit clear.
         let status = Status { bar: None };
         status.step("reading the repo");
+        // A tick says nothing without a terminal to redraw, and suspend still
+        // runs what it was given.
+        status.tick("3 panelists still reviewing, 1m30s");
+        assert_eq!(status.suspend(|| 7), 7);
         status.clear();
         status.clear();
     }

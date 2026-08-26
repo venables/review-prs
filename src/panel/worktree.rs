@@ -10,6 +10,7 @@
 //! Disk cost is N copies of the repo, but cargo/pnpm/npm caches live at the
 //! user level, so most of the bytes are shared.
 
+use crate::status::{Status, step};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,6 +41,7 @@ impl Worktrees {
         ids: &[String],
         sha: &str,
         interrupted: &Arc<AtomicBool>,
+        status: &Status,
     ) -> Result<Worktrees> {
         // Canonical, because git records a worktree at its realpath. On macOS
         // the default temp directory is /var/folders/..., a symlink to
@@ -48,7 +50,10 @@ impl Worktrees {
         // "not registered" for every real leak.
         let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
         let mut wts = Worktrees::none(repo_root);
-        for id in ids {
+        for (n, id) in ids.iter().enumerate() {
+            // The longest wait in a panel run happens here: N checkouts of the
+            // repository before a single model has been asked anything.
+            status.step(step::materializing(n, ids.len()));
             if interrupted.load(Ordering::Relaxed) {
                 // Whatever was made so far goes with wts on the way out.
                 bail!("interrupted while creating worktrees");

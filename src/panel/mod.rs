@@ -14,6 +14,7 @@ pub mod target;
 pub mod worktree;
 
 use crate::repo::{self, AlreadyReported};
+use crate::status::{Status, step};
 use anyhow::{Context, Result, bail};
 use cli::Config;
 use std::fs::File;
@@ -40,6 +41,11 @@ pub fn run(cfg: &Config) -> Result<i32> {
     let dashp = repo::dashp_bin();
     repo::require_deps(&[dashp.as_str()])?;
 
+    // Two waits stand between launch and the first panelist: reading the
+    // repo, and materializing a checkout per panelist. The second can be the
+    // longest thing a panel run does before a model is asked anything.
+    let status = Status::new();
+    status.step(step::reading_repo());
     let repo_root = repo::git_root()?;
     let mut cfg = cfg.clone();
 
@@ -68,6 +74,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
     }
     let panel = panelist::resolve(&specs);
 
+    status.step("building the diff");
     let resolved = target::resolve(&cfg.target, &repo_root)?;
     cfg.isolated = resolved.isolated;
 
@@ -108,8 +115,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
             if cfg.synthesize {
                 ids.push("synthesis".into());
             }
-            eprintln!("panel: materializing {} ...", crate::ui::count(ids.len(), "worktree"));
-            let wts = match Worktrees::create(&repo_root, &dir, &ids, sha, &interrupted) {
+            let wts = match Worktrees::create(&repo_root, &dir, &ids, sha, &interrupted, &status) {
                 Ok(wts) => wts,
                 Err(e) => {
                     // A ctrl-C reaches the running `git worktree add` too, so
@@ -138,6 +144,8 @@ pub fn run(cfg: &Config) -> Result<i32> {
         ),
     };
 
+    // The header is the report, so the spinner steps out of its way.
+    status.clear();
     let ids: Vec<&str> = panel.iter().map(|p| p.id.as_str()).collect();
     println!("# Panel review\n");
     println!("- Target: {}", resolved.label);
@@ -148,7 +156,16 @@ pub fn run(cfg: &Config) -> Result<i32> {
     }
     println!();
 
-    let outcomes = fanout::run(&panel, &cwds, &cfg, &dashp, &prompt_path, &dir, &interrupted)?;
+    let outcomes = fanout::run(
+        &panel,
+        &cwds,
+        &cfg,
+        &dashp,
+        &prompt_path,
+        &dir,
+        &interrupted,
+        &status,
+    )?;
 
     if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("panel: interrupted; the worktrees are being removed");
@@ -179,6 +196,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
         &synth_cwd,
         &dir,
         &interrupted,
+        &status,
     ) {
         Ok(report) => report,
         Err(e) => {

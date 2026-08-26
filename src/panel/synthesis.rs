@@ -15,6 +15,7 @@ use crate::panel::cli::Config;
 use crate::panel::fanout::{GRACE_SECS, Outcome};
 use crate::panel::prompt::fence_for;
 use crate::pool::stop_group;
+use crate::status::{Status, step};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Write;
@@ -150,6 +151,7 @@ pub fn run(
     cwd: &Path,
     out_dir: &Path,
     interrupted: &Arc<AtomicBool>,
+    status: &Status,
 ) -> Result<String> {
     let prompt = build_prompt(target_label, diff, untracked, outcomes, cfg.focus.as_deref());
     let prompt_path = out_dir.join("synthesis.prompt");
@@ -163,7 +165,7 @@ pub fn run(
     if interrupted.load(Ordering::Relaxed) {
         anyhow::bail!("interrupted before the synthesis started");
     }
-    eprintln!("panel: synthesizing with {} ...", cfg.synth_backend);
+    status.step(step::synthesizing(&cfg.synth_backend, 0));
     let stdin = File::open(&prompt_path).context("opening the synthesis prompt")?;
     let mut argv = vec![
         "-H".to_string(),
@@ -198,7 +200,8 @@ pub fn run(
     // Polled, not waited on: `.output()` would block through a signal and
     // through dash-p's own known wedge, with every worktree still registered
     // in the user's repository for as long as it lasted.
-    let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs + GRACE_SECS);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(cfg.timeout_secs + GRACE_SECS);
     let mut stopped = None;
     loop {
         // try_wait first: a signal that arrives after the child has already
@@ -216,7 +219,13 @@ pub fn run(
                 stopped = Some("timed out and had to be killed");
                 break;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+            Ok(None) => {
+                // The last long silence in a run, and the most expensive one
+                // to mistake for a hang: every panelist has already been paid
+                // for by the time it starts.
+                status.tick(step::synthesizing(&cfg.synth_backend, started.elapsed().as_secs()));
+                std::thread::sleep(Duration::from_millis(250));
+            }
             Err(e) => {
                 stop_group(pgid);
                 // Reaped, or it stays a zombie until this process exits.
