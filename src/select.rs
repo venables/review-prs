@@ -43,13 +43,19 @@ fn mark_resumable(rows: &mut [prlist::Row], ctx: &RepoContext) {
 /// 0: an empty repo, a sweep with nothing actionable, or an empty pick.
 pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Option<Selection>> {
     status.step(step::fetching(&ctx.owner, &ctx.name));
-    let found = prlist::fetch(ctx, opts.include_approved, opts.include_dependabot)?;
-    // Said before the ranking, because the ranking is the part that has
-    // nothing to wait on: this is what the network call went and got.
-    status.step(step::found(found.open, found.prs.len()));
+    let found = prlist::fetch(ctx, opts.include_approved, opts.include_dependabot, status)?;
+    // Permanent, not a step: it is the line that keeps "3 PRs to review" from
+    // reading as a broken query on a repo showing forty in the browser, and a
+    // step is erased the moment the next one replaces it.
+    status.say(step::found(found.open, found.prs.len()));
+    // Cleared before anything writes to stdout: the spinner owns the last
+    // line of the terminal until it does not.
+    let empty = found.prs.is_empty();
+    if empty {
+        status.clear();
+    }
     let Some(prs) = prlist::explain_if_empty(found.prs, opts.include_approved, opts.include_dependabot)
     else {
-        status.clear();
         return Ok(None);
     };
     let now = std::time::SystemTime::now()

@@ -35,8 +35,9 @@ fn select_prs(cfg: &Config) -> select::Opts<'static> {
 fn actionable_now(
     cfg: &Config,
     ctx: &repo::RepoContext,
+    status: &Status,
 ) -> anyhow::Result<(Vec<u64>, HashMap<u64, String>)> {
-    let prs = prlist::fetch(ctx, cfg.include_approved, cfg.include_dependabot)?.prs;
+    let prs = prlist::fetch(ctx, cfg.include_approved, cfg.include_dependabot, status)?.prs;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -111,7 +112,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // showing. Saying which one is running turns a silent wait into a wait.
     let status = Status::new();
     status.step(step::reading_repo());
-    let ctx = repo::load()?;
+    let ctx = repo::load(&status)?;
 
     let Some((numbers, titles)) = select::run(&ctx, &select_prs(cfg), &status)? else {
         return Ok(0);
@@ -176,7 +177,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
 
             let refresh = Status::new();
             refresh.step(step::fetching(&ctx.owner, &ctx.name));
-            let looked = actionable_now(&cfg, &ctx);
+            let looked = actionable_now(&cfg, &ctx, &refresh);
             refresh.clear();
             let fresh = match looked {
                 Ok((numbers, fresh_titles)) => {

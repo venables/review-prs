@@ -47,9 +47,14 @@ bots and approved ones are filtered out — and on a repo where most of the open
 PRs are yours, "found 3" on its own reads as a broken query rather than a
 working filter.
 
-On a terminal this is one spinner line that rewrites itself and leaves nothing
-behind, so the report still starts at the top. Piped, or under cron and CI, it
-is one plain line per step on stderr — stdout stays the report.
+The `found` line stays. The steps around it do not: on a terminal they are one
+spinner line that rewrites itself and leaves nothing behind, so the report
+still starts at the top. Under cron and CI, or with stderr redirected, each
+step is a plain line instead.
+
+**stderr decides**, because that is where all of this goes — a run whose stdout
+is piped to a file still has a terminal to spin on, and still leaves that file
+holding only the report.
 
 ## Requirements
 
