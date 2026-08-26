@@ -1,6 +1,7 @@
 //! Dependency checks and repo/user context. The gh argv shapes are
 //! load-bearing: the test suite's fake gh dispatches on them.
 
+use crate::status::Status;
 use anyhow::{Result, bail};
 use std::path::PathBuf;
 use std::process::Command;
@@ -143,24 +144,28 @@ fn repo_root_from(out: &std::process::Output) -> std::result::Result<PathBuf, St
 
 /// The repo root, without the GitHub context `load` also gathers. panel wants
 /// the directory and nothing else -- it never calls gh.
-pub fn git_root() -> Result<PathBuf> {
+pub fn git_root(status: &Status) -> Result<PathBuf> {
     let toplevel = Command::new("git").args(["rev-parse", "--show-toplevel"]).output()?;
     match repo_root_from(&toplevel) {
         Ok(root) => Ok(root),
         Err(msg) => {
-            eprintln!("{msg}");
+            // Suspended: a message written while the spinner is live fuses
+            // with it, and an error is the worst line to have to disentangle.
+            status.say(msg);
             bail!(AlreadyReported);
         }
     }
 }
 
-pub fn load() -> Result<RepoContext> {
+pub fn load(status: &Status) -> Result<RepoContext> {
     let repo_view = Command::new("gh")
         .args(["repo", "view", "--json", "owner,name"])
         .output()?;
     if !repo_view.status.success() {
-        eprintln!("error: not a GitHub repo (or gh not authenticated)");
-        eprintln!("{}", combined_output(&repo_view));
+        status.say(format!(
+            "error: not a GitHub repo (or gh not authenticated)\n{}",
+            combined_output(&repo_view)
+        ));
         bail!(AlreadyReported);
     }
     let repo_json: serde_json::Value = serde_json::from_slice(&repo_view.stdout)?;
@@ -169,19 +174,21 @@ pub fn load() -> Result<RepoContext> {
 
     // gh can answer from $GH_REPO outside any checkout; an empty repo root
     // would hash into every session id and fail every spawn one PR at a time.
-    let repo_root = git_root()?;
+    let repo_root = git_root(status)?;
 
     // gh can exit 0 and still hand back an empty login, which would silently
     // mislabel every PR's engagement -- so check both the status and the value.
     let user = Command::new("gh").args(["api", "user", "--jq", ".login"]).output()?;
     if !user.status.success() {
-        eprintln!("error: failed to fetch current GitHub user");
-        eprintln!("{}", combined_output(&user));
+        status.say(format!(
+            "error: failed to fetch current GitHub user\n{}",
+            combined_output(&user)
+        ));
         bail!(AlreadyReported);
     }
     let me = String::from_utf8_lossy(&user.stdout).trim().to_string();
     if me.is_empty() {
-        eprintln!("error: gh api user returned empty login");
+        status.say("error: gh api user returned empty login");
         bail!(AlreadyReported);
     }
 

@@ -2,6 +2,7 @@
 //! one list, so they cannot disagree about what is actionable.
 
 use crate::repo::RepoContext;
+use crate::status::Status;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::process::Command;
@@ -13,6 +14,11 @@ const BOT_LOGIN_PREFIX: &str = "dependabot";
 pub fn is_bot(login: &str) -> bool {
     login.starts_with(BOT_LOGIN_PREFIX)
 }
+
+/// How many PRs one call asks for. A repo with more than this returns a full
+/// page and the true total is unknown, which is why a count that reaches it is
+/// reported as "50+" rather than as fact.
+pub const QUERY_LIMIT: usize = 50;
 
 // One GraphQL call for the open PRs, and enough activity to rank engagement.
 const QUERY: &str = "
@@ -156,7 +162,12 @@ pub struct Fetched {
 
 /// Fetch and filter, saying nothing. What a refresh wants: a babysit loop
 /// that explained "no matching open PRs" on every interval would be noise.
-pub fn fetch(ctx: &RepoContext, include_approved: bool, include_dependabot: bool) -> Result<Fetched> {
+pub fn fetch(
+    ctx: &RepoContext,
+    include_approved: bool,
+    include_dependabot: bool,
+    status: &Status,
+) -> Result<Fetched> {
     let out = Command::new("gh")
         .args(["api", "graphql", "-F"])
         .arg(format!("owner={}", ctx.owner))
@@ -167,24 +178,36 @@ pub fn fetch(ctx: &RepoContext, include_approved: bool, include_dependabot: bool
         .output()
         .context("running gh api graphql")?;
     if !out.status.success() {
-        eprintln!("{}", String::from_utf8_lossy(&out.stderr).trim_end());
+        status.say(String::from_utf8_lossy(&out.stderr).trim_end().to_string());
         bail!(crate::repo::AlreadyReported);
     }
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).context("parsing gh api graphql output")?;
-    let prs = extract_nodes(&parsed)?;
+    let prs = extract_nodes(&parsed, status)?;
 
+    Ok(filter_prs(prs, &ctx.me, include_approved, include_dependabot))
+}
+
+/// Who is left after the filters, and how many were open before them. Split
+/// out and pure so the tests exercise the real chain: a test that re-lists the
+/// same four filters would agree with itself while the code drifted, which is
+/// the whole failure this crate spent a release removing.
+pub fn filter_prs(
+    prs: Vec<PrNode>,
+    me: &str,
+    include_approved: bool,
+    include_dependabot: bool,
+) -> Fetched {
     let open: Vec<PrNode> = prs.into_iter().filter(|pr| !pr.is_draft).collect();
     let total = open.len();
     let prs: Vec<PrNode> = open
         .into_iter()
         // Always hide your own PRs -- this tool is for reviewing others' work.
-        .filter(|pr| pr.author_login() != ctx.me)
+        .filter(|pr| pr.author_login() != me)
         .filter(|pr| include_dependabot || !is_bot(pr.author_login()))
         .filter(|pr| include_approved || pr.review_decision.as_deref() != Some("APPROVED"))
         .collect();
-
-    Ok(Fetched { prs, open: total })
+    Fetched { prs, open: total }
 }
 
 /// Nothing left after the filters is not an error, but it does need a reason:
@@ -218,21 +241,22 @@ pub fn explain_if_empty(
 /// `errors` array, or a response missing the data path entirely, must not
 /// read as "no PRs": an unattended sweep would then exit 0 having reviewed
 /// nothing, which is the lie the exit status exists to prevent.
-fn extract_nodes(parsed: &serde_json::Value) -> Result<Vec<PrNode>> {
+fn extract_nodes(parsed: &serde_json::Value, status: &Status) -> Result<Vec<PrNode>> {
     if let Some(errors) = parsed.get("errors").and_then(|e| e.as_array())
         && !errors.is_empty()
     {
-        eprintln!("error: gh api graphql returned errors:");
+        let mut said = String::from("error: gh api graphql returned errors:");
         for err in errors {
             match err.get("message").and_then(|m| m.as_str()) {
-                Some(msg) => eprintln!("  {msg}"),
-                None => eprintln!("  {err}"),
+                Some(msg) => said.push_str(&format!("\n  {msg}")),
+                None => said.push_str(&format!("\n  {err}")),
             }
         }
+        status.say(said);
         bail!(crate::repo::AlreadyReported);
     }
     let Some(nodes) = parsed.pointer("/data/repository/pullRequests/nodes") else {
-        eprintln!("error: gh api graphql returned no pull request data");
+        status.say("error: gh api graphql returned no pull request data");
         bail!(crate::repo::AlreadyReported);
     };
     serde_json::from_value(nodes.clone()).context("parsing the pull request list")
@@ -438,14 +462,10 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    /// The real chain, not a copy of it: `fetch` differs from this only by
+    /// the network call in front of it.
     fn filtered(include_approved: bool, include_dependabot: bool) -> Vec<PrNode> {
-        fixture()
-            .into_iter()
-            .filter(|pr| !pr.is_draft)
-            .filter(|pr| pr.author_login() != "me")
-            .filter(|pr| include_dependabot || !is_bot(pr.author_login()))
-            .filter(|pr| include_approved || pr.review_decision.as_deref() != Some("APPROVED"))
-            .collect()
+        filter_prs(fixture(), "me", include_approved, include_dependabot).prs
     }
 
     #[test]
@@ -470,12 +490,16 @@ mod tests {
     #[test]
     fn the_fetch_reports_what_its_filters_removed() {
         // The number a user sees in the browser, and the number this tool
-        // will act on. They differ on any repo where most PRs are your own.
-        let all = fixture();
-        let open = all.iter().filter(|p| !p.is_draft).count();
-        let considered = filtered(false, false).len();
-        assert_eq!(open, 6, "six open, one draft");
-        assert_eq!(considered, 3, "yours, the bot and the approved one go");
+        // will act on. They differ on any repo where most PRs are your own,
+        // and both come out of the one function that does the filtering.
+        let found = filter_prs(fixture(), "me", false, false);
+        assert_eq!(found.open, 6, "six open, one draft");
+        assert_eq!(found.prs.len(), 3, "yours, the bot and the approved one go");
+
+        // Widening the flags moves the second number and never the first.
+        let wide = filter_prs(fixture(), "me", true, true);
+        assert_eq!(wide.open, 6, "the draft is still not open");
+        assert_eq!(wide.prs.len(), 5);
     }
 
     #[test]
@@ -521,16 +545,17 @@ mod tests {
         // must refuse, or an unattended sweep exits 0 having reviewed nothing.
         let with_errors: serde_json::Value =
             serde_json::from_str(r#"{"errors":[{"message":"rate limited"}],"data":null}"#).unwrap();
-        assert!(extract_nodes(&with_errors).is_err());
+        let quiet = Status::silent();
+        assert!(extract_nodes(&with_errors, &quiet).is_err());
 
         let missing_path: serde_json::Value = serde_json::from_str(r#"{"data":{}}"#).unwrap();
-        assert!(extract_nodes(&missing_path).is_err());
+        assert!(extract_nodes(&missing_path, &quiet).is_err());
 
         let ok: serde_json::Value = serde_json::from_str(
             r#"{"data":{"repository":{"pullRequests":{"nodes":[]}}}}"#,
         )
         .unwrap();
-        assert_eq!(extract_nodes(&ok).unwrap().len(), 0);
+        assert_eq!(extract_nodes(&ok, &quiet).unwrap().len(), 0);
     }
 
     #[test]

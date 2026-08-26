@@ -52,6 +52,12 @@ impl Status {
         }
     }
 
+    /// A reporter that never draws. What a test wants, and what any caller
+    /// wants when the progress would be noise rather than news.
+    pub fn silent() -> Status {
+        Status { bar: None }
+    }
+
     /// A message that changes as time passes, drawn only where it can be
     /// redrawn. Off a terminal this says nothing at all -- a line every
     /// quarter second is not a log, it is a flood -- which is what separates
@@ -60,6 +66,15 @@ impl Status {
         if let Some(bar) = &self.bar {
             bar.set_message(msg.into());
         }
+    }
+
+    /// A line that stays on screen. The spinner steps aside for it and comes
+    /// back underneath -- otherwise a permanent line written while the
+    /// spinner is live fuses with it, which is how an error ends up reading
+    /// as part of a progress message.
+    pub fn say(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.suspend(|| eprintln!("{msg}"));
     }
 
     /// Print something permanent without the spinner fighting it for the
@@ -128,8 +143,16 @@ pub mod step {
         format!("synthesizing with {backend}, {}", crate::ui::fmt_dur(elapsed))
     }
 
+    /// A count that reached the query's own limit is reported as "50+": the
+    /// list is one page, so the real total is unknown, and stating it exactly
+    /// would be the same kind of lie in the other direction.
     pub fn found(open: usize, considered: usize) -> String {
-        let found = format!("found {}", crate::ui::count(open, "open PR"));
+        let count = if open >= crate::prlist::QUERY_LIMIT {
+            format!("{}+ open PRs", crate::prlist::QUERY_LIMIT)
+        } else {
+            crate::ui::count(open, "open PR")
+        };
+        let found = format!("found {count}");
         if considered == open {
             return found;
         }
@@ -151,6 +174,8 @@ mod tests {
         assert!(!step::found(2, 2).contains("PR(s)"));
         // Both numbers when they differ: most of those 40 are your own.
         assert_eq!(step::found(40, 3), "found 40 open PRs, 3 to consider");
+        // The query asks for one page, so a full page means "at least this".
+        assert_eq!(step::found(50, 4), "found 50+ open PRs, 4 to consider");
         // panel's own waits, counted from one rather than from zero.
         assert_eq!(step::materializing(0, 4), "materializing worktree 1 of 4");
         assert_eq!(step::materializing(3, 4), "materializing worktree 4 of 4");
@@ -164,7 +189,7 @@ mod tests {
         // Nothing to assert about the spinner itself; what matters is that
         // clearing an absent one is fine, and that clearing twice is too --
         // Drop calls it again after an explicit clear.
-        let status = Status { bar: None };
+        let status = Status::silent();
         status.step("reading the repo");
         // A tick says nothing without a terminal to redraw, and suspend still
         // runs what it was given.

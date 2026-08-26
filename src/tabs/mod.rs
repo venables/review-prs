@@ -32,7 +32,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
     // showing. Saying which one is running turns a silent wait into a wait.
     let status = Status::new();
     status.step(step::reading_repo());
-    let ctx = repo::load()?;
+    let ctx = repo::load(&status)?;
     let Some((numbers, _titles)) = select::run(&ctx, &select_opts(cfg), &status)? else {
         return Ok(0);
     };

@@ -46,7 +46,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
     // longest thing a panel run does before a model is asked anything.
     let status = Status::new();
     status.step(step::reading_repo());
-    let repo_root = repo::git_root()?;
+    let repo_root = repo::git_root(&status)?;
     let mut cfg = cfg.clone();
 
     let specs = if cfg.panelists.is_empty() {
