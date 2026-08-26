@@ -56,6 +56,22 @@ step is a plain line instead.
 is piped to a file still has a terminal to spin on, and still leaves that file
 holding only the report.
 
+`panel` reports its own three waits the same way, and the last two count up
+rather than sitting still:
+
+```
+reading the repo
+building the diff
+materializing worktree 3 of 4
+3 panelists still reviewing, 4m12s
+synthesizing with claude, 1m30s
+```
+
+Materializing a checkout per panelist is the longest thing a panel run does
+before a model is asked anything, and the synthesis is the most expensive
+silence in the run to mistake for a hang — every panelist has already been
+paid for by the time it starts.
+
 ## Requirements
 
 - [`gh`](https://cli.github.com) — authenticated (`gh auth login`)
