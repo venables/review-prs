@@ -27,6 +27,28 @@ skill, which is the default review command both run.
 Steps 1-3 are shared with [`autoreview`](#autoreview), which replaces step 4
 with a headless subprocess per PR.
 
+## While it waits
+
+Three network calls stand between launch and the first thing worth showing:
+`gh repo view`, `gh api user`, then one GraphQL call for the PR list. Both
+tools say what they are doing through them:
+
+```
+reading the repo
+fetching open PRs from acme/widgets
+found 40 open PRs, 3 to consider
+3 PRs to review: #9 #8 #6
+```
+
+The two counts are deliberate. The second is what is left after your own PRs,
+bots and approved ones are filtered out — and on a repo where most of the open
+PRs are yours, "found 3" on its own reads as a broken query rather than a
+working filter.
+
+On a terminal this is one spinner line that rewrites itself and leaves nothing
+behind, so the report still starts at the top. Piped, or under cron and CI, it
+is one plain line per step on stderr — stdout stays the report.
+
 ## Requirements
 
 - [`gh`](https://cli.github.com) — authenticated (`gh auth login`)

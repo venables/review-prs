@@ -22,6 +22,13 @@ assert_not_contains "draft PRs are hidden" "$out" "#2"
 out="$(run_review_prs --auto --dependabot)"
 assert_contains "--dependabot includes bot PRs" "$out" "#3"
 
+# --- What it is doing while it waits on the network ------------------------
+out="$(run_review_prs --auto)"
+assert_contains "it says it is reading the repo" "$out" "reading the repo"
+assert_contains "...and which repo it is fetching from" \
+  "$out" "fetching open PRs from acme/widgets"
+assert_contains "...and what the filters left" "$out" "found 6 open PRs, 3 to consider"
+
 # --- What the sweep says for itself ---------------------------------------
 # Pinned because it is the line a wrapper greps, and because it deliberately
 # no longer matches the bash this replaced: the "N PR(s)" shape went away

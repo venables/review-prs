@@ -8,6 +8,7 @@ pub mod command;
 pub mod spawner;
 
 use crate::repo::{self, AlreadyReported};
+use crate::status::{Status, step};
 use crate::{select, session, ui};
 use anyhow::{Result, bail};
 use cli::Config;
@@ -27,8 +28,12 @@ pub fn run(cfg: &Config) -> Result<i32> {
     // that has never seen it; picker::run asks for it when it is reached.
     repo::require_deps(&["gh", "git"])?;
 
+    // Three network calls stand between here and the first thing worth
+    // showing. Saying which one is running turns a silent wait into a wait.
+    let status = Status::new();
+    status.step(step::reading_repo());
     let ctx = repo::load()?;
-    let Some((numbers, _titles)) = select::run(&ctx, &select_opts(cfg))? else {
+    let Some((numbers, _titles)) = select::run(&ctx, &select_opts(cfg), &status)? else {
         return Ok(0);
     };
 

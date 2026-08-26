@@ -21,5 +21,6 @@ pub mod rundir;
 pub mod select;
 pub mod session;
 pub mod signals;
+pub mod status;
 pub mod tabs;
 pub mod ui;

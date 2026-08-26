@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::time::Duration;
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
 const TITLE_WIDTH: usize = 60;
 
 pub fn fmt_dur(s: u64) -> String {

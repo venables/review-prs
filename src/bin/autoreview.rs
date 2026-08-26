@@ -15,6 +15,7 @@
 use autoreview::cli::Config;
 use autoreview::queue::Queue;
 use autoreview::rundir::RunDir;
+use autoreview::status::{Status, step};
 use autoreview::{cli, pool, prlist, queue, repo, select, signals, ui};
 use std::collections::HashMap;
 
@@ -35,7 +36,7 @@ fn actionable_now(
     cfg: &Config,
     ctx: &repo::RepoContext,
 ) -> anyhow::Result<(Vec<u64>, HashMap<u64, String>)> {
-    let prs = prlist::fetch(ctx, cfg.include_approved, cfg.include_dependabot)?;
+    let prs = prlist::fetch(ctx, cfg.include_approved, cfg.include_dependabot)?.prs;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -106,9 +107,13 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     if cfg.review_cmd.is_none() {
         repo::require_deps(&[dashp.as_str()])?;
     }
+    // Three network calls stand between here and the first thing worth
+    // showing. Saying which one is running turns a silent wait into a wait.
+    let status = Status::new();
+    status.step(step::reading_repo());
     let ctx = repo::load()?;
 
-    let Some((numbers, titles)) = select::run(&ctx, &select_prs(cfg))? else {
+    let Some((numbers, titles)) = select::run(&ctx, &select_prs(cfg), &status)? else {
         return Ok(0);
     };
 
@@ -169,7 +174,11 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             watching = drop_finished(&watching, &mut tracker);
             let exhausted = nothing_left(&watching, &tracker);
 
-            let fresh = match actionable_now(&cfg, &ctx) {
+            let refresh = Status::new();
+            refresh.step(step::fetching(&ctx.owner, &ctx.name));
+            let looked = actionable_now(&cfg, &ctx);
+            refresh.clear();
+            let fresh = match looked {
                 Ok((numbers, fresh_titles)) => {
                     refresh_failures = 0;
                     titles.extend(fresh_titles);
