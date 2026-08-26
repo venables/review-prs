@@ -121,8 +121,6 @@ pub mod step {
         format!("fetching open PRs from {owner}/{name}")
     }
 
-    /// Both numbers when the filters removed something, because "found 3
-    /// open PRs" on a repo showing 40 in the browser reads as a broken query.
     /// Where the wait actually is for panel: N checkouts of the repository
     /// before a single model has been asked anything.
     pub fn materializing(done: usize, total: usize) -> String {
@@ -143,12 +141,15 @@ pub mod step {
         format!("synthesizing with {backend}, {}", crate::ui::fmt_dur(elapsed))
     }
 
-    /// A count that reached the query's own limit is reported as "50+": the
-    /// list is one page, so the real total is unknown, and stating it exactly
-    /// would be the same kind of lie in the other direction.
-    pub fn found(open: usize, considered: usize) -> String {
-        let count = if open >= crate::prlist::QUERY_LIMIT {
-            format!("{}+ open PRs", crate::prlist::QUERY_LIMIT)
+    /// Both numbers when the filters removed something, because "found 3 open
+    /// PRs" on a repo showing 40 in the browser reads as a broken query.
+    ///
+    /// A page-limited count is reported as "50+ open PRs": past the query's
+    /// own page size the real total is unknown, and stating it exactly would
+    /// be the same kind of lie in the other direction.
+    pub fn found(open: usize, considered: usize, truncated: bool) -> String {
+        let count = if truncated {
+            format!("{open}+ open PRs")
         } else {
             crate::ui::count(open, "open PR")
         };
@@ -167,15 +168,16 @@ mod tests {
     #[test]
     fn the_steps_read_as_sentences() {
         assert_eq!(step::fetching("acme", "widgets"), "fetching open PRs from acme/widgets");
-        assert_eq!(step::found(8, 8), "found 8 open PRs");
+        assert_eq!(step::found(8, 8, false), "found 8 open PRs");
         // Counted in english, like everything else this crate prints -- and
         // never as "PR(s)", which the sibling tools deliberately dropped.
-        assert_eq!(step::found(1, 1), "found 1 open PR");
-        assert!(!step::found(2, 2).contains("PR(s)"));
+        assert_eq!(step::found(1, 1, false), "found 1 open PR");
+        assert!(!step::found(2, 2, false).contains("PR(s)"));
         // Both numbers when they differ: most of those 40 are your own.
-        assert_eq!(step::found(40, 3), "found 40 open PRs, 3 to consider");
-        // The query asks for one page, so a full page means "at least this".
-        assert_eq!(step::found(50, 4), "found 50+ open PRs, 4 to consider");
+        assert_eq!(step::found(40, 3, false), "found 40 open PRs, 3 to consider");
+        // A full page means "at least this", and the number reported is what
+        // survived the draft filter rather than the page size itself.
+        assert_eq!(step::found(48, 4, true), "found 48+ open PRs, 4 to consider");
         // panel's own waits, counted from one rather than from zero.
         assert_eq!(step::materializing(0, 4), "materializing worktree 1 of 4");
         assert_eq!(step::materializing(3, 4), "materializing worktree 4 of 4");

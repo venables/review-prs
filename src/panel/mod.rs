@@ -41,12 +41,6 @@ pub fn run(cfg: &Config) -> Result<i32> {
     let dashp = repo::dashp_bin();
     repo::require_deps(&[dashp.as_str()])?;
 
-    // Two waits stand between launch and the first panelist: reading the
-    // repo, and materializing a checkout per panelist. The second can be the
-    // longest thing a panel run does before a model is asked anything.
-    let status = Status::new();
-    status.step(step::reading_repo());
-    let repo_root = repo::git_root(&status)?;
     let mut cfg = cfg.clone();
 
     let specs = if cfg.panelists.is_empty() {
@@ -72,7 +66,17 @@ pub fn run(cfg: &Config) -> Result<i32> {
     if cfg.synthesize {
         repo::require_deps(&[cfg.synth_backend.as_str()])?;
     }
+
     let panel = panelist::resolve(&specs);
+
+    // Started after every check that prints its own error, so none of them
+    // arrives wearing a spinner. Two waits stand between here and the first
+    // panelist: reading the repo, and materializing a checkout per panelist --
+    // the second is the longest thing a panel run does before a model is
+    // asked anything.
+    let status = Status::new();
+    status.step(step::reading_repo());
+    let repo_root = repo::git_root(&status)?;
 
     status.step("building the diff");
     let resolved = target::resolve(&cfg.target, &repo_root)?;
@@ -123,7 +127,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
                     // the explicit interrupt bail. Either way the user pressed
                     // ctrl-C, and 130 is what says so.
                     if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
-                        eprintln!("panel: interrupted while creating worktrees");
+                        status.say("panel: interrupted while creating worktrees");
                         return Ok(130);
                     }
                     return Err(e);
@@ -144,17 +148,20 @@ pub fn run(cfg: &Config) -> Result<i32> {
         ),
     };
 
-    // The header is the report, so the spinner steps out of its way.
-    status.clear();
+    // Printed around the spinner rather than after killing it: clearing here
+    // would finish the bar, and every tick through the two long waits below
+    // would then draw nothing at all -- which is the whole reason they tick.
     let ids: Vec<&str> = panel.iter().map(|p| p.id.as_str()).collect();
-    println!("# Panel review\n");
-    println!("- Target: {}", resolved.label);
-    println!("- Panelists: {}", ids.join(", "));
-    println!("- Outputs: `{}`", dir.display());
-    if let Some(focus) = &cfg.focus {
-        println!("- Focus: {focus}");
-    }
-    println!();
+    status.suspend(|| {
+        println!("# Panel review\n");
+        println!("- Target: {}", resolved.label);
+        println!("- Panelists: {}", ids.join(", "));
+        println!("- Outputs: `{}`", dir.display());
+        if let Some(focus) = &cfg.focus {
+            println!("- Focus: {focus}");
+        }
+        println!();
+    });
 
     let outcomes = fanout::run(
         &panel,
@@ -168,6 +175,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
     )?;
 
     if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+        status.clear();
         eprintln!("panel: interrupted; the worktrees are being removed");
         // Ok, not Err: the panelist reports above are real and already
         // printed. 130 is what a shell expects from an interrupted run.
@@ -176,12 +184,14 @@ pub fn run(cfg: &Config) -> Result<i32> {
 
     let answered = outcomes.iter().filter(|o| o.answered()).count();
     if answered == 0 {
+        status.clear();
         eprintln!("error: no panelist returned a review; there is nothing to synthesize");
         eprintln!("  what each one did is in {}", dir.display());
         bail!(AlreadyReported);
     }
 
     if !cfg.synthesize {
+        status.clear();
         eprintln!("panel: --no-synthesis, stopping after {}", crate::ui::count(answered, "report"));
         return Ok(0);
     }
@@ -204,12 +214,15 @@ pub fn run(cfg: &Config) -> Result<i32> {
             // failure: the panelist reports above are real and already
             // printed, and 130 is what a shell expects.
             if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+                status.clear();
                 eprintln!("panel: interrupted during synthesis");
                 return Ok(130);
             }
             return Err(e);
         }
     };
+    // Everything below is the report, and nothing else is coming.
+    status.clear();
     println!("# Synthesis\n");
     println!("{}", crate::report::sanitize_block(&report));
     println!();

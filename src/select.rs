@@ -47,7 +47,7 @@ pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Option<Sel
     // Permanent, not a step: it is the line that keeps "3 PRs to review" from
     // reading as a broken query on a repo showing forty in the browser, and a
     // step is erased the moment the next one replaces it.
-    status.say(step::found(found.open, found.prs.len()));
+    status.say(step::found(found.open, found.prs.len(), found.truncated));
     // Cleared before anything writes to stdout: the spinner owns the last
     // line of the terminal until it does not.
     let empty = found.prs.is_empty();

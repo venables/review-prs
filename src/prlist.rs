@@ -158,6 +158,10 @@ pub struct Fetched {
     /// Open and non-draft, before your own PRs, bots and approved ones were
     /// removed.
     pub open: usize,
+    /// The query came back full, so there are more PRs than this saw. Taken
+    /// from the raw node count, before drafts are dropped: a full page with
+    /// two drafts in it would otherwise report 48 as a fact.
+    pub truncated: bool,
 }
 
 /// Fetch and filter, saying nothing. What a refresh wants: a babysit loop
@@ -198,6 +202,7 @@ pub fn filter_prs(
     include_approved: bool,
     include_dependabot: bool,
 ) -> Fetched {
+    let truncated = prs.len() >= QUERY_LIMIT;
     let open: Vec<PrNode> = prs.into_iter().filter(|pr| !pr.is_draft).collect();
     let total = open.len();
     let prs: Vec<PrNode> = open
@@ -207,7 +212,7 @@ pub fn filter_prs(
         .filter(|pr| include_dependabot || !is_bot(pr.author_login()))
         .filter(|pr| include_approved || pr.review_decision.as_deref() != Some("APPROVED"))
         .collect();
-    Fetched { prs, open: total }
+    Fetched { prs, open: total, truncated }
 }
 
 /// Nothing left after the filters is not an error, but it does need a reason:
@@ -477,6 +482,33 @@ mod tests {
     }
 
     #[test]
+    fn a_full_page_is_known_to_be_incomplete_before_drafts_are_dropped() {
+        // The count of nodes the query returned, not the count that survived
+        // the filters: a full page holding two drafts reports 48 open, and
+        // without this flag it would report that as an exact total.
+        let mut page = Vec::new();
+        for n in 0..QUERY_LIMIT {
+            let mut pr = fixture().remove(0);
+            pr.number = n as u64 + 100;
+            pr.is_draft = n < 2;
+            page.push(pr);
+        }
+        let found = filter_prs(page, "me", false, false);
+        assert!(found.truncated, "a full page means there are more");
+        assert_eq!(found.open, QUERY_LIMIT - 2, "the drafts are still not open");
+    }
+
+    #[test]
+    fn the_query_asks_for_exactly_the_limit_it_reports() {
+        // Two values that would otherwise drift, and the "50+" label would be
+        // wrong the moment they did.
+        assert!(
+            QUERY.contains(&format!("first:{QUERY_LIMIT}")),
+            "the query and QUERY_LIMIT disagree"
+        );
+    }
+
+    #[test]
     fn an_empty_result_names_the_flags_that_would_widen_it() {
         // Nothing left is not an error, but it needs a reason: the flags that
         // would have found something are the answer most of the time.
@@ -495,6 +527,7 @@ mod tests {
         let found = filter_prs(fixture(), "me", false, false);
         assert_eq!(found.open, 6, "six open, one draft");
         assert_eq!(found.prs.len(), 3, "yours, the bot and the approved one go");
+        assert!(!found.truncated, "seven nodes is not a full page");
 
         // Widening the flags moves the second number and never the first.
         let wide = filter_prs(fixture(), "me", true, true);
