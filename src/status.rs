@@ -1,0 +1,143 @@
+//! What the tool is doing before it has anything to show.
+//!
+//! Every entry point spends the same few seconds before its first real line:
+//! `gh repo view`, `gh api user`, then one GraphQL call for the PR list. On a
+//! slow link that is several seconds of nothing at all, which reads as a hung
+//! tool rather than a working one -- and the first thing anyone does with a
+//! tool that looks hung is press ctrl-C.
+//!
+//! On a terminal this is one spinner line that rewrites itself and leaves
+//! nothing behind, so the report still starts at the top. Anywhere else --
+//! cron, CI, a pipe -- it is one plain line per step, on stderr, so a log
+//! records what happened while stdout stays the report.
+
+use crate::ui::SPINNER_FRAMES;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::io::IsTerminal;
+use std::time::Duration;
+
+pub struct Status {
+    /// None when there is no terminal to animate: the steps become plain
+    /// lines instead.
+    bar: Option<ProgressBar>,
+}
+
+impl Status {
+    pub fn new() -> Status {
+        // stderr decides, because that is where this goes: a run whose stdout
+        // is piped to a file still has a terminal to spin on.
+        if !std::io::stderr().is_terminal() {
+            return Status { bar: None };
+        }
+        let bar = ProgressBar::new_spinner();
+        bar.set_draw_target(ProgressDrawTarget::stderr());
+        bar.set_style(
+            ProgressStyle::with_template("{spinner:.magenta} {msg}")
+                .expect("spinner template")
+                .tick_strings(SPINNER_FRAMES),
+        );
+        // Steady, so the line keeps moving while a network call blocks: a
+        // frozen spinner says the same thing silence does.
+        bar.enable_steady_tick(Duration::from_millis(80));
+        Status { bar: Some(bar) }
+    }
+
+    /// What is happening now. Replaces the last step on a terminal; adds a
+    /// line anywhere else.
+    pub fn step(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        match &self.bar {
+            Some(bar) => bar.set_message(msg),
+            None => eprintln!("{msg}"),
+        }
+    }
+
+    /// Nothing more is coming. The spinner leaves no trace: what the run
+    /// found is the report's job to say, not the progress line's.
+    pub fn clear(&self) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+}
+
+impl Default for Status {
+    fn default() -> Status {
+        Status::new()
+    }
+}
+
+impl Drop for Status {
+    /// Every path out, not only the ones that finish. A fetch that fails
+    /// returns through `?` without reaching `clear`, and a spinner left
+    /// ticking under the error message is the one thing worse than no
+    /// spinner at all.
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// The steps themselves, so three front-ends word them the same way.
+pub mod step {
+    pub fn reading_repo() -> &'static str {
+        "reading the repo"
+    }
+
+    pub fn fetching(owner: &str, name: &str) -> String {
+        format!("fetching open PRs from {owner}/{name}")
+    }
+
+    /// Both numbers when the filters removed something, because "found 3
+    /// open PRs" on a repo showing 40 in the browser reads as a broken query.
+    pub fn found(open: usize, considered: usize) -> String {
+        let found = format!("found {}", crate::ui::count(open, "open PR"));
+        if considered == open {
+            return found;
+        }
+        format!("{found}, {considered} to consider")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_steps_read_as_sentences() {
+        assert_eq!(step::fetching("acme", "widgets"), "fetching open PRs from acme/widgets");
+        assert_eq!(step::found(8, 8), "found 8 open PRs");
+        // Counted in english, like everything else this crate prints -- and
+        // never as "PR(s)", which the sibling tools deliberately dropped.
+        assert_eq!(step::found(1, 1), "found 1 open PR");
+        assert!(!step::found(2, 2).contains("PR(s)"));
+        // Both numbers when they differ: most of those 40 are your own.
+        assert_eq!(step::found(40, 3), "found 40 open PRs, 3 to consider");
+    }
+
+    #[test]
+    fn a_run_with_no_terminal_still_says_its_steps() {
+        // Nothing to assert about the spinner itself; what matters is that
+        // clearing an absent one is fine, and that clearing twice is too --
+        // Drop calls it again after an explicit clear.
+        let status = Status { bar: None };
+        status.step("reading the repo");
+        status.clear();
+        status.clear();
+    }
+
+    #[test]
+    fn the_spinner_style_is_valid() {
+        // The template and the tick strings are only parsed when there is a
+        // terminal to draw on, and they are parsed with expect -- so without
+        // this a typo in either reaches a user's terminal as a panic and
+        // never reaches CI, which has no tty.
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(
+            ProgressStyle::with_template("{spinner:.magenta} {msg}")
+                .expect("spinner template")
+                .tick_strings(SPINNER_FRAMES),
+        );
+        bar.set_message("reading the repo");
+        bar.finish_and_clear();
+    }
+}

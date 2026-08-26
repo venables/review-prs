@@ -7,6 +7,7 @@ use crate::picker;
 use crate::prlist;
 use crate::repo::RepoContext;
 use crate::session;
+use crate::status::{Status, step};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -40,8 +41,15 @@ fn mark_resumable(rows: &mut [prlist::Row], ctx: &RepoContext) {
 
 /// None (after printing why) means there is nothing to do and the caller exits
 /// 0: an empty repo, a sweep with nothing actionable, or an empty pick.
-pub fn run(ctx: &RepoContext, opts: &Opts) -> Result<Option<Selection>> {
-    let Some(prs) = prlist::fetch_prs(ctx, opts.include_approved, opts.include_dependabot)? else {
+pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Option<Selection>> {
+    status.step(step::fetching(&ctx.owner, &ctx.name));
+    let found = prlist::fetch(ctx, opts.include_approved, opts.include_dependabot)?;
+    // Said before the ranking, because the ranking is the part that has
+    // nothing to wait on: this is what the network call went and got.
+    status.step(step::found(found.open, found.prs.len()));
+    let Some(prs) = prlist::explain_if_empty(found.prs, opts.include_approved, opts.include_dependabot)
+    else {
+        status.clear();
         return Ok(None);
     };
     let now = std::time::SystemTime::now()
@@ -52,8 +60,12 @@ pub fn run(ctx: &RepoContext, opts: &Opts) -> Result<Option<Selection>> {
     let titles = rows.iter().map(|r| (r.number, r.title.clone())).collect();
     let numbers = if opts.pick {
         mark_resumable(&mut rows, ctx);
+        // Cleared before the picker: gum owns the terminal from here, and a
+        // spinner ticking underneath it would fight for the same lines.
+        status.clear();
         picker::run(&rows, opts.continue_sessions, opts.include_dependabot)?
     } else {
+        status.clear();
         prlist::select_auto(&rows, opts.sweep_empty_hint)
     };
     Ok(numbers.map(|n| (n, titles)))

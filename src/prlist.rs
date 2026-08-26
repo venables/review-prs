@@ -143,9 +143,20 @@ pub struct Row {
     pub resumable: bool,
 }
 
+/// What one fetch found: the PRs this run may act on, and how many were open
+/// before the filters ran. The two differ on any repo where most of the open
+/// PRs are your own -- and "found 3 open PRs" on a repo showing 40 in the
+/// browser reads as a broken query rather than a working filter.
+pub struct Fetched {
+    pub prs: Vec<PrNode>,
+    /// Open and non-draft, before your own PRs, bots and approved ones were
+    /// removed.
+    pub open: usize,
+}
+
 /// Fetch and filter, saying nothing. What a refresh wants: a babysit loop
 /// that explained "no matching open PRs" on every interval would be noise.
-pub fn fetch(ctx: &RepoContext, include_approved: bool, include_dependabot: bool) -> Result<Vec<PrNode>> {
+pub fn fetch(ctx: &RepoContext, include_approved: bool, include_dependabot: bool) -> Result<Fetched> {
     let out = Command::new("gh")
         .args(["api", "graphql", "-F"])
         .arg(format!("owner={}", ctx.owner))
@@ -163,26 +174,28 @@ pub fn fetch(ctx: &RepoContext, include_approved: bool, include_dependabot: bool
         serde_json::from_slice(&out.stdout).context("parsing gh api graphql output")?;
     let prs = extract_nodes(&parsed)?;
 
-    let prs: Vec<PrNode> = prs
+    let open: Vec<PrNode> = prs.into_iter().filter(|pr| !pr.is_draft).collect();
+    let total = open.len();
+    let prs: Vec<PrNode> = open
         .into_iter()
-        .filter(|pr| !pr.is_draft)
         // Always hide your own PRs -- this tool is for reviewing others' work.
         .filter(|pr| pr.author_login() != ctx.me)
         .filter(|pr| include_dependabot || !is_bot(pr.author_login()))
         .filter(|pr| include_approved || pr.review_decision.as_deref() != Some("APPROVED"))
         .collect();
 
-    Ok(prs)
+    Ok(Fetched { prs, open: total })
 }
 
-/// The same fetch, but it says why when nothing is left. Returns None (after
-/// printing) when there is nothing to review -- the caller exits 0.
-pub fn fetch_prs(
-    ctx: &RepoContext,
+/// Nothing left after the filters is not an error, but it does need a reason:
+/// the two flags that would have widened the search are the answer most of
+/// the time. Returns None (after printing) when there is nothing to review --
+/// the caller exits 0.
+pub fn explain_if_empty(
+    prs: Vec<PrNode>,
     include_approved: bool,
     include_dependabot: bool,
-) -> Result<Option<Vec<PrNode>>> {
-    let prs = fetch(ctx, include_approved, include_dependabot)?;
+) -> Option<Vec<PrNode>> {
     if prs.is_empty() {
         let mut hint = String::new();
         if !include_approved {
@@ -196,9 +209,9 @@ pub fn fetch_prs(
         } else {
             println!("no open non-draft PRs");
         }
-        return Ok(None);
+        return None;
     }
-    Ok(Some(prs))
+    Some(prs)
 }
 
 /// The PR nodes out of a GraphQL response -- or a refusal. A 200 carrying an
@@ -441,6 +454,28 @@ mod tests {
         assert_eq!(nums, vec![9, 8, 6]);
         let nums: Vec<u64> = filtered(true, true).iter().map(|p| p.number).collect();
         assert_eq!(nums, vec![9, 8, 6, 3, 2]);
+    }
+
+    #[test]
+    fn an_empty_result_names_the_flags_that_would_widen_it() {
+        // Nothing left is not an error, but it needs a reason: the flags that
+        // would have found something are the answer most of the time.
+        assert!(explain_if_empty(Vec::new(), false, false).is_none());
+        assert!(explain_if_empty(Vec::new(), true, true).is_none());
+        // Something left is passed straight through.
+        let prs = filtered(false, false);
+        assert_eq!(explain_if_empty(prs, false, false).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_fetch_reports_what_its_filters_removed() {
+        // The number a user sees in the browser, and the number this tool
+        // will act on. They differ on any repo where most PRs are your own.
+        let all = fixture();
+        let open = all.iter().filter(|p| !p.is_draft).count();
+        let considered = filtered(false, false).len();
+        assert_eq!(open, 6, "six open, one draft");
+        assert_eq!(considered, 3, "yours, the bot and the approved one go");
     }
 
     #[test]

@@ -19,6 +19,16 @@ assert_not_contains "SEEN PRs are skipped" "$(claude_calls)" "/auto-review 6"
 assert_contains "a clean run reports each PR" "$out" "done    #9"
 assert_equals "a clean run exits 0" "$(last_status)" "0"
 assert_contains "the sweep names what it picked" "$out" "2 PRs to review: #9 #8"
+
+# What the run is doing before it has anything to show. Three network calls
+# stand between launch and the first review, and silence there reads as a hung
+# tool. Pinned because it is the first thing anyone sees.
+assert_contains "it says it is reading the repo" "$out" "reading the repo"
+assert_contains "...and which repo it is fetching from" \
+  "$out" "fetching open PRs from acme/widgets"
+# Both numbers, because 3 of 6 is a filter working and "found 3" alone reads
+# like a broken query on a repo that shows 6 in the browser.
+assert_contains "...and what the filters left" "$out" "found 6 open PRs, 3 to consider"
 assert_contains "the pass header counts in english" "$out" "reviewing 2 PRs"
 assert_not_contains "...without the PR(s) shape" "$out" "PR(s)"
 
