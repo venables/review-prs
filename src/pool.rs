@@ -142,7 +142,7 @@ fn deadline_for(cfg: &Config, is_override: bool) -> Option<Duration> {
 #[allow(clippy::too_many_arguments)]
 pub fn run_pass(
     queue: &[u64],
-    titles: &HashMap<u64, String>,
+    info: &HashMap<u64, crate::prlist::PrInfo>,
     cfg: &Config,
     ctx: &RepoContext,
     rundir: &RunDir,
@@ -156,7 +156,10 @@ pub fn run_pass(
         .iter()
         .map(|&n| {
             let mut job = Job::new(n);
-            job.title = titles.get(&n).cloned().unwrap_or_default();
+            if let Some(meta) = info.get(&n) {
+                job.title = meta.title.clone();
+                job.author = meta.author.clone();
+            }
             job
         })
         .collect();

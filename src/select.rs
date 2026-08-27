@@ -22,9 +22,9 @@ pub struct Opts<'a> {
     pub sweep_empty_hint: &'a str,
 }
 
-/// The chosen PR numbers, plus every fetched PR's title -- the live board wants
-/// them, the tab fan-out ignores them.
-pub type Selection = (Vec<u64>, HashMap<u64, String>);
+/// The chosen PR numbers, plus what the board needs to say about every PR it
+/// saw -- the tab fan-out ignores the second half.
+pub type Selection = (Vec<u64>, HashMap<u64, prlist::PrInfo>);
 
 fn mark_resumable(rows: &mut [prlist::Row], ctx: &RepoContext) {
     // Marking costs one hash and one glob per PR, so skip the whole loop when
@@ -63,7 +63,7 @@ pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Option<Sel
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let mut rows = prlist::build_rows(&prs, &ctx.me, now);
-    let titles = rows.iter().map(|r| (r.number, r.title.clone())).collect();
+    let info = rows.iter().map(|r| (r.number, r.info())).collect();
     let numbers = if opts.pick {
         mark_resumable(&mut rows, ctx);
         // Cleared before the picker: gum owns the terminal from here, and a
@@ -74,5 +74,5 @@ pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Option<Sel
         status.clear();
         prlist::select_auto(&rows, opts.sweep_empty_hint)
     };
-    Ok(numbers.map(|n| (n, titles)))
+    Ok(numbers.map(|n| (n, info)))
 }

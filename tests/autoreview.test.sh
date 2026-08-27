@@ -18,7 +18,7 @@ assert_contains "UPDATED/CHANGES PRs are reviewed" "$(claude_calls)" "/auto-revi
 assert_not_contains "SEEN PRs are skipped" "$(claude_calls)" "/auto-review 6"
 assert_contains "a clean run reports each PR" "$out" "done    #9"
 assert_equals "a clean run exits 0" "$(last_status)" "0"
-assert_contains "the sweep names what it picked" "$out" "2 PRs to review: #9 #8"
+assert_contains "the sweep names what it picked" "$out" "2 PRs to review: #9 (new) #8 (new)"
 
 # What the run is doing before it has anything to show. Three network calls
 # stand between launch and the first review, and silence there reads as a hung
@@ -30,6 +30,14 @@ assert_contains "...and which repo it is fetching from" \
 # like a broken query on a repo that shows 6 in the browser.
 assert_contains "...and what the filters left" "$out" "found 6 open PRs, 3 to consider"
 assert_contains "the pass header counts in english" "$out" "reviewing 2 PRs"
+
+# What the status lines say beyond the number. Each answers a question that
+# otherwise means opening the PR: whose work is this, and is this a first look
+# or a second one.
+assert_contains "a status line names the author" "$out" "start   #9 @alice"
+assert_contains "...and says this is a first look" "$out" "@alice (reviewing)"
+# The sweep line says why each PR is in the queue, not just how many.
+assert_contains "the sweep says why each PR is queued" "$out" "#9 (new)"
 assert_not_contains "...without the PR(s) shape" "$out" "PR(s)"
 
 # The old opt-in spelling still parses, so a cron line or alias keeps working.
@@ -68,6 +76,8 @@ out="$(run_autoreview --auto --continue)"
 cmd9="$(claude_call_for '/recheck-pr 9')"
 assert_contains "-C resumes the derived id" "$cmd9" "--resume $sid9"
 assert_contains "-C swaps the prompt to a re-check" "$cmd9" "/recheck-pr 9"
+assert_contains "...and the status line says it is a re-check, not a review" \
+  "$out" "(rechecking)"
 assert_contains "-C leaves a PR with no session on a fresh review" \
   "$(claude_calls)" "/auto-review 8"
 

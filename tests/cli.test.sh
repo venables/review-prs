@@ -34,7 +34,7 @@ assert_contains "...and what the filters left" "$out" "found 6 open PRs, 3 to co
 # no longer matches the bash this replaced: the "N PR(s)" shape went away
 # across both tools, so the sweep says its count in plain english.
 out="$(run_review_prs --auto)"
-assert_contains "the sweep names what it picked" "$out" "2 PRs to review: #9 #8"
+assert_contains "the sweep names what it picked" "$out" "2 PRs to review: #9 (new) #8 (new)"
 assert_not_contains "...without the PR(s) shape" "$out" "PR(s)"
 
 # Nothing actionable is not an error, and it says how to see the rest. PR #6 is

@@ -118,10 +118,16 @@ pass:
 2 PRs to review: #9 #8
 reviewing 2 PRs · logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 
-  ✓ #9 approved · risk LOW · 4m12s · $0.51  Add retry logic
-  ⠹ #8 Fix flaky test · reviewing 1m47s
+  ✓ #9 approved · risk LOW · 4m12s · $0.51  @alice Add retry logic
+  ⠹ #8 @bob Fix flaky test · rechecking 1m47s
   ━━━━━━━━━━━━╸───────────  1/2 · 1 running
 ```
+
+Each row says who opened the PR, and whether this is a first look
+(`reviewing`) or a second one against the findings already in that session
+(`rechecking`) — both questions you would otherwise open the PR to answer.
+Every `#N` is an OSC 8 hyperlink, so a terminal that supports them opens the
+PR on cmd-click.
 
 The header only mentions concurrency when it actually holds reviews back: with
 five PRs and `--jobs 2` it reads `reviewing 5 PRs, 2 at a time`.
@@ -632,7 +638,7 @@ PR tools say what they are doing through them:
 reading the repo
 fetching open PRs from acme/widgets
 found 40 open PRs, 3 to consider
-3 PRs to review: #9 #8 #6
+3 PRs to review: #9 (new) #8 (updated) #6 (new)
 ```
 
 The two counts are deliberate. The second is what is left after your own PRs,

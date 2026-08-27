@@ -135,6 +135,27 @@ impl Engagement {
     }
 }
 
+/// What the board needs to say about a PR that is not in the Job itself:
+/// who opened it, and why it is in the queue. Carried alongside the numbers
+/// from selection through to the pass, because the GraphQL answer is the only
+/// place any of it exists and re-fetching to render a line would be absurd.
+#[derive(Debug, Clone)]
+pub struct PrInfo {
+    pub title: String,
+    pub author: String,
+    pub engage: Engagement,
+}
+
+impl Row {
+    pub fn info(&self) -> PrInfo {
+        PrInfo {
+            title: self.title.clone(),
+            author: self.author.clone(),
+            engage: self.engage,
+        }
+    }
+}
+
 /// One display/selection row, already ranked.
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -391,7 +412,13 @@ pub fn select_auto(rows: &[Row], empty_hint: &str) -> Option<Vec<u64>> {
         println!("no NEW or UPDATED PRs to review{empty_hint}");
         return None;
     }
-    let list: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
+    // Each number carries the reason it is here. "4 PRs to review" answers
+    // how many; the reader's next question is always which of them are new.
+    let list: Vec<String> = rows
+        .iter()
+        .filter(|r| matches!(r.engage, Engagement::New | Engagement::Updated))
+        .map(|r| format!("#{} ({})", r.number, r.engage.label().to_lowercase()))
+        .collect();
     println!("{} to review: {}", crate::ui::count(numbers.len(), "PR"), list.join(" "));
     Some(numbers)
 }
