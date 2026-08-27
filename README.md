@@ -1,76 +1,47 @@
-# review-prs
+# autoreview
 
-Pick open GitHub PRs from a multi-select list and fan each one out into its own
-terminal tab running a review command per PR. Built for batch-reviewing a repo's
-open pull requests without manually opening tabs and typing commands.
+An automated code review system. It watches a repo's pull requests, reviews
+each one with a panel of independent models, posts what they found, and
+approves the ones that come back clean — then keeps watching, so a PR opened or
+pushed to while it runs gets picked up too.
 
-Three binaries over one library, so they cannot disagree about which PRs are
-worth reviewing or which session a PR belongs to:
+You can also drive every part of it by hand.
 
 | Command                     | Reviews                    | Use when                                                                |
 | --------------------------- | -------------------------- | ----------------------------------------------------------------------- |
-| `review-prs`                | a repo's PRs, one tab each | you want to watch a review happen and interrupt it                      |
-| [`autoreview`](#autoreview) | a repo's PRs, headlessly   | there is no terminal (ssh, cron, CI), or a dozen PRs means a dozen tabs |
+| [`autoreview`](#autoreview) | a repo's PRs, headlessly   | the default: no terminal needed, and an exit status that means something |
 | [`panel`](#panel)           | one change, several models | you want independent second opinions on a single diff                   |
+| [`review-prs`](#review-prs) | a repo's PRs, one tab each | you want to watch a review happen and steer it mid-flight               |
 
-`review-prs` and `autoreview` review a repo's PRs; each PR's review is a
-[`panel-review`](https://github.com/catena-labs/dev-skills) by default.
-[`panel`](#panel) is that panel on its own, for one diff, without the skill.
-
-## What it does
-
-1. Lists the current repo's open, non-draft PRs (via the GitHub GraphQL API).
-2. Annotates each with an engagement badge, a review-state flag, and a relative
-   "last activity" time, then sorts the most actionable ones to the top.
-3. Lets you multi-select with [gum](https://github.com/charmbracelet/gum).
-4. Opens a new terminal tab per selection, `cd`s to the repo root, and runs the
-   review command (see [Review command](#review-command)) for each PR.
-
-Steps 1-3 are shared with [`autoreview`](#autoreview), which replaces step 4
-with a headless subprocess per PR.
-
-## While it waits
-
-Three network calls stand between launch and the first thing worth showing:
-`gh repo view`, `gh api user`, then one GraphQL call for the PR list. Both
-tools say what they are doing through them:
+## How a review happens
 
 ```
-reading the repo
-fetching open PRs from acme/widgets
-found 40 open PRs, 3 to consider
-3 PRs to review: #9 #8 #6
+autoreview             picks every PR that is NEW or UPDATED
+  └─ dash-p → claude   one headless agent per PR, --jobs at a time
+       └─ /auto-review a panel of models reviews the diff independently,
+                       their findings are synthesized, verified, and posted
+  ← verdict            read back from GitHub, not taken from the agent's word
+  ↻ --babysit          watch on an interval: new PRs join, fixed ones leave
 ```
 
-The two counts are deliberate. The second is what is left after your own PRs,
-bots and approved ones are filtered out — and on a repo where most of the open
-PRs are yours, "found 3" on its own reads as a broken query rather than a
-working filter.
+The panel in the middle is the
+[`auto-review`](https://github.com/catena-labs/dev-skills) skill, which each
+agent runs against its own PR. [`panel`](#panel) is that same idea as a binary
+you can point at any diff, with no PR and no skill involved.
 
-The `found` line stays. The steps around it do not: on a terminal they are one
-spinner line that rewrites itself and leaves nothing behind, so the report
-still starts at the top. Under cron and CI, or with stderr redirected, each
-step is a plain line instead.
+Four things that shape the whole design:
 
-**stderr decides**, because that is where all of this goes — a run whose stdout
-is piped to a file still has a terminal to spin on, and still leaves that file
-holding only the report.
-
-`panel` reports its own three waits the same way, and the last two count up
-rather than sitting still:
-
-```
-reading the repo
-building the diff
-materializing worktree 3 of 4
-3 panelists still reviewing, 4m12s
-synthesizing with claude, 1m30s
-```
-
-Materializing a checkout per panelist is the longest thing a panel run does
-before a model is asked anything, and the synthesis is the most expensive
-silence in the run to mistake for a hang — every panelist has already been
-paid for by the time it starts.
+- **The exit status means the reviews succeeded**, not that the processes
+  started. A cron job or a CI step can tell a finished sweep from a broken one.
+- **The verdict is read back from GitHub.** An agent that believed its own
+  report would show "approved" for an approval that never landed.
+- **A review runs in a session you can reopen.** Losing the terminal loses live
+  steering, not access: every review's session id is printed, and
+  `claude --resume <id>` picks it up.
+- **Unattended means bounded.** `--jobs` caps concurrency, `--budget` caps each
+  review's spend, `--timeout` stops a wedged one, `--max-passes` stops a
+  conversation becoming a loop, and `--max-idle` stops a quiet PR keeping a
+  cron-started process alive forever.
 
 ## Requirements
 
@@ -96,167 +67,28 @@ paid for by the time it starts.
 ### Homebrew
 
 ```sh
-brew install venabots/tap/review-prs
+brew install venabots/tap/autoreview
 ```
 
 ### Manual
 
 ```sh
-git clone git@github.com:venabots/review-prs.git
-cargo install --path review-prs
+git clone git@github.com:venabots/autoreview.git
+cargo install --path autoreview
 ```
 
-That installs both binaries. Both are self-contained: nothing is read from the
-checkout at runtime, so a copy or a symlink anywhere on `$PATH` works.
-
-## Usage
-
-Run from inside any GitHub repo:
-
-```sh
-review-prs              # open, non-draft, unapproved PRs (excludes yours + bots)
-review-prs --auto       # skip the picker; auto-review every NEW/UPDATED PR
-review-prs --babysit    # re-check non-approvable PRs on an interval until approved
-review-prs --babysit=15 # ...every 15 minutes (default 30)
-review-prs --continue   # resume an earlier review session instead of starting over
-review-prs --all        # also include PRs already marked APPROVED
-review-prs --dependabot # also include Dependabot PRs (shown dimmed)
-review-prs --help       # usage
-```
-
-In the picker: `space` toggles a PR, `enter` confirms. Each selected PR opens in
-a fresh tab.
-
-## Review command
-
-Each spawned tab `cd`s to the repo root and runs a review command for the PR.
-By default that is a non-interactive [Claude Code](https://claude.com/claude-code)
-panel review:
-
-```sh
-claude --dangerously-skip-permissions --session-id <uuid> "panel review <number>"
-```
-
-(The `--session-id` is what makes [`--continue`](#continue-mode) possible later.)
-
-Override it with the `REVIEW_PRS_CMD` environment variable. The PR number is
-substituted for the first `{}` placeholder, or appended if there is no
-placeholder:
-
-```sh
-# Append form — runs `review 123` in each tab (e.g. a shell function/alias):
-REVIEW_PRS_CMD='review' review-prs
-
-# Placeholder form — substitute the number anywhere in the command:
-REVIEW_PRS_CMD='gh pr checkout {} && my-reviewer' review-prs
-```
-
-Note that `REVIEW_PRS_CMD` must be on the spawned tab's `PATH` (or be a shell
-function/alias defined in its startup files) — the command runs in a fresh
-shell, not the one you launched `review-prs` from.
-
-An overridden command owns its own session handling. It still receives the PR's
-session id as `$REVIEW_PRS_SESSION_ID`, along with `$REVIEW_PRS_SESSION_RESUME`
-(`1` when `--continue` matched an existing session, `0` otherwise), so it can
-wire up resumption however it likes.
-
-### Auto mode
-
-`--auto` skips the picker entirely: it fans out **every `NEW` and `UPDATED` PR**
-(the actionable ones) and runs an auto-review command in each tab. `SEEN` PRs
-are skipped on purpose — nothing has changed since you last engaged, so there's
-no reason to re-review them. Combine with `--all` / `--dependabot` to widen the
-set.
-
-The per-tab command is `REVIEW_PRS_AUTO_CMD` (same `{}`/append substitution as
-`REVIEW_PRS_CMD`), defaulting to the
-[`pr-review-tab`](https://github.com/catena-labs/dev-skills) skill:
-
-```sh
-claude --dangerously-skip-permissions --session-id <uuid> "pr-review-tab <number>"
-```
-
-That skill runs an auto-review and, **when the PR is approved, closes its tab**
-so a finished review cleans up after itself. (Tabs are closed via the enclosing
-multiplexer — `herdr tab close` / `cmux close-surface` — from inside the tab,
-which is why the behavior lives in the skill, not in review-prs.)
-
-### Babysit mode
-
-`--babysit` keeps a not-yet-approvable PR's tab open and **re-checks it on an
-interval until it can be approved**, then closes the tab — so a fix pushed
-overnight gets stamped without you re-running anything. The interval defaults to
-30 minutes; set it with `--babysit=MINUTES` or `$REVIEW_PRS_BABYSIT_INTERVAL`. A
-bare number is minutes, and suffixed durations (`30m`, `1h`, `2d`) work too;
-anything else is rejected up front rather than seeded into the tab.
-
-It uses the same unattended command as `--auto`, so it composes with both the
-sweep (`review-prs --auto --babysit`) and the picker (`review-prs --babysit`,
-then choose which PRs to babysit). Under the hood the `pr-review-tab` skill
-starts an in-session `/loop` that re-runs the
-[`recheck-pr`](https://github.com/catena-labs/dev-skills) skill each interval;
-`recheck-pr`'s fast path makes a no-change cycle cheap, and the loop ends when
-the tab closes on approval.
-
-### Continue mode
-
-`--continue` (`-C`) reopens the review session a PR already had on this machine
-instead of reviewing it from scratch. The resumed tab still holds the earlier
-findings, so it takes a **second look** — did the author fix them? — rather than
-re-deriving a review the author has already answered.
-
-```sh
-review-prs --continue            # picker; RESUMABLE rows reopen their session
-review-prs --auto --continue     # sweep, resuming wherever a session exists
-```
-
-Each PR gets a session id derived from the repo directory plus
-`owner/name#number`, so the same PR in the same checkout maps to the same
-session on every run. There is no state file: nothing to sync, nothing to go
-stale when a PR closes. A first review pins the id with `--session-id`;
-`--continue` reopens it with `--resume` and swaps the prompt:
-
-| Run                    | Prompt                        |
-| ---------------------- | ----------------------------- |
-| First review           | `panel review <N>`            |
-| `--continue`           | `recheck-pr <N>`              |
-| `--auto` / `--babysit` | `pr-review-tab <N>`           |
-| ...with `--continue`   | `pr-review-tab <N> --recheck` |
-
-PRs with a session show `RESUMABLE` in the picker, so you can see what would be
-resumed before you choose. Without `--continue` those PRs review from scratch in
-a fresh session, exactly as before.
-
-Two limits worth knowing:
-
-- **A session belongs to one checkout.** Sessions live under
-  `~/.claude/projects`, keyed to the repo root the tab `cd`s into, and the id
-  hashes that path in. A second clone or a `git worktree` of the same repo
-  therefore starts its own session for the same PR rather than reopening the
-  other one. Another machine will not find them at all.
-- **Sessions grow.** A PR resumed many times accumulates context and eventually
-  auto-compacts. That is fine for a second look; it is not a substitute for a
-  fresh review when a PR has been rewritten.
-- **Only the first review is addressable.** A PR keeps exactly one derived id.
-  Reviewing a PR again _without_ `-C` deliberately starts an unnamed session, so
-  a later `-C` reopens the first review, not that one. Treat a no-`-C` re-review
-  as a throwaway; use `-C` for the thread you want to keep.
-- **One tab at a time.** `-C` will not reopen a session another tab still holds
-  open — a babysit tab, typically. It says so and reviews fresh instead.
-
-Your own PRs are always excluded — this tool is for reviewing others' work.
-Dependabot PRs are hidden by default; pass `--dependabot` to include them, where
-they appear dimmed to mark them as lower-priority. (The bot match is one
-anchored prefix in `src/prlist.rs` — extend it as more AI coding bots show up.)
+Either way you get all three binaries. All three are self-contained: nothing is
+read from the checkout at runtime, so a copy or a symlink anywhere on `$PATH`
+works.
 
 ## autoreview
 
-`autoreview` reviews the same PRs without tabs. Each review runs as a
+The default way to run all this. Each PR is reviewed by a
 [dash-p](https://github.com/venabots/dash-p) subprocess driving claude
-headlessly. The run shows a live per-PR board, reads each
-review's verdict back from GitHub when it finishes, and ends with a summary
-of verdicts, findings, models and cost. It exits nonzero if any review
-failed.
+headlessly, `--jobs` at a time. The run shows a live per-PR board, reads each
+review's verdict back from GitHub when it finishes, and ends with a summary of
+verdicts, findings, models and cost. It exits nonzero if any review failed,
+which is what makes it safe to put in cron or CI.
 
 ```sh
 autoreview                  # review every NEW/UPDATED PR
@@ -267,10 +99,11 @@ autoreview --babysit=15     # re-run every 15 min, picking up new PRs as they op
 autoreview --help           # usage
 ```
 
-**Sweeping is the default here, and the picker is the flag.** `review-prs`
-opens a tab per PR, so choosing which tabs to open is the point; `autoreview`
-has no tabs to open, so the ordinary run is "review whatever is actionable"
-and `--pick` is for the times you want a subset. `--auto` / `-A` still parse —
+**Sweeping is the default, and the picker is the flag.** There are no tabs to
+choose between here, so the ordinary run is "review whatever is actionable" and
+`--pick` is for the times you want a subset. ([`review-prs`](#review-prs) is
+the other way round: it opens a tab per PR, so choosing which tabs to open is
+the point.) `--auto` / `-A` still parse —
 an old alias or cron line keeps working — they just name the default now.
 
 It takes the same selection flags as `review-prs` (`--continue`, `--all`,
@@ -360,29 +193,36 @@ MODEL is dash-p's accounting (`model_resolved` in its envelope): the model
 that drove the review session. The panel table lists the models the
 panelists ran on, as they reported them to the session that fanned them out.
 
-### What you trade
+### Reaching into a review
 
-Losing the tab loses live steering, not access. A PR with no session yet gets
-the same derived id `review-prs` would pin, so `claude --resume <id>` reopens
-the review afterwards — which is why the summary prints one per PR. (The id
-comes from the result envelope, so it names the review that just ran even when
-the run let Claude Code allocate its own.) Intervention becomes on-demand rather
-than up-front.
+There is no tab to interrupt, which loses live steering but not access. Every
+review runs in a session with a derived id, and the summary prints one per PR:
 
-What you gain:
+```sh
+claude --resume cc10f740-28c3-58c6-ae64-d9ff37df22a7
+```
 
-- **No terminal needed.** `review-prs` requires herdr, cmux or Ghostty and
-  refuses to run without one. This runs anywhere.
-- **An exit status that means something.** `review-prs` can only report whether
-  the _tabs opened_. This reports whether the _reviews succeeded_, so a cron job
-  or CI step can tell a finished sweep from a broken one. dash-p's exit codes
-  are the signal: an `is_error` turn and garbage output are both `agent-error`,
-  and a review that overruns `--timeout` counts as failed too.
-- **Bounded concurrency.** Twelve PRs is twelve tabs under `review-prs`; here it
-  is `--jobs 2`. Keep that number low — a panel review is itself several agents,
+That reopens the review as it was, findings and all. (The id comes from the
+result envelope, so it names the session the review actually ran in, even when
+the run let Claude Code allocate its own.) Intervention becomes on-demand
+rather than up-front — which is the trade that makes an unattended sweep
+possible at all.
+
+The same trade buys three other things a tab cannot give you:
+
+- **It runs anywhere.** No terminal required, so ssh, cron and CI are all fine.
+  ([`review-prs`](#review-prs) needs herdr, cmux or Ghostty and refuses without
+  one.)
+- **Bounded concurrency.** Twelve PRs is twelve tabs the other way; here it is
+  `--jobs 2`. Keep that number low — a panel review is itself several agents,
   so `--jobs 4` can mean a dozen concurrent processes.
 - **Per-PR accounting.** dash-p's meta envelope gives cost per PR, and
   `--budget` caps each review's spend (claude's `--max-budget-usd`).
+
+The exit status is the fourth, and it is the one that makes the whole thing
+automatable: dash-p's codes are the signal, so an `is_error` turn and garbage
+output are both `agent-error`, and a review that overruns `--timeout` counts as
+failed too.
 
 ### Prompts
 
@@ -560,6 +400,187 @@ which stops the panelists first.
 review approaches (`/decompose`), and `$PANEL_REVIEW_PANELISTS`-style env
 configuration all still live in the skill. This is the common path only.
 
+## review-prs
+
+The same PR list, fanned into one terminal tab per PR instead of a headless
+process. Reach for it when you want to watch a review happen and interrupt it;
+reach for [`autoreview`](#autoreview) for everything else.
+
+Run from inside any GitHub repo:
+
+```sh
+review-prs              # open, non-draft, unapproved PRs (excludes yours + bots)
+review-prs --auto       # skip the picker; auto-review every NEW/UPDATED PR
+review-prs --babysit    # re-check non-approvable PRs on an interval until approved
+review-prs --babysit=15 # ...every 15 minutes (default 30)
+review-prs --continue   # resume an earlier review session instead of starting over
+review-prs --all        # also include PRs already marked APPROVED
+review-prs --dependabot # also include Dependabot PRs (shown dimmed)
+review-prs --help       # usage
+```
+
+In the picker: `space` toggles a PR, `enter` confirms. Each selected PR opens in
+a fresh tab.
+
+### The review command
+
+Each spawned tab `cd`s to the repo root and runs a review command for the PR.
+By default that is a non-interactive [Claude Code](https://claude.com/claude-code)
+panel review:
+
+```sh
+claude --dangerously-skip-permissions --session-id <uuid> "panel review <number>"
+```
+
+(The `--session-id` is what makes [`--continue`](#continue-mode) possible later.)
+
+Override it with the `REVIEW_PRS_CMD` environment variable. The PR number is
+substituted for the first `{}` placeholder, or appended if there is no
+placeholder:
+
+```sh
+# Append form — runs `review 123` in each tab (e.g. a shell function/alias):
+REVIEW_PRS_CMD='review' review-prs
+
+# Placeholder form — substitute the number anywhere in the command:
+REVIEW_PRS_CMD='gh pr checkout {} && my-reviewer' review-prs
+```
+
+Note that `REVIEW_PRS_CMD` must be on the spawned tab's `PATH` (or be a shell
+function/alias defined in its startup files) — the command runs in a fresh
+shell, not the one you launched `review-prs` from.
+
+An overridden command owns its own session handling. It still receives the PR's
+session id as `$REVIEW_PRS_SESSION_ID`, along with `$REVIEW_PRS_SESSION_RESUME`
+(`1` when `--continue` matched an existing session, `0` otherwise), so it can
+wire up resumption however it likes.
+
+### Auto mode
+
+`--auto` skips the picker entirely: it fans out **every `NEW` and `UPDATED` PR**
+(the actionable ones) and runs an auto-review command in each tab. `SEEN` PRs
+are skipped on purpose — nothing has changed since you last engaged, so there's
+no reason to re-review them. Combine with `--all` / `--dependabot` to widen the
+set.
+
+The per-tab command is `REVIEW_PRS_AUTO_CMD` (same `{}`/append substitution as
+`REVIEW_PRS_CMD`), defaulting to the
+[`pr-review-tab`](https://github.com/catena-labs/dev-skills) skill:
+
+```sh
+claude --dangerously-skip-permissions --session-id <uuid> "pr-review-tab <number>"
+```
+
+That skill runs an auto-review and, **when the PR is approved, closes its tab**
+so a finished review cleans up after itself. (Tabs are closed via the enclosing
+multiplexer — `herdr tab close` / `cmux close-surface` — from inside the tab,
+which is why the behavior lives in the skill, not in review-prs.)
+
+### Babysit mode
+
+`--babysit` keeps a not-yet-approvable PR's tab open and **re-checks it on an
+interval until it can be approved**, then closes the tab — so a fix pushed
+overnight gets stamped without you re-running anything. The interval defaults to
+30 minutes; set it with `--babysit=MINUTES` or `$REVIEW_PRS_BABYSIT_INTERVAL`. A
+bare number is minutes, and suffixed durations (`30m`, `1h`, `2d`) work too;
+anything else is rejected up front rather than seeded into the tab.
+
+It uses the same unattended command as `--auto`, so it composes with both the
+sweep (`review-prs --auto --babysit`) and the picker (`review-prs --babysit`,
+then choose which PRs to babysit). Under the hood the `pr-review-tab` skill
+starts an in-session `/loop` that re-runs the
+[`recheck-pr`](https://github.com/catena-labs/dev-skills) skill each interval;
+`recheck-pr`'s fast path makes a no-change cycle cheap, and the loop ends when
+the tab closes on approval.
+
+### Continue mode
+
+`--continue` (`-C`) reopens the review session a PR already had on this machine
+instead of reviewing it from scratch. The resumed tab still holds the earlier
+findings, so it takes a **second look** — did the author fix them? — rather than
+re-deriving a review the author has already answered.
+
+```sh
+review-prs --continue            # picker; RESUMABLE rows reopen their session
+review-prs --auto --continue     # sweep, resuming wherever a session exists
+```
+
+Each PR gets a session id derived from the repo directory plus
+`owner/name#number`, so the same PR in the same checkout maps to the same
+session on every run. There is no state file: nothing to sync, nothing to go
+stale when a PR closes. A first review pins the id with `--session-id`;
+`--continue` reopens it with `--resume` and swaps the prompt:
+
+| Run                    | Prompt                        |
+| ---------------------- | ----------------------------- |
+| First review           | `panel review <N>`            |
+| `--continue`           | `recheck-pr <N>`              |
+| `--auto` / `--babysit` | `pr-review-tab <N>`           |
+| ...with `--continue`   | `pr-review-tab <N> --recheck` |
+
+PRs with a session show `RESUMABLE` in the picker, so you can see what would be
+resumed before you choose. Without `--continue` those PRs review from scratch in
+a fresh session, exactly as before.
+
+Two limits worth knowing:
+
+- **A session belongs to one checkout.** Sessions live under
+  `~/.claude/projects`, keyed to the repo root the tab `cd`s into, and the id
+  hashes that path in. A second clone or a `git worktree` of the same repo
+  therefore starts its own session for the same PR rather than reopening the
+  other one. Another machine will not find them at all.
+- **Sessions grow.** A PR resumed many times accumulates context and eventually
+  auto-compacts. That is fine for a second look; it is not a substitute for a
+  fresh review when a PR has been rewritten.
+- **Only the first review is addressable.** A PR keeps exactly one derived id.
+  Reviewing a PR again _without_ `-C` deliberately starts an unnamed session, so
+  a later `-C` reopens the first review, not that one. Treat a no-`-C` re-review
+  as a throwaway; use `-C` for the thread you want to keep.
+- **One tab at a time.** `-C` will not reopen a session another tab still holds
+  open — a babysit tab, typically. It says so and reviews fresh instead.
+
+Your own PRs are always excluded — this tool is for reviewing others' work.
+Dependabot PRs are hidden by default; pass `--dependabot` to include them, where
+they appear dimmed to mark them as lower-priority. (The bot match is one
+anchored prefix in `src/prlist.rs` — extend it as more AI coding bots show up.)
+
+### Naming
+
+Under herdr and cmux, review sessions label themselves so a screenful of tabs
+stays readable:
+
+- **Workspace** — renamed to `REVIEW_PRS_WORKSPACE` (default `pr reviews`). Set
+  it empty (`REVIEW_PRS_WORKSPACE=`) to leave your workspace title alone.
+- **Tabs** — named for the PR and what the tab is doing: `PR 27 Review`,
+  `PR 27 Auto-Review` (`--auto`), `PR 27 Recheck` (a resumed `--continue`
+  session), or `PR 27 Babysit` (`--babysit`, which wins over the others).
+
+Both names are sticky: they survive the terminal-title escapes the review
+command emits while it runs, which would otherwise replace them with a generic
+agent-generated summary.
+
+The workspace rename and the cmux tab rename are best-effort — a failure there
+is ignored. Under herdr the label is applied at tab-create time, so a rejected
+label fails that tab's spawn; the sweep warns and continues with the next PR.
+
+Ghostty tabs are left unnamed. It has no sticky-title API, so any title set at
+spawn time would be overwritten by the review command within seconds.
+
+## Picking the PRs
+
+`review-prs` and `autoreview` start the same way:
+
+1. List the current repo's open, non-draft PRs (via the GitHub GraphQL API).
+2. Annotate each with an engagement badge, a review-state flag, and a relative
+   "last activity" time, then sort the most actionable to the top.
+3. Take every `NEW` and `UPDATED` PR, or let you multi-select with
+   [gum](https://github.com/charmbracelet/gum).
+
+Then they diverge: `review-prs` opens a terminal tab per PR and runs the
+[review command](#the-review-command) in it; `autoreview` runs a headless
+subprocess per PR instead. `panel` does none of this — it takes one diff and
+asks several models about it.
+
 ## Columns
 
 ```
@@ -601,27 +622,48 @@ never reviewed, every row would read `-`.
 PRs are sorted `NEW` first, then `UPDATED`, then `SEEN`, with most recent
 activity breaking ties.
 
-## Naming
+## While it waits
 
-Under herdr and cmux, review sessions label themselves so a screenful of tabs
-stays readable:
+Three network calls stand between launch and the first thing worth showing:
+`gh repo view`, `gh api user`, then one GraphQL call for the PR list. The two
+PR tools say what they are doing through them:
 
-- **Workspace** — renamed to `REVIEW_PRS_WORKSPACE` (default `pr reviews`). Set
-  it empty (`REVIEW_PRS_WORKSPACE=`) to leave your workspace title alone.
-- **Tabs** — named for the PR and what the tab is doing: `PR 27 Review`,
-  `PR 27 Auto-Review` (`--auto`), `PR 27 Recheck` (a resumed `--continue`
-  session), or `PR 27 Babysit` (`--babysit`, which wins over the others).
+```
+reading the repo
+fetching open PRs from acme/widgets
+found 40 open PRs, 3 to consider
+3 PRs to review: #9 #8 #6
+```
 
-Both names are sticky: they survive the terminal-title escapes the review
-command emits while it runs, which would otherwise replace them with a generic
-agent-generated summary.
+The two counts are deliberate. The second is what is left after your own PRs,
+bots and approved ones are filtered out — and on a repo where most of the open
+PRs are yours, "found 3" on its own reads as a broken query rather than a
+working filter.
 
-The workspace rename and the cmux tab rename are best-effort — a failure there
-is ignored. Under herdr the label is applied at tab-create time, so a rejected
-label fails that tab's spawn; the sweep warns and continues with the next PR.
+The `found` line stays. The steps around it do not: on a terminal they are one
+spinner line that rewrites itself and leaves nothing behind, so the report
+still starts at the top. Under cron and CI, or with stderr redirected, each
+step is a plain line instead.
 
-Ghostty tabs are left unnamed. It has no sticky-title API, so any title set at
-spawn time would be overwritten by the review command within seconds.
+**stderr decides**, because that is where all of this goes — a run whose stdout
+is piped to a file still has a terminal to spin on, and still leaves that file
+holding only the report.
+
+`panel` reports its own three waits the same way, and the last two count up
+rather than sitting still:
+
+```
+reading the repo
+building the diff
+materializing worktree 3 of 4
+3 panelists still reviewing, 4m12s
+synthesizing with claude, 1m30s
+```
+
+Materializing a checkout per panelist is the longest thing a panel run does
+before a model is asked anything, and the synthesis is the most expensive
+silence in the run to mistake for a hang — every panelist has already been
+paid for by the time it starts.
 
 ## Notes
 
