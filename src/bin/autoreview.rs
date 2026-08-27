@@ -31,19 +31,20 @@ fn select_prs(cfg: &Config) -> select::Opts<'static> {
 
 /// What the sweep would pick up right now, said quietly -- a babysit loop
 /// that re-announced the whole list on every interval would be noise. Also
-/// returns the titles, so a PR that joined mid-run has one on the board.
+/// returns what the board needs, so a PR that joined mid-run is not a bare
+/// number on it.
 fn actionable_now(
     cfg: &Config,
     ctx: &repo::RepoContext,
     status: &Status,
-) -> anyhow::Result<(Vec<u64>, HashMap<u64, String>)> {
+) -> anyhow::Result<(Vec<u64>, HashMap<u64, prlist::PrInfo>)> {
     let prs = prlist::fetch(ctx, cfg.include_approved, cfg.include_dependabot, status)?.prs;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let rows = prlist::build_rows(&prs, &ctx.me, now);
-    let titles = rows.iter().map(|r| (r.number, r.title.clone())).collect();
+    let info = rows.iter().map(|r| (r.number, r.info())).collect();
     let numbers = rows
         .iter()
         .filter(|r| {
@@ -54,7 +55,7 @@ fn actionable_now(
         })
         .map(|r| r.number)
         .collect();
-    Ok((numbers, titles))
+    Ok((numbers, info))
 }
 
 /// Say what changed since the last pass, so a queue that grew explains itself
@@ -114,7 +115,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     status.step(step::reading_repo());
     let ctx = repo::load(&status)?;
 
-    let Some((numbers, titles)) = select::run(&ctx, &select_prs(cfg), &status)? else {
+    let Some((numbers, info)) = select::run(&ctx, &select_prs(cfg), &status)? else {
         return Ok(0);
     };
 
@@ -131,7 +132,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // see and kill.
     let mut cfg = cfg.clone();
     let mut queue = numbers;
-    let mut titles = titles;
+    let mut info = info;
     // A --pick run may never grow past what was picked; a sweep may.
     let picked = cfg.pick.then(|| queue.clone());
     let mut tracker = Queue::new(cfg.max_passes, picked);
@@ -143,7 +144,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     let mut pass = 1u32;
     let (failures, total) = loop {
         rundir.start_pass(pass)?;
-        let jobs = pool::run_pass(&queue, &titles, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
+        let jobs = pool::run_pass(&queue, &info, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
         ui.print_summary(&jobs, &rundir.pass_dir);
         let failures = pool::failures(&jobs);
         tracker.record_pass(&queue);
@@ -180,9 +181,9 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             let looked = actionable_now(&cfg, &ctx, &refresh);
             refresh.clear();
             let fresh = match looked {
-                Ok((numbers, fresh_titles)) => {
+                Ok((numbers, fresh_info)) => {
                     refresh_failures = 0;
-                    titles.extend(fresh_titles);
+                    info.extend(fresh_info);
                     numbers
                 }
                 Err(e) => {

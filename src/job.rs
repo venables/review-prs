@@ -43,6 +43,9 @@ pub struct Job {
     pub pr: u64,
     /// The PR title, for the live board; empty when unknown.
     pub title: String,
+    /// Who opened it. On the board because a row that says only "#9" makes
+    /// you go and look up whose work you are about to spend money reviewing.
+    pub author: String,
     pub state: JobState,
     /// The child's pid doubles as its process-group id (process_group(0)).
     pub pgid: Option<i32>,
@@ -74,6 +77,7 @@ impl Job {
         Job {
             pr,
             title: String::new(),
+            author: String::new(),
             state: JobState::Queued,
             pgid: None,
             flag: SessionFlag::None,

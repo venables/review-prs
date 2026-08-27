@@ -215,8 +215,15 @@ impl Ui {
             return;
         }
         let n = job.pr;
+        // The same three facts the board shows, one line each: who opened it,
+        // and whether this is a first look or a second one. A log that only
+        // says "start #9" makes you open the PR to learn either.
+        let who = if job.author.is_empty() { String::new() } else { format!(" @{}", job.author) };
         match job.state {
-            JobState::Running => println!("start   #{n}"),
+            JobState::Running => {
+                let verb = if job.resume { "rechecking" } else { "reviewing" };
+                println!("start   #{n}{who} ({verb})");
+            }
             JobState::Done => println!("done    #{n} ({})", fmt_dur(job.elapsed_secs)),
             JobState::Failed => {
                 println!("FAILED  #{n} ({}, {})", job.outcome(), fmt_dur(job.elapsed_secs))
@@ -251,6 +258,9 @@ impl Ui {
     }
 
     fn board_transition(&mut self, job: &Job) {
+        // Rendered before the board is borrowed mutably: pr_label reads self,
+        // and the borrow checker is right that both at once is not allowed.
+        let label = self.pr_label(job.pr);
         let Some(board) = &mut self.board else {
             return;
         };
@@ -262,7 +272,7 @@ impl Ui {
                         .expect("spinner template")
                         .tick_strings(SPINNER_FRAMES),
                 );
-                bar.set_message(running_line(job));
+                bar.set_message(running_line(label, job));
                 bar.enable_steady_tick(Duration::from_millis(80));
                 board.bars.insert(job.pr, bar);
             }
@@ -271,7 +281,7 @@ impl Ui {
                     bar.finish_and_clear();
                     board.mp.remove(&bar);
                 }
-                let _ = board.mp.println(finished_line(job));
+                let _ = board.mp.println(finished_line(label, job));
                 board.footer.inc(1);
             }
             JobState::Queued => {}
@@ -297,7 +307,7 @@ impl Ui {
                         running += 1;
                     }
                     if let Some(bar) = board.bars.get(&job.pr) {
-                        bar.set_message(running_line(job));
+                        bar.set_message(running_line(self.pr_label(job.pr), job));
                     }
                 }
                 JobState::Queued => queued += 1,
@@ -504,7 +514,19 @@ fn short_title(title: &str) -> String {
     console::truncate_str(&clean, TITLE_WIDTH, "…").to_string()
 }
 
-fn running_line(job: &Job) -> String {
+/// Who opened it and what it is called, in the width the board has. A row
+/// that says only "#9" makes you go and look up whose work you are about to
+/// spend money reviewing.
+fn who_and_what(job: &Job) -> String {
+    if job.author.is_empty() {
+        return short_title(&job.title);
+    }
+    short_title(&format!("@{} {}", job.author, job.title))
+}
+
+/// `label` is the PR number as the caller wants it rendered -- clickable
+/// where the terminal allows it, plain text everywhere else.
+fn running_line(label: String, job: &Job) -> String {
     // A reaped review already exited and only the verdict readback remains:
     // freeze the clock at the real duration rather than letting it climb
     // past what the summary will report.
@@ -518,14 +540,14 @@ fn running_line(job: &Job) -> String {
     };
     format!(
         "{} {} {}",
-        style(format!("#{}", job.pr)).cyan().bold(),
-        style(short_title(&job.title)).dim(),
+        style(label).cyan().bold(),
+        style(who_and_what(job)).dim(),
         style(format!("· {verb} {}", fmt_dur(secs))).magenta()
     )
 }
 
 /// The permanent line a finished review leaves on the board.
-fn finished_line(job: &Job) -> String {
+fn finished_line(label: String, job: &Job) -> String {
     let (mark, headline) = match job.state {
         JobState::Done => {
             let word = match job.verdict.as_deref() {
@@ -553,9 +575,9 @@ fn finished_line(job: &Job) -> String {
     }
     format!(
         "  {mark} {} {headline} {} {}",
-        style(format!("#{}", job.pr)).cyan().bold(),
+        style(label).cyan().bold(),
         style(format!("· {}", extras.join(" · "))).dim(),
-        style(short_title(&job.title)).dim()
+        style(who_and_what(job)).dim()
     )
 }
 
@@ -685,11 +707,37 @@ mod tests {
         job.title = "t".into();
         job.reaped = true;
         job.elapsed_secs = 252;
-        let line = running_line(&job);
+        let line = running_line("#9".into(), &job);
         assert!(line.contains("finishing"));
         assert!(line.contains("4m12s"));
         job.reaped = false;
-        assert!(running_line(&job).contains("reviewing"));
+        assert!(running_line("#9".into(), &job).contains("reviewing"));
+        // A resumed review says so: it is the difference between paying for a
+        // first look and paying for a second one.
+        job.resume = true;
+        assert!(running_line("#9".into(), &job).contains("rechecking"));
+    }
+
+    #[test]
+    fn a_board_row_says_who_opened_it() {
+        let mut job = Job::new(9);
+        job.title = "Add retry logic".into();
+        job.author = "alice".into();
+        assert_eq!(who_and_what(&job), "@alice Add retry logic");
+        // An author the fetch never learned leaves the title alone rather
+        // than printing a bare "@".
+        job.author = String::new();
+        assert_eq!(who_and_what(&job), "Add retry logic");
+    }
+
+    #[test]
+    fn a_board_row_links_to_the_pr_where_the_terminal_allows_it() {
+        let job = Job::new(9);
+        // The label is whatever the caller rendered, so a plain-text run and
+        // a hyperlinked one go through exactly the same line builder.
+        assert!(running_line("#9".into(), &job).contains("#9"));
+        let linked = hyperlink("https://github.com/acme/widgets/pull/9", "#9");
+        assert!(finished_line(linked.clone(), &job).contains(&linked));
     }
 
     #[test]
