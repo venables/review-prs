@@ -21,7 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          tarball="https://github.com/venabots/review-prs/archive/refs/tags/${TAG}.tar.gz"
+          tarball="https://github.com/venabots/autoreview/archive/refs/tags/${TAG}.tar.gz"
 
           # Retry: GitHub occasionally serves the archive a few seconds after
           # the tag push event arrives.
@@ -32,7 +32,7 @@ jobs:
           sed -i \
             -e "s|^  url .*|  url \"$tarball\"|" \
             -e "s|^  sha256 .*|  sha256 \"$sha\"|" \
-            Formula/review-prs.rb
+            Formula/autoreview.rb
 
       - name: Commit and push
         env:
@@ -42,10 +42,10 @@ jobs:
           version="${TAG#v}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/review-prs.rb
+          git add Formula/autoreview.rb
           if git diff --cached --quiet; then
             echo "no changes to commit"
             exit 0
           fi
-          git commit -m "review-prs: bump to ${version}"
+          git commit -m "autoreview: bump to ${version}"
           git push

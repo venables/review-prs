@@ -1,12 +1,13 @@
 [package]
 name = "autoreview"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
-description = "Review a repo's open PRs, headlessly or fanned out into terminal tabs"
+description = "Automated code review: watch a repo's PRs and review each with a panel of models"
 license = "MIT"
 
-# Two front-ends over one library: they must agree on the PR list and on which
-# session a PR belongs to, and sharing a build is what guarantees it.
+# Three front-ends over one library. The two that read PRs must agree on which
+# ones are worth reviewing and on which session each belongs to, and sharing a
+# build is what guarantees it.
 [lib]
 name = "autoreview"
 path = "src/lib.rs"
