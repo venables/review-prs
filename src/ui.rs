@@ -258,9 +258,15 @@ impl Ui {
     }
 
     fn board_transition(&mut self, job: &Job) {
-        // Rendered before the board is borrowed mutably: pr_label reads self,
-        // and the borrow checker is right that both at once is not allowed.
-        let label = self.pr_label(job.pr);
+        // Plain "#9", never the hyperlinked label the summary uses.
+        //
+        // indicatif measures each row with console::measure_text_width to work
+        // out how many terminal lines it occupies, and that function strips
+        // colour but not OSC 8 hyperlinks -- it reports a linked "#1711" as 54
+        // columns where it renders as 5. Every linked row is then believed to
+        // wrap, the move-up-N-lines redraw is computed against the wrong count,
+        // and the board walks up the screen overwriting scrollback.
+        let label = format!("#{}", job.pr);
         let Some(board) = &mut self.board else {
             return;
         };
@@ -307,7 +313,7 @@ impl Ui {
                         running += 1;
                     }
                     if let Some(bar) = board.bars.get(&job.pr) {
-                        bar.set_message(running_line(self.pr_label(job.pr), job));
+                        bar.set_message(running_line(format!("#{}", job.pr), job));
                     }
                 }
                 JobState::Queued => queued += 1,
@@ -524,8 +530,8 @@ fn who_and_what(job: &Job) -> String {
     short_title(&format!("@{} {}", job.author, job.title))
 }
 
-/// `label` is the PR number as the caller wants it rendered -- clickable
-/// where the terminal allows it, plain text everywhere else.
+/// `label` is the PR number as the caller wants it rendered. The board passes
+/// plain text; see `board_transition` for why it may not pass a hyperlink.
 fn running_line(label: String, job: &Job) -> String {
     // A reaped review already exited and only the verdict readback remains:
     // freeze the clock at the real duration rather than letting it climb
@@ -731,13 +737,21 @@ mod tests {
     }
 
     #[test]
-    fn a_board_row_links_to_the_pr_where_the_terminal_allows_it() {
+    fn a_board_row_never_carries_a_hyperlink() {
+        // The summary table links its PR numbers and the board does not, and
+        // the asymmetry is load-bearing rather than an oversight. indicatif
+        // measures each row it redraws with console::measure_text_width to
+        // decide how many terminal lines the row occupies; that function
+        // strips SGR colour but not OSC 8, so a linked "#9" measures 54
+        // columns where it renders as 2. Rows are then all believed to wrap,
+        // the move-up-N-lines redraw is computed against the wrong count, and
+        // the board climbs the screen eating scrollback. The summary is a
+        // plain println! that indicatif never measures, so it links freely.
         let job = Job::new(9);
-        // The label is whatever the caller rendered, so a plain-text run and
-        // a hyperlinked one go through exactly the same line builder.
-        assert!(running_line("#9".into(), &job).contains("#9"));
-        let linked = hyperlink("https://github.com/acme/widgets/pull/9", "#9");
-        assert!(finished_line(linked.clone(), &job).contains(&linked));
+        for line in [running_line("#9".into(), &job), finished_line("#9".into(), &job)] {
+            assert!(line.contains("#9"), "the row still names the PR: {line:?}");
+            assert!(!line.contains("\x1b]8;;"), "no OSC 8 on the board: {line:?}");
+        }
     }
 
     #[test]
