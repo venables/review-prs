@@ -44,6 +44,7 @@ PRs (nothing has changed since you last engaged) are left alone.
   --all, -a           Include PRs already marked APPROVED (default: exclude).
   --dependabot, -d    Include Dependabot PRs (default: hidden; shown dimmed).
   --help, -h          Show this help.
+  --version, -V       Show the version.
 
 Each PR is reviewed by a dash-p subprocess driving claude headlessly:
   dash-p --output-format json --meta-file ... --timeout ... \
@@ -113,6 +114,7 @@ impl Config {
 pub enum Parsed {
     Run(Box<Config>),
     Help,
+    Version,
 }
 
 pub struct CliError {
@@ -128,6 +130,17 @@ fn err(msg: String) -> CliError {
 /// Env access is injected so the unit tests are hermetic: a developer's own
 /// $AUTOREVIEW_JOBS must not change what the tests assert.
 pub type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// What `--version` prints: the binary's own name and the crate version they
+/// all share. Compiled in, so it cannot disagree with Cargo.toml -- and it is
+/// the first thing anyone is asked for in a bug report.
+///
+/// Between releases this reports the last released number, because that is
+/// what the manifest says. A build from an untagged commit is not a different
+/// version, it is that version plus whatever is on main.
+pub fn version(bin: &str) -> String {
+    format!("{bin} {}", env!("CARGO_PKG_VERSION"))
+}
 
 pub fn real_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -229,6 +242,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--all" | "-a" => include_approved = true,
             "--dependabot" | "-d" => include_dependabot = true,
             "--help" | "-h" => return Ok(Parsed::Help),
+            "--version" | "-V" => return Ok(Parsed::Version),
             "--jobs" | "-j" => jobs_raw = require_value("--jobs", it.next())?,
             "--max-passes" => max_passes_raw = require_value("--max-passes", it.next())?,
             "--max-idle" => max_idle_raw = require_value("--max-idle", it.next())?,
@@ -358,7 +372,11 @@ mod tests {
     fn cfg(args: &[&str]) -> Config {
         match run(args).ok().unwrap() {
             Parsed::Run(c) => *c,
-            Parsed::Help => panic!("unexpected help"),
+            other => panic!("expected a run, got {}", match other {
+                Parsed::Help => "help",
+                Parsed::Version => "version",
+                Parsed::Run(_) => unreachable!(),
+            }),
         }
     }
 
@@ -460,6 +478,23 @@ mod tests {
     fn help_flag() {
         assert!(matches!(run(&["--help"]).ok().unwrap(), Parsed::Help));
         assert!(matches!(run(&["-h"]).ok().unwrap(), Parsed::Help));
+    }
+    #[test]
+    fn the_version_line_names_the_binary_and_the_crate() {
+        // Three binaries share one crate version, and each says its own name,
+        // because "0.11.0" alone in a bug report does not say which tool.
+        assert_eq!(version("panel"), format!("panel {}", env!("CARGO_PKG_VERSION")));
+        assert!(version("autoreview").starts_with("autoreview "));
+        assert_eq!(version("review-prs").split(' ').count(), 2);
+    }
+
+    #[test]
+    fn version_flag() {
+        assert!(matches!(run(&["--version"]).ok().unwrap(), Parsed::Version));
+        assert!(matches!(run(&["-V"]).ok().unwrap(), Parsed::Version));
+        // -V, not -v: lowercase is verbose in most tools, and this one may
+        // want that later.
+        assert!(run(&["-v"]).is_err());
     }
 
     #[test]

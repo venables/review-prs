@@ -27,6 +27,7 @@ Usage: review-prs [--auto] [--babysit[=MINUTES]] [--continue] [--all]
   --all, -a           Include PRs already marked APPROVED (default: exclude).
   --dependabot, -d    Include Dependabot PRs (default: hidden; shown dimmed).
   --help, -h          Show this help.
+  --version, -V       Show the version.
 
 Each selected PR opens a tab that cd's to the repo root and runs a review
 command. The built-in commands are:
@@ -80,6 +81,7 @@ impl Config {
 pub enum Parsed {
     Run(Box<Config>),
     Help,
+    Version,
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Parsed, CliError> {
@@ -104,6 +106,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--all" | "-a" => include_approved = true,
             "--dependabot" | "-d" => include_dependabot = true,
             "--help" | "-h" => return Ok(Parsed::Help),
+            "--version" | "-V" => return Ok(Parsed::Version),
             other => match other.strip_prefix("--babysit=") {
                 Some(v) => {
                     babysit = true;
@@ -238,6 +241,14 @@ mod tests {
     fn help_flag() {
         assert!(matches!(run_env(&["--help"], &[]).ok().unwrap(), Parsed::Help));
         assert!(matches!(run_env(&["-h"], &[]).ok().unwrap(), Parsed::Help));
+    }
+    #[test]
+    fn version_flag() {
+        assert!(matches!(run_env(&["--version"], &[]).ok().unwrap(), Parsed::Version));
+        assert!(matches!(run_env(&["-V"], &[]).ok().unwrap(), Parsed::Version));
+        // -V, not -v: lowercase is verbose in most tools, and this one may
+        // want that later.
+        assert!(run_env(&["-v"], &[]).is_err());
     }
 
     #[test]

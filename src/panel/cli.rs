@@ -37,6 +37,7 @@ questionable claims against the code, and writes the report.
   --no-synthesis      Print the panelist sections and stop. For comparing the
                       panel against a synthesis you write yourself.
   --help, -h          Show this help.
+  --version, -V       Show the version.
 
 The synthesis runs in this repository with read-only access, because verifying
 a finding means reading the code it is about. It is told which panelists
@@ -65,6 +66,7 @@ pub struct Config {
 pub enum Parsed {
     Run(Box<Config>),
     Help,
+    Version,
 }
 
 fn err(msg: String) -> CliError {
@@ -103,6 +105,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--synth" => synth_raw = require_value("--synth", it.next())?,
             "--no-synthesis" => synthesize = false,
             "--help" | "-h" => return Ok(Parsed::Help),
+            "--version" | "-V" => return Ok(Parsed::Version),
             other => {
                 if let Some(v) = other.strip_prefix("--base=") {
                     target = Target::Base(require_value("--base", Some(v.to_string()))?);
@@ -162,7 +165,11 @@ mod tests {
     fn cfg(args: &[&str]) -> Config {
         match run(args).ok().unwrap() {
             Parsed::Run(c) => *c,
-            Parsed::Help => panic!("unexpected help"),
+            other => panic!("expected a run, got {}", match other {
+                Parsed::Help => "help",
+                Parsed::Version => "version",
+                Parsed::Run(_) => unreachable!(),
+            }),
         }
     }
 
@@ -223,5 +230,13 @@ mod tests {
     fn help_flag() {
         assert!(matches!(run(&["--help"]).ok().unwrap(), Parsed::Help));
         assert!(matches!(run(&["-h"]).ok().unwrap(), Parsed::Help));
+    }
+    #[test]
+    fn version_flag() {
+        assert!(matches!(run(&["--version"]).ok().unwrap(), Parsed::Version));
+        assert!(matches!(run(&["-V"]).ok().unwrap(), Parsed::Version));
+        // -V, not -v: lowercase is verbose in most tools, and this one may
+        // want that later.
+        assert!(run(&["-v"]).is_err());
     }
 }

@@ -16,6 +16,10 @@ fn main() {
             print!("{}", cli::HELP);
             std::process::exit(0);
         }
+        Ok(cli::Parsed::Version) => {
+            println!("{}", autoreview::cli::version("review-prs"));
+            std::process::exit(0);
+        }
         Ok(cli::Parsed::Run(cfg)) => cfg,
         Err(e) => {
             eprintln!("{}", e.msg);
