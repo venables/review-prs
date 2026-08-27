@@ -21,7 +21,28 @@ use std::io::IsTerminal;
 use std::time::Duration;
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
+/// The most title any board row will show, on a terminal wide enough for it.
 const TITLE_WIDTH: usize = 60;
+/// Below this a title is no longer a title. A row this tight drops the title
+/// outright rather than shaving it further, because what the row has left --
+/// the PR number, the verb and the clock -- is the part that tells you the
+/// review is alive.
+const TITLE_FLOOR: usize = 16;
+/// The columns SPINNER_TEMPLATE draws ahead of `{msg}`: two spaces, the
+/// spinner, one space. They never appear in the string the row builder
+/// returns, so the builder has to pay for them itself -- otherwise a row cut
+/// to the terminal width is drawn four columns wider than the terminal.
+const SPINNER_RESERVE: usize = 4;
+const SPINNER_TEMPLATE: &str = "  {spinner:.magenta} {msg}";
+const FOOTER_TEMPLATE: &str = "  {bar:24.cyan/238} {pos}/{len} {msg}";
+/// The width to assume when the terminal will not say. Matches what console
+/// falls back to, so the two never disagree.
+const ASSUMED_WIDTH: usize = 80;
+/// The columns FOOTER_TEMPLATE draws around `{pos}/{len}` and ahead of
+/// `{msg}`: two spaces, a 24-column bar, the space before the counts, and the
+/// space after them. The counts themselves vary with the PR count, so the
+/// caller measures those.
+const FOOTER_RESERVE: usize = 28;
 
 pub fn fmt_dur(s: u64) -> String {
     if s >= 3600 {
@@ -200,6 +221,7 @@ impl Ui {
     pub fn note(&mut self, note: String) {
         match &self.board {
             Some(b) => {
+                let note = fit(&note, board_width().saturating_sub(2));
                 let _ = b.mp.println(format!("  {}", style(&note).yellow()));
             }
             None => eprintln!("{note}"),
@@ -246,27 +268,22 @@ impl Ui {
             style(format!("· logs: {}", pass_dir.display())).dim()
         );
         println!();
+        let total_width = board_width();
         let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stdout());
         let footer = mp.add(ProgressBar::new(total as u64));
         footer.set_style(
-            ProgressStyle::with_template("  {bar:24.cyan/238} {pos}/{len} {msg}")
+            ProgressStyle::with_template(FOOTER_TEMPLATE)
                 .expect("footer template")
                 .progress_chars("━╸─"),
         );
-        footer.set_message(style("reviewed").dim().to_string());
+        let counts = format!("0/{total}");
+        let first = fit("reviewed", total_width.saturating_sub(FOOTER_RESERVE + cols(&counts)));
+        footer.set_message(style(first).dim().to_string());
         self.board = Some(Board { mp, bars: HashMap::new(), footer });
     }
 
     fn board_transition(&mut self, job: &Job) {
-        // Plain "#9", never the hyperlinked label the summary uses.
-        //
-        // indicatif measures each row with console::measure_text_width to work
-        // out how many terminal lines it occupies, and that function strips
-        // colour but not OSC 8 hyperlinks -- it reports a linked "#1711" as 54
-        // columns where it renders as 5. Every linked row is then believed to
-        // wrap, the move-up-N-lines redraw is computed against the wrong count,
-        // and the board walks up the screen overwriting scrollback.
-        let label = format!("#{}", job.pr);
+        let label = board_label(job.pr);
         let Some(board) = &mut self.board else {
             return;
         };
@@ -274,11 +291,11 @@ impl Ui {
             JobState::Running => {
                 let bar = board.mp.insert_before(&board.footer, ProgressBar::new_spinner());
                 bar.set_style(
-                    ProgressStyle::with_template("  {spinner:.magenta} {msg}")
+                    ProgressStyle::with_template(SPINNER_TEMPLATE)
                         .expect("spinner template")
                         .tick_strings(SPINNER_FRAMES),
                 );
-                bar.set_message(running_line(label, job));
+                bar.set_message(running_line(label, job, board_width()));
                 bar.enable_steady_tick(Duration::from_millis(80));
                 board.bars.insert(job.pr, bar);
             }
@@ -287,7 +304,7 @@ impl Ui {
                     bar.finish_and_clear();
                     board.mp.remove(&bar);
                 }
-                let _ = board.mp.println(finished_line(label, job));
+                let _ = board.mp.println(finished_line(label, job, board_width()));
                 board.footer.inc(1);
             }
             JobState::Queued => {}
@@ -301,6 +318,9 @@ impl Ui {
         let Some(board) = &self.board else {
             return;
         };
+        // Read once, not once per row: every row of a tick is drawn in the
+        // same terminal, and each read is a size ioctl.
+        let width = board_width();
         let mut running = 0usize;
         let mut finishing = 0usize;
         let mut queued = 0usize;
@@ -313,7 +333,7 @@ impl Ui {
                         running += 1;
                     }
                     if let Some(bar) = board.bars.get(&job.pr) {
-                        bar.set_message(running_line(format!("#{}", job.pr), job));
+                        bar.set_message(running_line(board_label(job.pr), job, width));
                     }
                 }
                 JobState::Queued => queued += 1,
@@ -327,6 +347,12 @@ impl Ui {
         if queued > 0 {
             msg.push_str(&format!(" · {queued} queued"));
         }
+        // Same reserve problem as the spinner rows: the footer template draws
+        // "  ", a 24-column bar, a space, "{pos}/{len}", and a space before
+        // {msg}.
+        let reserve = FOOTER_RESERVE
+            + cols(&format!("{}/{}", board.footer.position(), board.footer.length().unwrap_or(0)));
+        let msg = fit(&msg, width.saturating_sub(reserve));
         board.footer.set_message(style(msg).dim().to_string());
     }
 
@@ -515,24 +541,97 @@ fn risk_cell(risk: Option<&str>) -> Cell {
 /// PR titles are other people's text headed for the terminal: control bytes
 /// (ANSI/OSC escapes) could repaint the board and bidi/zero-width marks
 /// could visually reorder it, so both are dropped before display.
-fn short_title(title: &str) -> String {
+fn short_title(title: &str, width: usize) -> String {
     let clean = crate::report::sanitize_for_display(title);
-    console::truncate_str(&clean, TITLE_WIDTH, "…").to_string()
+    console::truncate_str(&clean, width, "…").to_string()
+}
+
+/// What a board row calls a PR: plain text, never the hyperlinked label the
+/// summary uses.
+///
+/// indicatif measures each row it redraws with console::measure_text_width to
+/// work out how many terminal lines the row occupies, and that function strips
+/// SGR colour but not OSC 8 hyperlinks -- it reports a linked "#1711" as 54
+/// columns where it renders as 5. Every linked row is then believed to wrap,
+/// the move-up-N-lines redraw is computed against the wrong count, and the
+/// board climbs the screen overwriting scrollback.
+///
+/// Every board call site goes through here so the links cannot come back one
+/// site at a time. The summary table is a plain println! that indicatif never
+/// measures, so it links freely.
+fn board_label(pr: u64) -> String {
+    format!("#{pr}")
+}
+
+/// The terminal the board is drawn on, or what to assume when it will not say.
+fn board_width() -> usize {
+    console::Term::stdout().size_checked().map_or(ASSUMED_WIDTH, |(_, w)| w as usize)
+}
+
+/// What is left for the title once the parts that must survive have been paid
+/// for. `fixed` is measured by the caller from the strings it will actually
+/// draw, rather than estimated from a constant, because the parts vary: a
+/// seven-digit PR number and "rechecking 1h05m" cost eight columns more than
+/// "#123" and "reviewing 3s".
+///
+/// Zero means the row cannot afford a title at all.
+fn title_budget(width: usize, fixed: usize) -> usize {
+    let left = width.saturating_sub(fixed);
+    if left < TITLE_FLOOR { 0 } else { TITLE_WIDTH.min(left) }
+}
+
+/// Cut a rendered line to the width it is drawn in. This is a backstop, not
+/// the mechanism: the row builders size the title so it never fires. It exists
+/// for the row too narrow to hold even its fixed parts, where something has to
+/// give and there is nothing left to choose.
+///
+/// Note this is legibility rather than correctness. indicatif counts a wrapped
+/// line correctly (`LineType::wrapped_metrics` walks the string and counts the
+/// wraps), so a row that overruns looks misaligned but does not corrupt the
+/// redraw the way an unmeasurable one does -- see `board_transition`.
+fn fit(line: &str, width: usize) -> String {
+    // console::truncate_str returns the ellipsis itself at width 0, which is
+    // one column and so still overruns. A width this small has nothing to say
+    // anyway.
+    if width == 0 {
+        return String::new();
+    }
+    console::truncate_str(line, width, "…").to_string()
 }
 
 /// Who opened it and what it is called, in the width the board has. A row
 /// that says only "#9" makes you go and look up whose work you are about to
 /// spend money reviewing.
-fn who_and_what(job: &Job) -> String {
-    if job.author.is_empty() {
-        return short_title(&job.title);
+fn who_and_what(job: &Job, width: usize) -> String {
+    if width == 0 {
+        return String::new();
     }
-    short_title(&format!("@{} {}", job.author, job.title))
+    if job.author.is_empty() {
+        return short_title(&job.title, width);
+    }
+    short_title(&format!("@{} {}", job.author, job.title), width)
+}
+
+/// A row's parts joined with single spaces, skipping any that draws nothing --
+/// a row that could not afford a title must not show where it would have been.
+///
+/// Measured rather than tested with `is_empty`, because the parts arrive
+/// styled: on a terminal `style("").dim()` is eight bytes of SGR that draw
+/// zero columns, so an empty title would survive an `is_empty` filter and take
+/// a joining space with it. Off a terminal console emits no bytes and the two
+/// tests agree, which is why only a real terminal ever showed the gap.
+fn join_parts(parts: &[String]) -> String {
+    parts.iter().filter(|p| cols(p) > 0).cloned().collect::<Vec<_>>().join(" ")
+}
+
+/// The width of a string as the terminal will draw it.
+fn cols(s: &str) -> usize {
+    console::measure_text_width(s)
 }
 
 /// `label` is the PR number as the caller wants it rendered. The board passes
 /// plain text; see `board_transition` for why it may not pass a hyperlink.
-fn running_line(label: String, job: &Job) -> String {
+fn running_line(label: String, job: &Job, width: usize) -> String {
     // A reaped review already exited and only the verdict readback remains:
     // freeze the clock at the real duration rather than letting it climb
     // past what the summary will report.
@@ -544,16 +643,24 @@ fn running_line(label: String, job: &Job) -> String {
             job.started.map(|s| s.elapsed().as_secs()).unwrap_or(0),
         )
     };
-    format!(
-        "{} {} {}",
-        style(label).cyan().bold(),
-        style(who_and_what(job)).dim(),
-        style(format!("· {verb} {}", fmt_dur(secs))).magenta()
-    )
+    let status = format!("· {verb} {}", fmt_dur(secs));
+    // The row is drawn inside the spinner template, so the width it has is the
+    // terminal less what that template draws in front of it.
+    let width = width.saturating_sub(SPINNER_RESERVE);
+    // Two single spaces join the three parts; an absent title takes its space
+    // with it, which join_parts handles.
+    let fixed = cols(&label) + cols(&status) + 2;
+    let who = who_and_what(job, title_budget(width, fixed));
+    let line = join_parts(&[
+        style(&label).cyan().bold().to_string(),
+        style(&who).dim().to_string(),
+        style(&status).magenta().to_string(),
+    ]);
+    fit(&line, width)
 }
 
 /// The permanent line a finished review leaves on the board.
-fn finished_line(label: String, job: &Job) -> String {
+fn finished_line(label: String, job: &Job, width: usize) -> String {
     let (mark, headline) = match job.state {
         JobState::Done => {
             let word = match job.verdict.as_deref() {
@@ -579,12 +686,20 @@ fn finished_line(label: String, job: &Job) -> String {
     if let Some(cost) = job.cost {
         extras.push(format!("${cost:.2}"));
     }
-    format!(
-        "  {mark} {} {headline} {} {}",
-        style(label).cyan().bold(),
-        style(format!("· {}", extras.join(" · "))).dim(),
-        style(who_and_what(job)).dim()
-    )
+    let extras = format!("· {}", extras.join(" · "));
+    // "  " + mark + the three joining spaces, plus the parts themselves.
+    let fixed = 2 + cols(&mark) + cols(&label) + cols(&headline) + cols(&extras) + 4;
+    let who = who_and_what(job, title_budget(width, fixed));
+    let line = format!(
+        "  {mark} {}",
+        join_parts(&[
+            style(&label).cyan().bold().to_string(),
+            headline.to_string(),
+            style(&extras).dim().to_string(),
+            style(&who).dim().to_string(),
+        ])
+    );
+    fit(&line, width)
 }
 
 /// A panic must not leave the terminal without its cursor.
@@ -713,15 +828,15 @@ mod tests {
         job.title = "t".into();
         job.reaped = true;
         job.elapsed_secs = 252;
-        let line = running_line("#9".into(), &job);
+        let line = running_line("#9".into(), &job, ASSUMED_WIDTH);
         assert!(line.contains("finishing"));
         assert!(line.contains("4m12s"));
         job.reaped = false;
-        assert!(running_line("#9".into(), &job).contains("reviewing"));
+        assert!(running_line("#9".into(), &job, ASSUMED_WIDTH).contains("reviewing"));
         // A resumed review says so: it is the difference between paying for a
         // first look and paying for a second one.
         job.resume = true;
-        assert!(running_line("#9".into(), &job).contains("rechecking"));
+        assert!(running_line("#9".into(), &job, ASSUMED_WIDTH).contains("rechecking"));
     }
 
     #[test]
@@ -729,39 +844,123 @@ mod tests {
         let mut job = Job::new(9);
         job.title = "Add retry logic".into();
         job.author = "alice".into();
-        assert_eq!(who_and_what(&job), "@alice Add retry logic");
+        assert_eq!(who_and_what(&job, TITLE_WIDTH), "@alice Add retry logic");
         // An author the fetch never learned leaves the title alone rather
         // than printing a bare "@".
         job.author = String::new();
-        assert_eq!(who_and_what(&job), "Add retry logic");
+        assert_eq!(who_and_what(&job, TITLE_WIDTH), "Add retry logic");
     }
 
     #[test]
     fn a_board_row_never_carries_a_hyperlink() {
-        // The summary table links its PR numbers and the board does not, and
-        // the asymmetry is load-bearing rather than an oversight. indicatif
-        // measures each row it redraws with console::measure_text_width to
-        // decide how many terminal lines the row occupies; that function
-        // strips SGR colour but not OSC 8, so a linked "#9" measures 54
-        // columns where it renders as 2. Rows are then all believed to wrap,
-        // the move-up-N-lines redraw is computed against the wrong count, and
-        // the board climbs the screen eating scrollback. The summary is a
-        // plain println! that indicatif never measures, so it links freely.
+        // The summary table links its PR numbers and the board does not; see
+        // `board_label` for why the asymmetry is load-bearing. Asserting on
+        // `board_label` rather than on a literal is what stops the links
+        // returning through a call site no test covers.
+        assert_eq!(board_label(9), "#9");
+        assert!(!board_label(9).contains('\x1b'));
         let job = Job::new(9);
-        for line in [running_line("#9".into(), &job), finished_line("#9".into(), &job)] {
+        for line in [running_line(board_label(9), &job, ASSUMED_WIDTH), finished_line(board_label(9), &job, ASSUMED_WIDTH)] {
             assert!(line.contains("#9"), "the row still names the PR: {line:?}");
             assert!(!line.contains("\x1b]8;;"), "no OSC 8 on the board: {line:?}");
         }
     }
 
     #[test]
+    fn the_title_is_the_only_part_of_a_row_that_shrinks() {
+        // The budget is what a row can spend on a title after the parts that
+        // must survive are paid for. Pinned at real widths, because the
+        // terminal under `cargo test` is always the same one and a test that
+        // only restates the min/max clamps cannot fail.
+        assert_eq!(title_budget(200, 30), TITLE_WIDTH);
+        assert_eq!(title_budget(80, 30), 50);
+        assert_eq!(title_budget(60, 30), 30);
+        // Too tight for a title worth the name: the row drops it rather than
+        // shaving it, and keeps the number, the verb and the clock.
+        assert_eq!(title_budget(45, 30), 0);
+        assert_eq!(title_budget(10, 30), 0);
+        assert_eq!(who_and_what(&Job::new(9), 0), "");
+    }
+
+    #[test]
+    fn a_row_fits_the_width_it_is_given() {
+        // The width the row builders read is the test process's terminal, so
+        // this pins the arithmetic they use rather than the number they read.
+        let mut job = Job::new(1234567);
+        job.author = "domleboss97".into();
+        job.title = "ENG-2304: add a protocol-neutral payment credential format".into();
+        job.resume = true;
+
+        // Widths are given, not read, so this pins the arithmetic at every
+        // shape of terminal rather than at whichever one cargo test ran in --
+        // including the degenerate ones, where truncate_str would otherwise
+        // hand back a one-column ellipsis for a zero-column budget.
+        for width in [200, 120, 80, 60, 45, 30, 20, 6, 4, 1, 0] {
+            let run = running_line(board_label(job.pr), &job, width);
+            // A running row is drawn inside "  {spinner} ", which is not part
+            // of the string -- so the string gets what the template leaves.
+            // Below SPINNER_RESERVE the template alone is wider than the
+            // terminal, which is indicatif's floor and not something a row can
+            // fix; the row's job is to claim none of what is left.
+            assert!(
+                cols(&run) <= width.saturating_sub(SPINNER_RESERVE),
+                "running row at {width}: {} > {}",
+                cols(&run),
+                width.saturating_sub(SPINNER_RESERVE)
+            );
+            let fin = finished_line(board_label(job.pr), &job, width);
+            assert!(cols(&fin) <= width, "finished row at {width}: {} > {width}", cols(&fin));
+        }
+        // Down to the width where the title stops fitting, the row keeps the
+        // parts that say the review is alive.
+        let run = running_line(board_label(job.pr), &job, 45);
+        assert!(run.contains("#1234567") && run.contains("rechecking"), "got {run:?}");
+    }
+
+    #[test]
+    fn the_reserves_match_the_templates_they_pay_for() {
+        // Derived from the template text rather than restated, because the
+        // row test pays the reserve on both sides and so cannot notice a wrong
+        // value. A template edit that moves a space fails here instead of on
+        // somebody's terminal.
+        let lead = |t: &str, upto: &str| t.split(upto).next().unwrap().to_string();
+        let spinner = lead(SPINNER_TEMPLATE, "{msg}").replace("{spinner:.magenta}", "*");
+        assert_eq!(cols(&spinner), SPINNER_RESERVE);
+
+        let before = lead(FOOTER_TEMPLATE, "{pos}/{len}").replace("{bar:24.cyan/238}", &"*".repeat(24));
+        let after = lead(FOOTER_TEMPLATE.split("{pos}/{len}").nth(1).unwrap(), "{msg}");
+        assert_eq!(cols(&before) + cols(&after), FOOTER_RESERVE);
+    }
+
+    #[test]
+    fn a_row_with_no_room_for_a_title_leaves_no_gap() {
+        // Colour on, because that is the only condition under which the bug
+        // this pins exists: a styled empty title is eight bytes of SGR that
+        // draw nothing, and an is_empty filter keeps it plus its joining space.
+        // force_styling on the one value, never the process-wide flag: cargo
+        // test runs these in parallel threads, and a global flip would race.
+        let styled_empty = style("").dim().force_styling(true).to_string();
+        assert!(!styled_empty.is_empty() && cols(&styled_empty) == 0);
+        assert_eq!(join_parts(&["#9".into(), styled_empty, "· reviewing 3s".into()]), "#9 · reviewing 3s");
+    }
+
+    #[test]
+    fn fit_cuts_to_the_width_it_is_given() {
+        assert_eq!(fit("hello", 80), "hello");
+        assert_eq!(cols(&fit("hello world, this is long", 10)), 10);
+        // Colour is not width: a styled string is cut by what it draws.
+        let styled = style("hello world").green().to_string();
+        assert_eq!(cols(&fit(&styled, 5)), 5);
+    }
+
+    #[test]
     fn titles_lose_their_control_bytes() {
-        assert_eq!(short_title("Add \x1b[31mretry\x1b[0m logic"), "Add [31mretry[0m logic");
-        assert_eq!(short_title("plain title"), "plain title");
+        assert_eq!(short_title("Add \x1b[31mretry\x1b[0m logic", TITLE_WIDTH), "Add [31mretry[0m logic");
+        assert_eq!(short_title("plain title", TITLE_WIDTH), "plain title");
         // Bidi overrides and zero-width characters reorder or hide text
         // without being C0 controls; they must go too.
-        assert_eq!(short_title("fix\u{202E}cod.exe"), "fixcod.exe");
-        assert_eq!(short_title("a\u{200B}b\u{FEFF}c"), "abc");
+        assert_eq!(short_title("fix\u{202E}cod.exe", TITLE_WIDTH), "fixcod.exe");
+        assert_eq!(short_title("a\u{200B}b\u{FEFF}c", TITLE_WIDTH), "abc");
     }
 
     #[test]
