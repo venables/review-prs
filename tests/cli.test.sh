@@ -86,6 +86,14 @@ run_review_prs --auto --babysit=05 >/dev/null
 assert_contains "a bare number becomes minutes" \
   "$(spawned_cmd 'pr-review-tab 9')" "--babysit 05m"
 
+# --- Version ---------------------------------------------------------------
+out="$(run_review_prs --version)"
+assert_equals "--version exits 0" "$(last_status)" "0"
+assert_contains "...naming the binary, not just a number" "$out" "review-prs "
+assert_contains "...and the crate version" "$out" "$(grep '^version' "$TESTS_DIR/../Cargo.toml" | cut -d'"' -f2)"
+out="$(run_review_prs -V)"
+assert_contains "-V is the short form" "$out" "review-prs "
+
 # --- Unknown flags fail loudly -------------------------------------------
 out="$(run_review_prs --nope)"
 assert_equals "an unknown flag exits nonzero" "$(last_status)" "1"

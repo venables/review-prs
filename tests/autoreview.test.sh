@@ -300,6 +300,13 @@ run_autoreview --auto >/dev/null
 recorded_files="$(echo "$SANDBOX"/out/logs/run-*/session-9.id | wc -w | tr -d ' ')"
 assert_equals "each run records its sessions separately" "$recorded_files" "2"
 
+# --- Version ---------------------------------------------------------------
+out="$(run_autoreview --version)"
+assert_equals "--version exits 0" "$(last_status)" "0"
+assert_contains "...naming the binary" "$out" "autoreview "
+assert_contains "...and the crate version" \
+  "$out" "$(grep '^version' "$TESTS_DIR/../Cargo.toml" | cut -d'\"' -f2)"
+
 # --- Bad input ------------------------------------------------------------
 out="$(run_autoreview --auto --jobs 0)"
 assert_equals "--jobs 0 exits nonzero" "$(last_status)" "1"

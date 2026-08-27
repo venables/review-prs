@@ -231,6 +231,11 @@ assert_contains "a base target with an empty diff says to commit" \
   "$out" "commit them first"
 rm -f "$SANDBOX/repo/new-file.txt"
 
+# --- Version -----------------------------------------------------------------
+out="$(run_panel --version)"
+assert_equals "--version exits 0" "$(last_status)" "0"
+assert_contains "...naming the binary" "$out" "panel "
+
 # --- Bad input --------------------------------------------------------------
 out="$(run_panel --base "--output=/tmp/pwned")"
 assert_equals "a base that is really a git option is refused" "$(last_status)" "1"
