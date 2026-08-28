@@ -584,9 +584,13 @@ reset_spawn_log
 ( cd "$SANDBOX/repo" && FAKE_GH_APPROVED="9" FAKE_GH_GRAPHQL_FAIL_AFTER=1 "$AUTOREVIEW" \
     --log-dir "$SANDBOX/out/logs" --auto --watch=1 >"$SANDBOX/out/bg" 2>&1 ) &
 bg=$!
+# The second message, not the first: --babysit also warns and says "looking
+# again in 1m" once before it gives up, so a test that stops at the first line
+# passes whether or not the watch guard is there. Only the watch path backs
+# off, so "looking again in 2m" is what distinguishes them.
 waited=0
-while [[ "$waited" -lt 1200 ]]; do
-  grep -q "looking again" "$SANDBOX/out/bg" 2>/dev/null && break
+while [[ "$waited" -lt 1800 ]]; do
+  grep -q "looking again in 2m" "$SANDBOX/out/bg" 2>/dev/null && break
   kill -0 "$bg" 2>/dev/null || break
   sleep 0.1
   waited=$((waited + 1))
@@ -600,8 +604,9 @@ wait "$bg" 2>/dev/null || true
 out="$(cat "$SANDBOX/out/bg")"
 assert_equals "a watch run survives a failing PR list" "$failing_running" "yes"
 assert_contains "...saying the look failed" "$out" "could not refresh the PR list"
-assert_contains "...and that it will try again" "$out" "looking again in"
-assert_not_contains "...rather than giving up" "$out" "giving up"
+assert_contains "...and backs off rather than giving up after three" \
+  "$out" "looking again in 2m"
+assert_not_contains "...never giving up" "$out" "giving up"
 
 default_prs
 
@@ -616,9 +621,12 @@ reset_spawn_log
     --log-dir "$SANDBOX/out/logs" --auto --watch=1 --max-idle=1 \
     >"$SANDBOX/out/bg" 2>&1 ) &
 bg=$!
+# Two of them, not one. The check straight after a pass is uncounted, so a
+# --babysit run with --max-idle=1 also prints "next check in" once and is
+# alive at that point. It stops at the second. A watch run keeps going.
 waited=0
-while [[ "$waited" -lt 900 ]]; do
-  grep -q "next check in" "$SANDBOX/out/bg" 2>/dev/null && break
+while [[ "$waited" -lt 1800 ]]; do
+  [[ "$(grep -c "next check in" "$SANDBOX/out/bg" 2>/dev/null || echo 0)" -ge 2 ]] && break
   kill -0 "$bg" 2>/dev/null || break
   sleep 0.1
   waited=$((waited + 1))
