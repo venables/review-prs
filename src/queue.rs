@@ -50,10 +50,12 @@ pub struct Queue {
     cooldown: Option<u64>,
     /// When each PR was last reviewed, for the cooldown.
     last_pass: std::collections::HashMap<u64, u64>,
-    /// PRs seen not-actionable since their last review. A PR that goes quiet
-    /// has ended the conversation the cap bounds; if it comes back, somebody
-    /// pushed to it, and that is new work rather than more of the same.
-    quiet: HashSet<u64>,
+    /// The newest commit seen on each PR, from the latest refresh.
+    heads: std::collections::HashMap<u64, String>,
+    /// The newest commit each PR had when it was last reviewed. A difference
+    /// between this and `heads` is a push, which is the only thing that
+    /// resets the cap.
+    reviewed_at: std::collections::HashMap<u64, String>,
 }
 
 impl Queue {
@@ -67,14 +69,15 @@ impl Queue {
             max_passes,
             cooldown: None,
             last_pass: std::collections::HashMap::new(),
-            quiet: HashSet::new(),
+            heads: std::collections::HashMap::new(),
+            reviewed_at: std::collections::HashMap::new(),
         }
     }
 
     /// The same queue for a --watch run, which polls far more often than a PR
     /// can usefully be reviewed. Two rules come with it: a PR rests for
-    /// `cooldown` seconds after a review, and a PR its author pushed to gets
-    /// a fresh set of passes.
+    /// `cooldown` seconds after a review, and a PR that has been pushed to
+    /// since its last review gets a fresh set of passes.
     pub fn watching(max_passes: u32, only: Option<Vec<u64>>, cooldown: u64) -> Queue {
         Queue { cooldown: Some(cooldown), ..Queue::new(max_passes, only) }
     }
@@ -84,10 +87,40 @@ impl Queue {
         self.done.insert(pr);
     }
 
+    /// The newest commit on a PR, as the latest refresh saw it. A PR with no
+    /// commit data is left unrecorded rather than recorded as empty: "we
+    /// cannot see a commit" must not later read as "the commit changed".
+    pub fn note_head(&mut self, pr: u64, head: Option<String>) {
+        if let Some(head) = head {
+            self.heads.insert(pr, head);
+        }
+    }
+
     pub fn record_pass(&mut self, prs: &[u64], now: u64) {
         for &pr in prs {
             *self.passes.entry(pr).or_insert(0) += 1;
             self.last_pass.insert(pr, now);
+            // What this review covered. Anything newer than this is a push.
+            if let Some(head) = self.heads.get(&pr) {
+                self.reviewed_at.insert(pr, head.clone());
+            }
+        }
+    }
+
+    /// New commits since the last review of this PR.
+    ///
+    /// Only a push resets the cap. A comment, a review, or a reply also makes
+    /// a PR actionable again, and treating those as new work would let an
+    /// author who answers every review be reviewed again every time -- the
+    /// unattended loop the cap exists to stop.
+    ///
+    /// Both unknowns answer "no": a PR with no commit data cannot show a
+    /// push, and a PR whose commit we only learned after reviewing it has not
+    /// been pushed to, we simply had not looked before.
+    fn pushed_since_review(&self, pr: u64) -> bool {
+        match (self.heads.get(&pr), self.reviewed_at.get(&pr)) {
+            (Some(now), Some(then)) => now != then,
+            _ => false,
         }
     }
 
@@ -127,26 +160,17 @@ impl Queue {
     /// unattended, and for as long as the loop runs.
     pub fn next(&mut self, still_open: &[u64], actionable: &[u64], now: u64) -> Intake {
         let mut intake = Intake::default();
-        // Watched, and the sweep no longer ranks it actionable: whatever
-        // conversation it was in has stopped. Noted before the queue is built
-        // so that a PR which comes back is recognised as pushed-to.
-        if self.cooldown.is_some() {
-            for &pr in still_open {
-                if !actionable.contains(&pr) {
-                    self.quiet.insert(pr);
-                }
-            }
-        }
         for &pr in actionable {
             if !self.eligible(pr) || intake.queue.contains(&pr) {
                 continue;
             }
-            // Quiet, and now actionable again. Its author pushed, so it
-            // starts over: a session that runs for days must not go
-            // permanently deaf to a PR that is still being worked on.
-            if self.quiet.remove(&pr) {
+            // Pushed to since we reviewed it, so it starts over: a session
+            // that runs for days must not go permanently deaf to a PR that
+            // is still being worked on.
+            if self.cooldown.is_some() && self.pushed_since_review(pr) {
                 self.passes.remove(&pr);
                 self.announced.remove(&pr);
+                self.reviewed_at.remove(&pr);
             }
             if self.is_capped(pr) {
                 if self.announced.insert(pr) {
@@ -292,45 +316,73 @@ mod tests {
         assert_eq!(intake.joined, vec![12]);
     }
 
+    /// Tell the queue the newest commit on each PR, the way a refresh does.
+    fn heads(q: &mut Queue, pairs: &[(u64, &str)]) {
+        for (pr, head) in pairs {
+            q.note_head(*pr, Some((*head).to_string()));
+        }
+    }
+
     #[test]
     fn a_push_gives_a_capped_pr_a_fresh_set_of_passes() {
         // The cap bounds one conversation: we review, the author answers,
         // that answer makes the PR actionable again, and without a cap that
-        // runs forever. A PR that goes quiet has ended that conversation. If
-        // it comes back it is because somebody pushed, which is new work --
-        // and a session running for days must not go deaf to it.
+        // runs forever. A push is different -- it is new code, and a session
+        // running for days must not go deaf to it.
         let mut q = watcher(2, 0);
+        heads(&mut q, &[(9, "c1")]);
         q.record_pass(&[9], 0);
         q.record_pass(&[9], 0);
         assert!(q.is_capped(9));
         assert_eq!(q.next(&[9], &[9], 10).capped, vec![9], "capped, left alone");
 
-        // It goes quiet: our own review is the latest activity on it.
-        assert!(q.next(&[9], &[], 20).queue.is_empty());
-        // The author pushes, so the sweep ranks it actionable again.
+        // The author pushes: a new commit on the PR.
+        heads(&mut q, &[(9, "c2")]);
         let intake = q.next(&[9], &[9], 30);
         assert_eq!(intake.queue, vec![9], "a push is new work");
         assert!(!q.is_capped(9), "and it starts its passes over");
     }
 
     #[test]
-    fn a_pr_that_never_goes_quiet_stays_capped() {
-        // The guard on the rule above: without the quiet step this would
-        // reset on every poll and the cap would mean nothing.
+    fn a_comment_does_not_reset_the_cap() {
+        // The finding that made this rule use commits rather than activity.
+        // A PR becomes actionable again when its author comments, reviews, or
+        // pushes. Only the last is new code. If a comment reset the cap, an
+        // author who replies to each review would be reviewed again every
+        // time, unattended and for as long as the process runs -- which is
+        // the exact loop --max-passes exists to stop.
+        let mut q = watcher(1, 0);
+        heads(&mut q, &[(9, "c1")]);
+        q.record_pass(&[9], 0);
+        assert_eq!(q.next(&[9], &[9], 10).capped, vec![9]);
+        // Actionable again on every poll, with no new commit: a conversation.
+        for t in [20, 30, 40] {
+            assert!(q.next(&[9], &[9], t).queue.is_empty(), "still capped at {t}");
+            assert!(q.is_capped(9));
+        }
+    }
+
+    #[test]
+    fn a_pr_with_no_commit_data_keeps_its_cap() {
+        // No commits in the query answer means no push anyone can prove, and
+        // guessing "probably" here is what the comment case punishes.
         let mut q = watcher(1, 0);
         q.record_pass(&[9], 0);
         assert_eq!(q.next(&[9], &[9], 10).capped, vec![9]);
-        for t in [20, 30, 40] {
-            assert!(q.next(&[9], &[9], t).queue.is_empty(), "still capped at {t}");
-        }
+        assert!(q.next(&[9], &[9], 20).queue.is_empty());
+        // A first sighting of a commit is not a push either: it is the first
+        // time we looked, and the review we already did covered it.
+        heads(&mut q, &[(9, "c1")]);
+        assert!(q.next(&[9], &[9], 30).queue.is_empty(), "not a push, just news");
     }
 
     #[test]
     fn a_reset_pr_can_be_announced_as_capped_again() {
         let mut q = watcher(1, 0);
+        heads(&mut q, &[(9, "c1")]);
         q.record_pass(&[9], 0);
         assert_eq!(q.next(&[9], &[9], 10).capped, vec![9]);
-        q.next(&[9], &[], 20);
+        heads(&mut q, &[(9, "c2")]);
         q.next(&[9], &[9], 30);
         q.record_pass(&[9], 30);
         // Capped a second time, and worth saying so a second time: it is a
@@ -343,19 +395,21 @@ mod tests {
         // No cooldown and no reset without watch mode: --babysit sleeps
         // between passes itself, and a cron run is meant to end.
         let mut q = sweep(1);
+        heads(&mut q, &[(9, "c1")]);
         q.record_pass(&[9], 0);
         assert_eq!(q.next(&[9], &[9], 1).capped, vec![9]);
-        q.next(&[9], &[], 2);
+        heads(&mut q, &[(9, "c2")]);
         assert!(q.next(&[9], &[9], 3).queue.is_empty(), "a push does not reset it");
         assert!(q.is_capped(9));
     }
 
     #[test]
-    fn an_approved_pr_stays_done_even_after_going_quiet() {
+    fn an_approved_pr_stays_done_however_much_it_is_pushed_to() {
         // The reset must not resurrect a PR that GitHub says is finished.
         let mut q = watcher(1, 0);
+        heads(&mut q, &[(9, "c1")]);
         q.mark_done(9);
-        q.next(&[9], &[], 10);
+        heads(&mut q, &[(9, "c2")]);
         assert!(q.next(&[9], &[9], 20).queue.is_empty(), "approved is final");
     }
 

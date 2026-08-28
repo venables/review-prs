@@ -154,6 +154,7 @@ mod tests {
             title: "Add retry logic".into(),
             updated_at: "2026-08-10T10:00:00Z".into(),
             resumable,
+            head: None,
         }
     }
 

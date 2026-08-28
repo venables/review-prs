@@ -144,6 +144,8 @@ pub struct PrInfo {
     pub title: String,
     pub author: String,
     pub engage: Engagement,
+    /// See `Row::head`.
+    pub head: Option<String>,
 }
 
 impl Row {
@@ -152,6 +154,7 @@ impl Row {
             title: self.title.clone(),
             author: self.author.clone(),
             engage: self.engage,
+            head: self.head.clone(),
         }
     }
 }
@@ -168,6 +171,10 @@ pub struct Row {
     pub title: String,
     pub updated_at: String,
     pub resumable: bool,
+    /// The newest commit date on the PR: the fingerprint a watch run compares
+    /// to tell a push from a comment. None when the query returned no
+    /// commits, which reads as "no push we can prove".
+    pub head: Option<String>,
 }
 
 /// What one fetch found: the PRs this run may act on, and how many were open
@@ -362,6 +369,17 @@ pub fn engagement(pr: &PrNode, me: &str) -> Engagement {
     }
 }
 
+/// The newest commit on a PR, as its committed date. This is what tells a
+/// push apart from a comment: both make a PR actionable again, but only one
+/// is new code to review.
+fn newest_commit(pr: &PrNode) -> Option<String> {
+    pr.commits
+        .nodes
+        .iter()
+        .filter_map(|c| c.commit.committed_date.clone())
+        .max()
+}
+
 pub fn build_rows(prs: &[PrNode], me: &str, now_epoch: i64) -> Vec<Row> {
     let mut rows: Vec<Row> = prs
         .iter()
@@ -383,6 +401,7 @@ pub fn build_rows(prs: &[PrNode], me: &str, now_epoch: i64) -> Vec<Row> {
                 title: pr.title.clone(),
                 updated_at: pr.updated_at.clone(),
                 resumable: false,
+                head: newest_commit(pr),
             }
         })
         .collect();

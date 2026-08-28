@@ -77,12 +77,6 @@ fn report_intake(intake: &queue::Intake, cfg: &Config) {
     }
 }
 
-/// Which of these PRs are still worth watching. Approved, merged and closed
-/// are all finished, and finished is final for the run -- the sweep lags, and
-/// a stale list must not re-queue a PR on the interval that dropped it.
-/// Seconds since the epoch, for the queue's per-PR cooldown. A clock that
-/// steps backwards would only ever end a rest early, which costs one review
-/// and never a stuck loop, so the wall clock is good enough here.
 /// What a watch run is sitting there for, so an idle line says something.
 fn waiting_on(watching: &[u64]) -> String {
     if watching.is_empty() {
@@ -92,6 +86,9 @@ fn waiting_on(watching: &[u64]) -> String {
     }
 }
 
+/// Seconds since the epoch, for the queue's per-PR cooldown. A clock that
+/// steps backwards would only ever end a rest early, which costs one review
+/// and never a stuck loop, so the wall clock is good enough here.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -99,6 +96,9 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Which of these PRs are still worth watching. Approved, merged and closed
+/// are all finished, and finished is final for the run -- the sweep lags, and
+/// a stale list must not re-queue a PR on the interval that dropped it.
 fn drop_finished(prs: &[u64], tracker: &mut Queue) -> Vec<u64> {
     let mut open = Vec::new();
     for &n in prs {
@@ -140,8 +140,10 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     let selected = select::run(&ctx, &select_prs(cfg), &status)?;
     let (numbers, info) = match (selected, &cfg.watch) {
         (Some(found), _) => found,
-        (None, Some(_)) => (Vec::new(), Default::default()),
-        (None, None) => return Ok(0),
+        // A --pick run reviews what was picked and nothing else, so a pick
+        // with nothing in it has nothing to watch for.
+        (None, Some(_)) if !cfg.pick => (Vec::new(), Default::default()),
+        (None, _) => return Ok(0),
     };
 
     let mut rundir = RunDir::new(cfg.log_dir.clone())?;
@@ -171,6 +173,9 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // Every PR this run is responsible for, which is not the same as the
     // queue: a PR that went quiet is still open, still ours, and still worth
     // waiting on. Rebuilding this from the last pass's queue would forget it.
+    for (&pr, pr_info) in &info {
+        tracker.note_head(pr, pr_info.head.clone());
+    }
     let mut watching = queue.clone();
     let mut refresh_failures = 0u32;
     let mut pass = 1u32;
@@ -241,7 +246,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
                         // Back off a little so a broken list is not polled at
                         // full rate for hours, but never to the point of
                         // missing a PR for long.
-                        let wait = poll.secs * refresh_failures.min(5) as u64;
+                        let wait = poll.secs.saturating_mul(refresh_failures.min(5) as u64);
                         println!("looking again in {}", ui::fmt_dur(wait));
                         interruptible_sleep(&rx, std::time::Duration::from_secs(wait), &ui);
                         already_waited = true;
@@ -275,6 +280,12 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
                 }
             };
 
+            // What the refresh saw, before it decides anything: the cap
+            // reset compares this against the commit each PR had when it was
+            // last reviewed.
+            for (&pr, pr_info) in &info {
+                tracker.note_head(pr, pr_info.head.clone());
+            }
             let intake = tracker.next(&watching, &fresh, now_secs());
             // A PR that joined is this run's responsibility from now on, so it
             // is watched until it is approved or closed -- not only while it
@@ -287,6 +298,14 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             // Everything below this decides to stop. A watch run does not
             // stop: an empty repo is a quiet morning, not a finished job.
             if watch.is_some() {
+                // The exception. A --pick run may only ever review the PRs it
+                // was given, so once they are all approved or closed nothing
+                // that happens next could add work. Waiting on would be
+                // waiting for something the queue is built to refuse.
+                if cfg.pick && watching.is_empty() {
+                    println!("\nevery picked PR is finished; nothing left to watch");
+                    break None;
+                }
                 println!(
                     "\nnothing to review right now; next check in {} ({})",
                     poll.normalized,
