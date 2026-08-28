@@ -637,7 +637,10 @@ assert_not_contains "...and it is not counting idle checks" "$out" "nothing has 
 #    ever hold what was picked, so nothing that happens next could add work.
 default_prs
 reset_spawn_log
-out="$(FAKE_GUM_PICK="#9" FAKE_GH_APPROVED="9" run_autoreview --pick --watch=1)"
+# Bounded: a regression that removed the exit would otherwise hang the suite
+# rather than fail this test.
+out="$(FAKE_GUM_PICK="#9" FAKE_GH_APPROVED="9" \
+  run_autoreview_bounded 120 --pick --watch=1)"
 assert_equals "a picked watch run ends when its picks are done" "$(last_status)" "0"
 assert_contains "...and says why" "$out" "every picked PR is finished"
 assert_not_contains "...rather than claiming to watch for new PRs" \

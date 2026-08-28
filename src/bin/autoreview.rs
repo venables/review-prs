@@ -137,7 +137,19 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // Nothing actionable ends an ordinary run. It does not end a watch run:
     // starting one before anybody has opened a PR is the ordinary way to
     // start one, and exiting would be the opposite of what was asked for.
-    let selected = select::run(&ctx, &select_prs(cfg), &status)?;
+    //
+    // Nor does a first fetch that fails. The loop below retries a failed
+    // refresh forever, and a run started at boot or during a GitHub outage
+    // must not be the one case that gives up on the first try.
+    let selected = match select::run(&ctx, &select_prs(cfg), &status) {
+        Ok(selected) => selected,
+        Err(e) if cfg.watch.is_some() => {
+            eprintln!("warning: could not read the PR list ({e:#})");
+            println!("watching anyway; the list will be read again on the next check");
+            None
+        }
+        Err(e) => return Err(e),
+    };
     let (numbers, info) = match (selected, &cfg.watch) {
         (Some(found), _) => found,
         // A --pick run reviews what was picked and nothing else, so a pick
@@ -166,9 +178,15 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // the queue rests each PR for the babysit interval instead of the loop
     // sleeping it. Both are set whenever --watch is.
     let watch = cfg.watch.clone();
+    // --watch always carries a babysit interval (src/cli.rs sets one), and if
+    // that ever stopped being true the plain Queue would take the loop out at
+    // the first pass -- so watch mode falls back to its own interval rather
+    // than to the bounded queue.
     let mut tracker = match (&watch, &cfg.babysit) {
-        (Some(_), Some(cooldown)) => Queue::watching(cfg.max_passes, picked, cooldown.secs),
-        _ => Queue::new(cfg.max_passes, picked),
+        (Some(w), cooldown) => {
+            Queue::watching(cfg.max_passes, picked, cooldown.as_ref().unwrap_or(w).secs)
+        }
+        (None, _) => Queue::new(cfg.max_passes, picked),
     };
     // Every PR this run is responsible for, which is not the same as the
     // queue: a PR that went quiet is still open, still ours, and still worth
