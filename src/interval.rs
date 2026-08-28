@@ -17,6 +17,13 @@ pub struct Interval {
 /// "soon" or an empty value would arrive as an unparseable duration.
 /// Sub-minute units are refused for the same hot-loop reason.
 pub fn normalize(raw: &str) -> Result<Interval, String> {
+    normalize_named(raw, "babysit")
+}
+
+/// The same rules, for a flag that is not --babysit. `kind` names the flag in
+/// the error, because "invalid babysit interval" sent to somebody who typed
+/// --watch tells them to go and look at the wrong flag.
+pub fn normalize_named(raw: &str, kind: &str) -> Result<Interval, String> {
     let mut v = raw.to_string();
     if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
         v.push('m');
@@ -29,27 +36,27 @@ pub fn normalize(raw: &str) -> Result<Interval, String> {
         && v[..v.len() - 1].bytes().all(|b| b.is_ascii_digit())
         && v[..v.len() - 1].bytes().any(|b| (b'1'..=b'9').contains(&b));
     if !ok {
-        return Err(format!(
-            "error: invalid babysit interval: \"{raw}\" (expected a positive duration, e.g. 30, 30m, 1h)"
-        ));
+        return Err(reject(raw, kind));
     }
 
     // Checked arithmetic, and a parse that can refuse: an absurd interval
     // must not wrap into a near-zero sleep -- that is the hot loop this whole
     // function exists to prevent.
-    let reject = || {
-        format!(
-            "error: invalid babysit interval: \"{raw}\" (expected a positive duration, e.g. 30, 30m, 1h)"
-        )
-    };
-    let n: u64 = v[..v.len() - 1].trim_start_matches('0').parse().map_err(|_| reject())?;
+    let n: u64 =
+        v[..v.len() - 1].trim_start_matches('0').parse().map_err(|_| reject(raw, kind))?;
     let secs = match v.as_bytes()[v.len() - 1] {
         b'm' => n.checked_mul(60),
         b'h' => n.checked_mul(3600),
         _ => n.checked_mul(86400),
     }
-    .ok_or_else(reject)?;
+    .ok_or_else(|| reject(raw, kind))?;
     Ok(Interval { normalized: v, secs })
+}
+
+fn reject(raw: &str, kind: &str) -> String {
+    format!(
+        "error: invalid {kind} interval: \"{raw}\" (expected a positive duration, e.g. 30, 30m, 1h)"
+    )
 }
 
 #[cfg(test)]
@@ -98,6 +105,19 @@ mod tests {
         for bad in ["", "5s", "m", "1x", "-5", "1.5h"] {
             assert!(normalize(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn the_error_names_the_flag_that_was_typed() {
+        // Somebody who typed --watch must not be sent to look at --babysit.
+        assert_eq!(
+            normalize_named("soon", "watch").unwrap_err(),
+            "error: invalid watch interval: \"soon\" (expected a positive duration, e.g. 30, 30m, 1h)"
+        );
+        // ...and the same rules apply whatever the flag is called.
+        assert!(normalize_named("0", "watch").is_err());
+        assert!(normalize_named("5s", "watch").is_err());
+        assert_eq!(normalize_named("2", "watch").unwrap().secs, 120);
     }
 
     #[test]
