@@ -493,18 +493,21 @@ EOF
 {"data":{"repository":{"pullRequests":{"nodes":[
   {"number":9,"title":"Add retry logic","isDraft":false,
    "updatedAt":"2026-08-10T10:00:00Z","reviewDecision":null,
+   "headRefOid":"sha9",
    "author":{"login":"alice"},
    "comments":{"nodes":[]},"reviews":{"nodes":[]},
    "commits":{"nodes":[{"commit":{"committedDate":"2026-08-10T10:00:00Z","author":{"user":{"login":"alice"}}}}]}},
 
   {"number":8,"title":"Fix typo","isDraft":false,
    "updatedAt":"2026-08-09T10:00:00Z","reviewDecision":"CHANGES_REQUESTED",
+   "headRefOid":"sha8",
    "author":{"login":"bob"},
    "comments":{"nodes":[]},"reviews":{"nodes":[]},
    "commits":{"nodes":[{"commit":{"committedDate":"2026-08-09T10:00:00Z","author":{"user":{"login":"bob"}}}}]}},
 
   {"number":6,"title":"Refactor client","isDraft":false,
    "updatedAt":"2026-08-08T10:00:00Z","reviewDecision":null,
+   "headRefOid":"sha6",
    "author":{"login":"carol"},
    "comments":{"nodes":[{"author":{"login":"me"},"updatedAt":"2026-08-08T10:00:00Z"}]},
    "reviews":{"nodes":[]},
@@ -512,24 +515,28 @@ EOF
 
   {"number":5,"title":"Approved already","isDraft":false,
    "updatedAt":"2026-08-06T10:00:00Z","reviewDecision":"APPROVED",
+   "headRefOid":"sha5",
    "author":{"login":"dave"},
    "comments":{"nodes":[]},"reviews":{"nodes":[]},
    "commits":{"nodes":[{"commit":{"committedDate":"2026-08-06T10:00:00Z","author":{"user":{"login":"dave"}}}}]}},
 
   {"number":4,"title":"My own work","isDraft":false,
    "updatedAt":"2026-08-05T10:00:00Z","reviewDecision":null,
+   "headRefOid":"sha4",
    "author":{"login":"me"},
    "comments":{"nodes":[]},"reviews":{"nodes":[]},
    "commits":{"nodes":[{"commit":{"committedDate":"2026-08-05T10:00:00Z","author":{"user":{"login":"me"}}}}]}},
 
   {"number":3,"title":"Bump lodash","isDraft":false,
    "updatedAt":"2026-08-04T10:00:00Z","reviewDecision":null,
+   "headRefOid":"sha3",
    "author":{"login":"dependabot"},
    "comments":{"nodes":[]},"reviews":{"nodes":[]},
    "commits":{"nodes":[{"commit":{"committedDate":"2026-08-04T10:00:00Z","author":{"user":{"login":"dependabot"}}}}]}},
 
   {"number":2,"title":"Work in progress","isDraft":true,
    "updatedAt":"2026-08-03T10:00:00Z","reviewDecision":null,
+   "headRefOid":"sha2",
    "author":{"login":"erin"},
    "comments":{"nodes":[]},"reviews":{"nodes":[]},
    "commits":{"nodes":[{"commit":{"committedDate":"2026-08-03T10:00:00Z","author":{"user":{"login":"erin"}}}}]}}
@@ -562,6 +569,34 @@ run_autoreview() {
   rm -rf "$SANDBOX/out/logs"
   set +e
   ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" "$@" 2>&1 )
+  local status=$?
+  set -e
+  printf '%s' "$status" >"$SANDBOX/out/status"
+}
+
+# run_autoreview with a wall-clock bound in seconds ($1), for a run that is
+# asserted to exit. Without the bound a regression that removes the exit hangs
+# the whole suite rather than failing the one test. A run still alive at the
+# limit records the status "timeout", which no assertion accepts.
+run_autoreview_bounded() {
+  local limit="$1"; shift
+  reset_spawn_log
+  set +e
+  ( cd "$SANDBOX/repo" && "$AUTOREVIEW" --log-dir "$SANDBOX/out/logs" "$@" 2>&1 ) &
+  local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null && [[ "$waited" -lt $((limit * 10)) ]]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    pkill -P "$pid" >/dev/null 2>&1
+    kill "$pid" >/dev/null 2>&1
+    wait "$pid" 2>/dev/null
+    printf '%s' "timeout" >"$SANDBOX/out/status"
+    set -e
+    return
+  fi
+  wait "$pid"
   local status=$?
   set -e
   printf '%s' "$status" >"$SANDBOX/out/status"

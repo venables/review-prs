@@ -31,6 +31,7 @@ const QUERY: &str = "
               isDraft
               updatedAt
               reviewDecision
+              headRefOid
               author { login }
               comments(last:100) { nodes { author { login } updatedAt } }
               reviews(last:100)  { nodes { author { login } submittedAt } }
@@ -96,6 +97,10 @@ pub struct PrNode {
     pub updated_at: String,
     #[serde(rename = "reviewDecision")]
     pub review_decision: Option<String>,
+    /// The SHA at the tip of the PR branch. This is what tells a push from a
+    /// comment: both make a PR actionable again, and only one is new code.
+    #[serde(rename = "headRefOid")]
+    pub head_ref_oid: Option<String>,
     pub author: Option<Actor>,
     #[serde(default = "empty_nodes")]
     pub comments: Nodes<CommentNode>,
@@ -171,9 +176,13 @@ pub struct Row {
     pub title: String,
     pub updated_at: String,
     pub resumable: bool,
-    /// The newest commit date on the PR: the fingerprint a watch run compares
-    /// to tell a push from a comment. None when the query returned no
-    /// commits, which reads as "no push we can prove".
+    /// The SHA at the tip of the PR branch: the fingerprint a watch run
+    /// compares to tell a push from a comment. None when the query did not
+    /// return one, which reads as "no push we can prove".
+    ///
+    /// A SHA rather than the newest commit date, because a date is not
+    /// unique: a force-push that keeps committer dates, or two pushes inside
+    /// the same second, would read as no push at all and leave the PR capped.
     pub head: Option<String>,
 }
 
@@ -369,17 +378,6 @@ pub fn engagement(pr: &PrNode, me: &str) -> Engagement {
     }
 }
 
-/// The newest commit on a PR, as its committed date. This is what tells a
-/// push apart from a comment: both make a PR actionable again, but only one
-/// is new code to review.
-fn newest_commit(pr: &PrNode) -> Option<String> {
-    pr.commits
-        .nodes
-        .iter()
-        .filter_map(|c| c.commit.committed_date.clone())
-        .max()
-}
-
 pub fn build_rows(prs: &[PrNode], me: &str, now_epoch: i64) -> Vec<Row> {
     let mut rows: Vec<Row> = prs
         .iter()
@@ -401,7 +399,7 @@ pub fn build_rows(prs: &[PrNode], me: &str, now_epoch: i64) -> Vec<Row> {
                 title: pr.title.clone(),
                 updated_at: pr.updated_at.clone(),
                 resumable: false,
-                head: newest_commit(pr),
+                head: pr.head_ref_oid.clone(),
             }
         })
         .collect();
@@ -511,6 +509,36 @@ mod tests {
            "comments":{"nodes":[]},"reviews":{"nodes":[]},"commits":{"nodes":[]}}
         ]"#;
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn the_head_sha_reaches_the_queue_that_compares_it() {
+        // The push detection is only as good as this wiring: the query asks
+        // for headRefOid, Row carries it, and PrInfo hands it to the queue.
+        // Every link was previously untested, so the whole reset could have
+        // been inert against a real GitHub answer and every test still pass.
+        assert!(QUERY.contains("headRefOid"), "the query must ask for it");
+
+        let json = r#"[
+          {"number":9,"title":"Add retry logic","isDraft":false,
+           "updatedAt":"2026-08-10T10:00:00Z","reviewDecision":null,
+           "headRefOid":"abc123","author":{"login":"alice"},
+           "comments":{"nodes":[]},"reviews":{"nodes":[]},"commits":{"nodes":[]}},
+          {"number":8,"title":"No head","isDraft":false,
+           "updatedAt":"2026-08-09T10:00:00Z","reviewDecision":null,
+           "author":{"login":"bob"},
+           "comments":{"nodes":[]},"reviews":{"nodes":[]},"commits":{"nodes":[]}}
+        ]"#;
+        let prs: Vec<PrNode> = serde_json::from_str(json).unwrap();
+        assert_eq!(prs[0].head_ref_oid.as_deref(), Some("abc123"));
+        assert_eq!(prs[1].head_ref_oid, None, "a missing head is None, not an error");
+
+        let rows = build_rows(&prs, "me", 0);
+        let nine = rows.iter().find(|r| r.number == 9).unwrap();
+        let eight = rows.iter().find(|r| r.number == 8).unwrap();
+        assert_eq!(nine.head.as_deref(), Some("abc123"));
+        assert_eq!(nine.info().head.as_deref(), Some("abc123"));
+        assert_eq!(eight.info().head, None);
     }
 
     /// The real chain, not a copy of it: `fetch` differs from this only by
