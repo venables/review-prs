@@ -80,6 +80,16 @@ fn report_intake(intake: &queue::Intake, cfg: &Config) {
 /// Which of these PRs are still worth watching. Approved, merged and closed
 /// are all finished, and finished is final for the run -- the sweep lags, and
 /// a stale list must not re-queue a PR on the interval that dropped it.
+/// Seconds since the epoch, for the queue's per-PR cooldown. A clock that
+/// steps backwards would only ever end a rest early, which costs one review
+/// and never a stuck loop, so the wall clock is good enough here.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn drop_finished(prs: &[u64], tracker: &mut Queue) -> Vec<u64> {
     let mut open = Vec::new();
     for &n in prs {
@@ -147,7 +157,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         let jobs = pool::run_pass(&queue, &info, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
         ui.print_summary(&jobs, &rundir.pass_dir);
         let failures = pool::failures(&jobs);
-        tracker.record_pass(&queue);
+        tracker.record_pass(&queue, now_secs());
 
         let Some(babysit) = cfg.babysit.clone() else {
             break (failures, jobs.len());
@@ -215,7 +225,7 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
                 }
             };
 
-            let intake = tracker.next(&watching, &fresh);
+            let intake = tracker.next(&watching, &fresh, now_secs());
             // A PR that joined is this run's responsibility from now on, so it
             // is watched until it is approved or closed -- not only while it
             // happens to be actionable.
