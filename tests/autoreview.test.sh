@@ -605,6 +605,44 @@ assert_not_contains "...rather than giving up" "$out" "giving up"
 
 default_prs
 
+# 4. An open PR that nobody touches. This is the case --max-idle exists to
+#    stop, and the one a watch run must sit through: --max-idle=1 would end a
+#    babysit run at the first counted idle check. Without this test a change
+#    that moved the watch guard below the --max-idle check would still pass.
+default_prs
+reset_spawn_log
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && FAKE_GH_APPROVED="9" "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --watch=1 --max-idle=1 \
+    >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+waited=0
+while [[ "$waited" -lt 900 ]]; do
+  grep -q "next check in" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+idle_running=no
+kill -0 "$bg" 2>/dev/null && idle_running=yes
+pkill -P "$bg" >/dev/null 2>&1 || true
+kill "$bg" >/dev/null 2>&1 || true
+wait "$bg" 2>/dev/null || true
+
+out="$(cat "$SANDBOX/out/bg")"
+assert_equals "--max-idle does not stop a watch run" "$idle_running" "yes"
+assert_not_contains "...and it is not counting idle checks" "$out" "nothing has changed in"
+
+# 5. --pick --watch ends when every picked PR is finished: the queue may only
+#    ever hold what was picked, so nothing that happens next could add work.
+default_prs
+reset_spawn_log
+out="$(FAKE_GUM_PICK="#9" FAKE_GH_APPROVED="9" run_autoreview --pick --watch=1)"
+assert_equals "a picked watch run ends when its picks are done" "$(last_status)" "0"
+assert_contains "...and says why" "$out" "every picked PR is finished"
+assert_not_contains "...rather than claiming to watch for new PRs" \
+  "$out" "watching for new PRs"
+
 # --- --watch validates its own interval -----------------------------------
 out="$(run_autoreview --auto --watch=soon)"
 assert_equals "a bad watch interval exits nonzero" "$(last_status)" "1"
