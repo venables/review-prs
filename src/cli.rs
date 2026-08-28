@@ -21,7 +21,9 @@ PRs (nothing has changed since you last engaged) are left alone.
                       stop (default 2, or $AUTOREVIEW_WATCH_INTERVAL). Only
                       ctrl-C ends it. Nothing to review is not a reason to
                       exit, an idle stretch is not a reason to exit, and a
-                      failed refresh is retried rather than counted. A PR that
+                      failed refresh is retried rather than counted. With
+                      --pick there is nothing to pick from if the first fetch
+                      fails, so that one case still exits. A PR that
                       goes quiet and then becomes actionable again was pushed
                       to, so it gets a fresh set of passes. Use this to leave
                       a terminal reviewing all day; use --babysit for cron.

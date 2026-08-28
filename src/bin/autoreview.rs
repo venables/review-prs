@@ -197,6 +197,9 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         tracker.note_head(pr, pr_info.head.clone());
     }
     let mut watching = queue.clone();
+    // Needed before the pass runs, where the loop's own `poll` is not yet in
+    // scope. Only ever read on the watch path.
+    let poll_secs = watch.as_ref().map_or(0, |w| w.secs);
     let mut refresh_failures = 0u32;
     let mut pass = 1u32;
     let (failures, total) = loop {
@@ -206,7 +209,18 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         let jobs = if queue.is_empty() {
             Vec::new()
         } else {
-            rundir.start_pass(pass)?;
+            // The last non-signal exit a watch sweep had: a full disk or a
+            // log directory somebody removed would end a session that is
+            // meant to outlive both. The work waits for the next poll.
+            if let Err(e) = rundir.start_pass(pass) {
+                if watch.is_some() {
+                    eprintln!("\nwarning: could not open the log directory ({e:#})");
+                    println!("waiting, then trying again");
+                    interruptible_sleep(&rx, std::time::Duration::from_secs(poll_secs), &ui);
+                    continue;
+                }
+                return Err(e);
+            }
             let jobs =
                 pool::run_pass(&queue, &info, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
             ui.print_summary(&jobs, &rundir.pass_dir);
