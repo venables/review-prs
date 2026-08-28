@@ -646,6 +646,43 @@ assert_contains "...and says why" "$out" "every picked PR is finished"
 assert_not_contains "...rather than claiming to watch for new PRs" \
   "$out" "watching for new PRs"
 
+# 6. A first fetch that fails does not end a watch sweep. Starting one at boot
+#    or during a GitHub outage is exactly when this happens, and the loop below
+#    retries anyway.
+default_prs
+reset_spawn_log
+rm -f "$SANDBOX/out/graphql-calls"
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && FAKE_GH_GRAPHQL_FAIL_AFTER=0 "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --watch=1 >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+waited=0
+while [[ "$waited" -lt 600 ]]; do
+  grep -q "watching anyway" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+first_fail_running=no
+kill -0 "$bg" 2>/dev/null && first_fail_running=yes
+pkill -P "$bg" >/dev/null 2>&1 || true
+kill "$bg" >/dev/null 2>&1 || true
+wait "$bg" 2>/dev/null || true
+
+out="$(cat "$SANDBOX/out/bg")"
+assert_equals "a failed first fetch does not end a watch run" "$first_fail_running" "yes"
+assert_contains "...and it says what it is doing" "$out" "watching anyway"
+
+# 7. ...but a picked watch run has nothing to show the picker, so it fails --
+#    and it must fail, not report success. Both a failed fetch and an empty
+#    pick produce no selection, and only one of them is a clean exit.
+default_prs
+reset_spawn_log
+rm -f "$SANDBOX/out/graphql-calls"
+out="$(FAKE_GH_GRAPHQL_FAIL_AFTER=0 run_autoreview_bounded 60 --pick --watch=1)"
+assert_equals "a picked watch run with no PR list fails" "$(last_status)" "1"
+assert_not_contains "...rather than reporting success" "$out" "watching anyway"
+
 # --- --watch validates its own interval -----------------------------------
 out="$(run_autoreview --auto --watch=soon)"
 assert_equals "a bad watch interval exits nonzero" "$(last_status)" "1"
