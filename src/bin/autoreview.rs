@@ -83,6 +83,15 @@ fn report_intake(intake: &queue::Intake, cfg: &Config) {
 /// Seconds since the epoch, for the queue's per-PR cooldown. A clock that
 /// steps backwards would only ever end a rest early, which costs one review
 /// and never a stuck loop, so the wall clock is good enough here.
+/// What a watch run is sitting there for, so an idle line says something.
+fn waiting_on(watching: &[u64]) -> String {
+    if watching.is_empty() {
+        "watching for new PRs".to_string()
+    } else {
+        format!("{} still open", ui::count(watching.len(), "PR"))
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -125,8 +134,14 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     status.step(step::reading_repo());
     let ctx = repo::load(&status)?;
 
-    let Some((numbers, info)) = select::run(&ctx, &select_prs(cfg), &status)? else {
-        return Ok(0);
+    // Nothing actionable ends an ordinary run. It does not end a watch run:
+    // starting one before anybody has opened a PR is the ordinary way to
+    // start one, and exiting would be the opposite of what was asked for.
+    let selected = select::run(&ctx, &select_prs(cfg), &status)?;
+    let (numbers, info) = match (selected, &cfg.watch) {
+        (Some(found), _) => found,
+        (None, Some(_)) => (Vec::new(), Default::default()),
+        (None, None) => return Ok(0),
     };
 
     let mut rundir = RunDir::new(cfg.log_dir.clone())?;
@@ -145,7 +160,14 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     let mut info = info;
     // A --pick run may never grow past what was picked; a sweep may.
     let picked = cfg.pick.then(|| queue.clone());
-    let mut tracker = Queue::new(cfg.max_passes, picked);
+    // A watch run polls far more often than a PR can usefully be reviewed, so
+    // the queue rests each PR for the babysit interval instead of the loop
+    // sleeping it. Both are set whenever --watch is.
+    let watch = cfg.watch.clone();
+    let mut tracker = match (&watch, &cfg.babysit) {
+        (Some(_), Some(cooldown)) => Queue::watching(cfg.max_passes, picked, cooldown.secs),
+        _ => Queue::new(cfg.max_passes, picked),
+    };
     // Every PR this run is responsible for, which is not the same as the
     // queue: a PR that went quiet is still open, still ours, and still worth
     // waiting on. Rebuilding this from the last pass's queue would forget it.
@@ -153,15 +175,28 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     let mut refresh_failures = 0u32;
     let mut pass = 1u32;
     let (failures, total) = loop {
-        rundir.start_pass(pass)?;
-        let jobs = pool::run_pass(&queue, &info, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
-        ui.print_summary(&jobs, &rundir.pass_dir);
+        // A watch run reaches the loop with an empty queue whenever there is
+        // nothing to review yet, and an empty pass would print a summary of
+        // nothing and burn a pass number.
+        let jobs = if queue.is_empty() {
+            Vec::new()
+        } else {
+            rundir.start_pass(pass)?;
+            let jobs =
+                pool::run_pass(&queue, &info, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
+            ui.print_summary(&jobs, &rundir.pass_dir);
+            tracker.record_pass(&queue, now_secs());
+            pass += 1;
+            jobs
+        };
         let failures = pool::failures(&jobs);
-        tracker.record_pass(&queue, now_secs());
 
         let Some(babysit) = cfg.babysit.clone() else {
             break (failures, jobs.len());
         };
+        // How often to look for new work. Under --watch that is its own
+        // interval; under --babysit the one interval does both jobs.
+        let poll = watch.clone().unwrap_or_else(|| babysit.clone());
 
         // The first pass recorded each review's session; every later pass
         // resumes it whether or not --continue was passed. Re-reviewing from
@@ -197,6 +232,21 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
                     numbers
                 }
                 Err(e) => {
+                    // A watch run has nowhere to be. The list will answer
+                    // again eventually, and stopping would be the one failure
+                    // mode the mode exists to avoid.
+                    if watch.is_some() {
+                        refresh_failures += 1;
+                        eprintln!("\nwarning: could not refresh the PR list ({e:#})");
+                        // Back off a little so a broken list is not polled at
+                        // full rate for hours, but never to the point of
+                        // missing a PR for long.
+                        let wait = poll.secs * refresh_failures.min(5) as u64;
+                        println!("looking again in {}", ui::fmt_dur(wait));
+                        interruptible_sleep(&rx, std::time::Duration::from_secs(wait), &ui);
+                        already_waited = true;
+                        continue;
+                    }
                     // A run with nothing left to watch is finished whatever
                     // the list says, so a failed look here must not turn it
                     // into a failed run.
@@ -233,6 +283,18 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             report_intake(&intake, &cfg);
             if !intake.queue.is_empty() {
                 break Some(intake.queue);
+            }
+            // Everything below this decides to stop. A watch run does not
+            // stop: an empty repo is a quiet morning, not a finished job.
+            if watch.is_some() {
+                println!(
+                    "\nnothing to review right now; next check in {} ({})",
+                    poll.normalized,
+                    waiting_on(&watching)
+                );
+                interruptible_sleep(&rx, std::time::Duration::from_secs(poll.secs), &ui);
+                already_waited = true;
+                continue;
             }
             if exhausted {
                 // Nothing open to wait for, or nothing left that may be
@@ -284,7 +346,11 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         // spent before the next pass rather than before deciding there is one
         // -- unless the wait above already spent one, in which case spending
         // another would delay the work by twice the interval.
-        if !already_waited {
+        //
+        // A watch run never spends it here. Its queue only ever holds PRs
+        // that have already rested, so sleeping again would delay real work
+        // by a full cooldown.
+        if !already_waited && watch.is_none() {
             println!(
                 "\nnext check in {} ({} left)",
                 babysit.normalized,
@@ -292,7 +358,6 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             );
             interruptible_sleep(&rx, std::time::Duration::from_secs(babysit.secs), &ui);
         }
-        pass += 1;
     };
     ui.show_cursor();
 
