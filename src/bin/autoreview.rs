@@ -141,23 +141,26 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // Nor does a first fetch that fails. The loop below retries a failed
     // refresh forever, and a run started at boot or during a GitHub outage
     // must not be the one case that gives up on the first try.
+    //
+    // A --pick run is the exception on both counts. It has nothing to show the
+    // picker if the fetch failed, and its queue can only hold what was picked,
+    // so neither a failure nor an empty pick is something waiting would fix.
+    // Keeping it out of the arm below also keeps the two apart: a failed fetch
+    // must not leave by the same door as an empty pick, which exits 0.
+    let sweeping = cfg.watch.is_some() && !cfg.pick;
     let selected = match select::run(&ctx, &select_prs(cfg), &status) {
-        Ok(selected) => selected,
-        Err(e) if cfg.watch.is_some() => {
+        Err(e) if sweeping => {
             eprintln!("warning: could not read the PR list ({e:#})");
             println!("watching anyway; the list will be read again on the next check");
             None
         }
-        Err(e) => return Err(e),
+        other => other?,
     };
-    let (numbers, info) = match (selected, &cfg.watch) {
+    let (numbers, info) = match (selected, sweeping) {
         (Some(found), _) => found,
-        // A --pick run reviews what was picked and nothing else, so a pick
-        // with nothing in it has nothing to watch for.
-        (None, Some(_)) if !cfg.pick => (Vec::new(), Default::default()),
-        (None, _) => return Ok(0),
+        (None, true) => (Vec::new(), Default::default()),
+        (None, false) => return Ok(0),
     };
-
     let mut rundir = RunDir::new(cfg.log_dir.clone())?;
     let (tx, rx) = std::sync::mpsc::channel();
     signals::install(tx.clone());
@@ -178,10 +181,9 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // the queue rests each PR for the babysit interval instead of the loop
     // sleeping it. Both are set whenever --watch is.
     let watch = cfg.watch.clone();
-    // --watch always carries a babysit interval (src/cli.rs sets one), and if
-    // that ever stopped being true the plain Queue would take the loop out at
-    // the first pass -- so watch mode falls back to its own interval rather
-    // than to the bounded queue.
+    // --watch always carries a babysit interval (src/cli.rs sets one). If that
+    // ever stopped being true, watch mode falls back to its own interval for
+    // the cooldown, and the loop guard below takes the same fallback.
     let mut tracker = match (&watch, &cfg.babysit) {
         (Some(w), cooldown) => {
             Queue::watching(cfg.max_passes, picked, cooldown.as_ref().unwrap_or(w).secs)
@@ -214,7 +216,11 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         };
         let failures = pool::failures(&jobs);
 
-        let Some(babysit) = cfg.babysit.clone() else {
+        // A run with no interval at all does one pass and stops. --watch
+        // always has one, and falls back to its own poll interval if that
+        // ever stopped being true -- the same fallback the queue takes, so
+        // the two cannot disagree about whether the loop continues.
+        let Some(babysit) = cfg.babysit.clone().or_else(|| watch.clone()) else {
             break (failures, jobs.len());
         };
         // How often to look for new work. Under --watch that is its own
