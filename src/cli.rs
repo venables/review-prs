@@ -8,20 +8,30 @@ use std::path::PathBuf;
 
 pub const HELP: &str = r#"autoreview: review open PRs headlessly, with progress and a real exit status.
 
-Usage: autoreview [--pick] [--babysit[=MINUTES]] [--continue] [--jobs N]
-                  [--timeout SECONDS] [--budget USD] [--log-dir DIR]
-                  [--all] [--dependabot] [--help]
+Usage: autoreview [--pick] [--watch[=MINUTES]] [--babysit[=MINUTES]]
+                  [--continue] [--jobs N] [--timeout SECONDS] [--budget USD]
+                  [--log-dir DIR] [--all] [--dependabot] [--help]
 
 Every NEW or UPDATED PR is reviewed by default -- the actionable ones. SEEN
 PRs (nothing has changed since you last engaged) are left alone.
 
   --pick, -p          Choose from a list instead of reviewing every one.
   --auto, -A          Accepted and ignored: it is the default now.
+  --watch[=MIN], -w   Stay on: poll every MIN minutes for new PRs and never
+                      stop (default 2, or $AUTOREVIEW_WATCH_INTERVAL). Only
+                      ctrl-C ends it. Nothing to review is not a reason to
+                      exit, an idle stretch is not a reason to exit, and a
+                      failed refresh is retried rather than counted. A PR that
+                      goes quiet and then becomes actionable again was pushed
+                      to, so it gets a fresh set of passes. Use this to leave
+                      a terminal reviewing all day; use --babysit for cron.
   --babysit[=MIN], -b Re-run the pass every MIN minutes (default 30, or
                       $AUTOREVIEW_BABYSIT_INTERVAL), dropping PRs as they are
                       approved or closed and picking up PRs opened or updated
                       while it ran, until none are left. A bare number is
-                      minutes; 30m/1h/2d also work.
+                      minutes; 30m/1h/2d also work. Under --watch this is
+                      not a sleep but a per-PR cooldown: how long a PR rests
+                      after a review before it may be reviewed again.
   --continue, -C      Resume this machine's earlier review session for a PR
                       (a second look at the findings) instead of reviewing it
                       from scratch. Marked RESUMABLE in the picker.
@@ -29,10 +39,12 @@ PRs (nothing has changed since you last engaged) are left alone.
                       Keep it low: a panel review is itself several agents.
   --max-idle N        How many checks in a row may find nothing to do before
                       --babysit stops (default 3, or $AUTOREVIEW_MAX_IDLE).
+                      Ignored under --watch, which is meant to sit idle.
                       A PR nobody is touching should not keep a process alive
                       forever, least of all one started by cron.
-  --max-passes N      How often --babysit may review one PR before leaving it
-                      alone (default 3, or $AUTOREVIEW_MAX_PASSES). Every
+  --max-passes N      How often one PR may be reviewed before it is left
+                      alone (default 3, or $AUTOREVIEW_MAX_PASSES). Under
+                      --watch the count resets when its author pushes again. Every
                       review is activity on the PR, so an author who answers
                       makes it actionable again; this is what keeps that from
                       running for as long as the loop does.
@@ -82,7 +94,13 @@ pub struct Config {
     /// Show the picker instead of sweeping every NEW/UPDATED PR. The sweep is
     /// the default; picking is what marks a run as attended.
     pub pick: bool,
+    /// How long a PR rests after a review before it may be reviewed again.
+    /// Under --babysit this is also the sleep between passes; under --watch
+    /// it is a per-PR cooldown and the loop polls on `watch` instead.
     pub babysit: Option<Interval>,
+    /// Always on: poll this often for new PRs and never stop. Only a signal
+    /// ends a watch run, so none of the bounds --babysit respects apply.
+    pub watch: Option<Interval>,
     pub continue_sessions: bool,
     pub jobs: u32,
     /// How often --babysit may review one PR before leaving it alone.
@@ -107,7 +125,7 @@ impl Config {
     /// for the picker is the one thing that proves somebody is watching --
     /// and a babysit loop outlives that person either way.
     pub fn unattended(&self) -> bool {
-        !self.pick || self.babysit.is_some()
+        !self.pick || self.babysit.is_some() || self.watch.is_some()
     }
 }
 
@@ -212,6 +230,7 @@ fn require_value(flag: &str, value: Option<String>) -> Result<String, CliError> 
 pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Parsed, CliError> {
     let mut pick = false;
     let mut babysit = false;
+    let mut watch = false;
     let mut continue_sessions = false;
     let mut include_approved = false;
     let mut include_dependabot = false;
@@ -228,6 +247,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     // including --help and picker runs that never babysit.
     let mut babysit_interval_raw =
         env_nonempty(env, "AUTOREVIEW_BABYSIT_INTERVAL").unwrap_or_else(|| "30".into());
+    let mut watch_interval_raw =
+        env_nonempty(env, "AUTOREVIEW_WATCH_INTERVAL").unwrap_or_else(|| "2".into());
 
     let mut it = args.into_iter().peekable();
     while let Some(arg) = it.next() {
@@ -238,6 +259,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             // tool already does.
             "--auto" | "-A" => {}
             "--babysit" | "-b" => babysit = true,
+            "--watch" | "-w" => watch = true,
             "--continue" | "-C" => continue_sessions = true,
             "--all" | "-a" => include_approved = true,
             "--dependabot" | "-d" => include_dependabot = true,
@@ -250,7 +272,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--budget" => budget_raw = Some(require_value("--budget", it.next())?),
             "--log-dir" => log_dir_raw = Some(require_value("--log-dir", it.next())?),
             other => {
-                if let Some(v) = other.strip_prefix("--babysit=") {
+                if let Some(v) = other.strip_prefix("--watch=") {
+                    watch = true;
+                    watch_interval_raw = v.to_string();
+                } else if let Some(v) = other.strip_prefix("--babysit=") {
                     babysit = true;
                     babysit_interval_raw = v.to_string();
                 } else if let Some(v) =
@@ -307,7 +332,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
 
     // Validated only when babysitting is actually on, so an unrelated bad env
     // var never blocks a plain run.
-    let babysit_interval = if babysit {
+    let watch_interval = if watch {
+        Some(interval::normalize_named(&watch_interval_raw, "watch").map_err(err)?)
+    } else {
+        None
+    };
+    // A watch run needs the babysit interval as well: it is the cooldown that
+    // keeps a still-actionable PR from being reviewed on every poll.
+    let babysit_interval = if babysit || watch {
         Some(interval::normalize(&babysit_interval_raw).map_err(err)?)
     } else {
         None
@@ -318,7 +350,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     // would be the expensive kind of surprise, so say which one is running.
     let cmd = env_nonempty(env, "AUTOREVIEW_CMD");
     let auto_cmd = env_nonempty(env, "AUTOREVIEW_AUTO_CMD");
-    let unattended = !pick || babysit;
+    let unattended = !pick || babysit || watch;
     let mut startup_notes = Vec::new();
     let review_cmd = if unattended {
         if cmd.is_some() && auto_cmd.is_none() {
@@ -334,6 +366,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     Ok(Parsed::Run(Box::new(Config {
         pick,
         babysit: babysit_interval,
+        watch: watch_interval,
         continue_sessions,
         jobs,
         max_passes,
@@ -385,6 +418,70 @@ mod tests {
             Err(e) => e.msg,
             Ok(_) => panic!("expected an error"),
         }
+    }
+
+    #[test]
+    fn watch_is_off_unless_asked_for() {
+        assert!(cfg(&[]).watch.is_none());
+        assert!(cfg(&["--babysit"]).watch.is_none(), "--babysit is not --watch");
+    }
+
+    #[test]
+    fn watch_polls_every_two_minutes_by_default() {
+        // "a minute or two" is the point of the mode: a session sitting in a
+        // terminal should notice a new PR while you still care about it.
+        let c = cfg(&["--watch"]);
+        let w = c.watch.unwrap();
+        assert_eq!(w.normalized, "2m");
+        assert_eq!(w.secs, 120);
+    }
+
+    #[test]
+    fn watch_takes_an_interval() {
+        assert_eq!(cfg(&["--watch=5"]).watch.unwrap().normalized, "5m");
+        assert_eq!(cfg(&["--watch=90m"]).watch.unwrap().secs, 5400);
+        // "=" only, like --babysit: an optional-value flag cannot take a
+        // space-separated value without guessing.
+        assert_eq!(cfg(&["--watch=1h"]).watch.unwrap().secs, 3600);
+        assert!(cfg(&["-w"]).watch.is_some(), "the short form is the bare flag");
+    }
+
+    #[test]
+    fn watch_supplies_the_babysit_interval_it_uses_as_a_cooldown() {
+        // The two intervals do different jobs: --watch is how often to look
+        // for new work, --babysit is how long a PR rests after a review. A
+        // --watch run needs both, so it takes the babysit default when the
+        // user names only one.
+        let c = cfg(&["--watch=1"]);
+        assert_eq!(c.watch.unwrap().secs, 60);
+        assert_eq!(c.babysit.unwrap().normalized, "30m", "the cooldown still applies");
+
+        let c = cfg(&["--watch=1", "--babysit=2h"]);
+        assert_eq!(c.watch.unwrap().secs, 60);
+        assert_eq!(c.babysit.unwrap().secs, 7200);
+    }
+
+    #[test]
+    fn a_bad_watch_interval_names_watch_not_babysit() {
+        assert!(msg(&["--watch=soon"]).contains("invalid watch interval"));
+        assert!(msg(&["--watch=0"]).contains("invalid watch interval"));
+    }
+
+    #[test]
+    fn the_watch_interval_comes_from_the_environment_too() {
+        let c = match run_env(&["--watch"], &[("AUTOREVIEW_WATCH_INTERVAL", "10")]) {
+            Ok(Parsed::Run(c)) => *c,
+            _ => panic!("expected a run"),
+        };
+        assert_eq!(c.watch.unwrap().normalized, "10m");
+    }
+
+    #[test]
+    fn a_watch_run_is_unattended_even_when_it_picks() {
+        // Nobody sits and watches a process that never ends, so it takes the
+        // unattended prompt and override like --babysit does.
+        assert!(cfg(&["--watch"]).unattended());
+        assert!(cfg(&["--pick", "--watch"]).unattended());
     }
 
     #[test]

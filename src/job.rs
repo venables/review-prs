@@ -270,6 +270,7 @@ mod tests {
         Config {
             pick,
             babysit: None,
+            watch: None,
             continue_sessions: false,
             jobs: 2,
             max_passes: 3,
