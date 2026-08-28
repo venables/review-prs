@@ -527,6 +527,89 @@ assert_equals "an all-approved run still exits 0" "$(last_status)" "0"
 assert_contains "...and ends" "$out" "nothing left to babysit"
 assert_contains "...while admitting the last look failed" "$out" "could not refresh the PR list"
 
+# --- --watch never stops --------------------------------------------------
+# The three things that end a --babysit run must not end a watch run. Each of
+# these would have stopped the loop before: everything approved (nothing left),
+# an empty repo (nothing to watch at all), and a PR list that keeps failing.
+default_prs
+
+# 1. Everything approved. --babysit says "nothing left to babysit" and exits;
+#    a watch run has no opinion about being idle.
+reset_spawn_log
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && FAKE_GH_APPROVED="9 8" "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --watch=1 >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+waited=0
+while [[ "$waited" -lt 900 ]]; do
+  grep -q "next check in" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+still_running=no
+kill -0 "$bg" 2>/dev/null && still_running=yes
+pkill -P "$bg" >/dev/null 2>&1 || true
+kill "$bg" >/dev/null 2>&1 || true
+wait "$bg" 2>/dev/null || true
+
+out="$(cat "$SANDBOX/out/bg")"
+assert_equals "an all-approved watch run keeps running" "$still_running" "yes"
+assert_not_contains "...and never says it is finished" "$out" "nothing left to babysit"
+assert_contains "...it says what it is waiting for" "$out" "watching for new PRs"
+assert_contains "...at the watch interval, not the babysit one" "$out" "next check in 1m"
+
+# 2. An empty repo. The sweep has nothing at all, which normally exits 0 before
+#    the loop is even reached.
+echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
+reset_spawn_log
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --watch=1 >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+sleep 2
+empty_running=no
+kill -0 "$bg" 2>/dev/null && empty_running=yes
+pkill -P "$bg" >/dev/null 2>&1 || true
+kill "$bg" >/dev/null 2>&1 || true
+wait "$bg" 2>/dev/null || true
+assert_equals "a watch run on an empty repo waits rather than exiting" \
+  "$empty_running" "yes"
+
+# 3. A PR list that keeps failing. --babysit gives up after three; a watch run
+#    backs off and keeps trying, because the list will answer again.
+default_prs
+reset_spawn_log
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && FAKE_GH_APPROVED="9" FAKE_GH_GRAPHQL_FAIL_AFTER=1 "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --watch=1 >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+waited=0
+while [[ "$waited" -lt 1200 ]]; do
+  grep -q "looking again" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+failing_running=no
+kill -0 "$bg" 2>/dev/null && failing_running=yes
+pkill -P "$bg" >/dev/null 2>&1 || true
+kill "$bg" >/dev/null 2>&1 || true
+wait "$bg" 2>/dev/null || true
+
+out="$(cat "$SANDBOX/out/bg")"
+assert_equals "a watch run survives a failing PR list" "$failing_running" "yes"
+assert_contains "...saying the look failed" "$out" "could not refresh the PR list"
+assert_contains "...and that it will try again" "$out" "looking again in"
+assert_not_contains "...rather than giving up" "$out" "giving up"
+
+default_prs
+
+# --- --watch validates its own interval -----------------------------------
+out="$(run_autoreview --auto --watch=soon)"
+assert_equals "a bad watch interval exits nonzero" "$(last_status)" "1"
+assert_contains "...naming the flag that was typed" "$out" "invalid watch interval"
+
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
 out="$(run_autoreview --auto)"
