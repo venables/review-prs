@@ -289,6 +289,10 @@ fn require_value(flag: &str, value: Option<String>) -> Result<String, CliError> 
         // This matters beyond tidiness: "--focus --no-post" would otherwise
         // review with the focus "--no-post" and post to the PR, which is the
         // one thing the swallowed flag was there to prevent.
+        //
+        // panel's parser deliberately does not do this. Its dangerous flag is
+        // --base, which git would read as an option, and panel/target.rs
+        // already refuses that with a message that says so.
         Some(v) if v.starts_with("--") => {
             Err(err(format!("error: {flag} expects a value, but found the flag {v}")))
         }

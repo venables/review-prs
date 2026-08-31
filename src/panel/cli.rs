@@ -75,13 +75,6 @@ fn err(msg: String) -> CliError {
 
 fn require_value(flag: &str, value: Option<String>) -> Result<String, CliError> {
     match value {
-        // A value that is itself a flag is a forgotten argument, not a value.
-        // This matters beyond tidiness: "--focus --no-post" would otherwise
-        // review with the focus "--no-post" and post to the PR, which is the
-        // one thing the swallowed flag was there to prevent.
-        Some(v) if v.starts_with("--") => {
-            Err(err(format!("error: {flag} expects a value, but found the flag {v}")))
-        }
         Some(v) if !v.is_empty() => Ok(v),
         _ => Err(err(format!("error: {flag} expects a value"))),
     }
