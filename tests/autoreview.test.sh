@@ -695,6 +695,58 @@ assert_not_contains "...rather than reporting success" "$out" "watching anyway"
 out="$(run_autoreview --auto --watch=soon)"
 assert_equals "a bad watch interval exits nonzero" "$(last_status)" "1"
 assert_contains "...naming the flag that was typed" "$out" "invalid watch interval"
+# --- --focus reaches the reviewer -----------------------------------------
+default_prs
+out="$(run_autoreview --auto --focus "be strict about the migration")"
+call="$(claude_call_for "/auto-review 9")"
+assert_contains "the focus reaches the reviewer as an option" \
+  "$call" '/auto-review 9 --focus "be strict about the migration"'
+assert_contains "...for every PR in the sweep, not just the first" \
+  "$(claude_call_for "/auto-review 8")" '--focus "be strict about the migration"'
+
+# One line, because the reviewer call log is one line per call and the prompt
+# is one argv element.
+out="$(run_autoreview --auto --focus "be strict about
+the migration")"
+assert_contains "a pasted focus arrives on one line" \
+  "$(claude_call_for "/auto-review 9")" '--focus "be strict about the migration"'
+
+# A focused run still produces a readable review. The fake used to read the
+# PR number off the tail of the prompt, so --focus made it answer nonsense and
+# nothing noticed.
+out="$(FAKE_CLAUDE_TRAILER="9" run_autoreview --auto --no-post --focus "the ledger migration")"
+review="$(cat "$SANDBOX/out/logs"/run-*/pass-1/pr-9.review.md 2>/dev/null || true)"
+assert_equals "a focused run still writes its review" "$review" "reviewed 9"
+
+out="$(run_autoreview --auto --focus "   ")"
+assert_equals "a blank focus exits nonzero" "$(last_status)" "1"
+assert_contains "...and says what it wanted" "$out" "--focus expects"
+
+# --- --no-post reviews without touching the PR ----------------------------
+# Structural, not a promise: the reviewer is given the skill that has no
+# posting step, rather than the one that posts and an instruction not to.
+default_prs
+out="$(run_autoreview --auto --no-post)"
+assert_equals "a no-post sweep exits 0" "$(last_status)" "0"
+assert_contains "the reviewer is sent the skill that cannot post" \
+  "$(claude_call_for "panel-review 9")" "/panel-review 9"
+assert_not_contains "...and never the one that does" \
+  "$(claude_calls)" "/auto-review 9"
+assert_contains "the run says nothing was posted" "$out" "nothing was posted to any PR"
+
+# The review lands somewhere a person can read it, with the machine trailer
+# taken off: pr-N.json keeps the original, this is the readable copy.
+out="$(FAKE_CLAUDE_TRAILER="9" run_autoreview --auto --no-post)"
+review="$(cat "$SANDBOX/out/logs"/run-*/pass-1/pr-9.review.md 2>/dev/null || true)"
+assert_equals "the review is written as readable text" "$review" "reviewed 9"
+assert_not_contains "...without the machine trailer" "$review" "autoreview"
+
+# ...and on an ordinary run too, since it costs nothing and pr-N.json is not
+# something a person reads.
+out="$(run_autoreview --auto)"
+review="$(cat "$SANDBOX/out/logs"/run-*/pass-1/pr-9.review.md 2>/dev/null || true)"
+assert_equals "an ordinary run writes the review too" "$review" "reviewed 9"
+assert_not_contains "...and says nothing about withholding" "$out" "nothing was posted to any PR"
 
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"

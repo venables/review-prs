@@ -324,6 +324,12 @@ pub fn run_pass(
                     if !is_override {
                         job.trailer = report::read_trailer(&rundir.stdout_path(job.pr));
                     }
+                    // The review in a form a person can open. Best effort: a
+                    // review that ran is not spoiled by a file that could not
+                    // be written, and pr-N.json still holds the original.
+                    if let Some(review) = report::read_review(&rundir.stdout_path(job.pr)) {
+                        let _ = std::fs::write(rundir.review_path(job.pr), review);
+                    }
                     job.verdict = report::resolve_verdict(&gh, job.trailer.as_ref());
                     if let Some(claim) = report::vetoed_claim(&gh, job.trailer.as_ref()) {
                         ui.note(format!(
