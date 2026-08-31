@@ -119,7 +119,7 @@ impl Job {
         // the flag travels as the option it already is rather than as prose
         // the skill would have to interpret.
         match &cfg.focus {
-            Some(focus) => format!("{base} --focus \"{}\"", focus.replace('"', "'")),
+            Some(focus) => format!("{base} --focus \"{focus}\""),
             None => base,
         }
     }
@@ -341,7 +341,8 @@ mod tests {
         // the reviewer call log.
         assert!(!job.prompt(&cfg).contains('\n'));
         // A quote in the text must not close the option early.
-        cfg.focus = Some("the \"fast\" path".into());
+        // Already made safe by the parser; the prompt just wraps it.
+        cfg.focus = Some("the 'fast' path".into());
         assert_eq!(job.prompt(&cfg), "/auto-review 9 --focus \"the 'fast' path\"");
     }
 

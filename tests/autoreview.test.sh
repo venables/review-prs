@@ -748,6 +748,14 @@ review="$(cat "$SANDBOX/out/logs"/run-*/pass-1/pr-9.review.md 2>/dev/null || tru
 assert_equals "an ordinary run writes the review too" "$review" "reviewed 9"
 assert_not_contains "...and says nothing about withholding" "$out" "nothing was posted to any PR"
 
+# --no-post cannot reach an override, so the two are refused together rather
+# than the flag quietly doing nothing.
+out="$(AUTOREVIEW_AUTO_CMD='my-review' run_autoreview --auto --no-post)"
+assert_equals "--no-post with an override exits nonzero" "$(last_status)" "1"
+assert_contains "...and says which variable is in the way" \
+  "$out" "AUTOREVIEW_AUTO_CMD"
+assert_not_contains "...and runs nothing" "$(override_calls)" "my-review"
+
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
 out="$(run_autoreview --auto)"
