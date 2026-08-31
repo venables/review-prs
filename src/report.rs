@@ -80,9 +80,11 @@ pub fn read_review(stdout_path: &std::path::Path) -> Option<String> {
 
 /// The reply without the machine trailer on the end.
 ///
-/// Only a block that actually parses is removed, the same rule `parse_trailer`
-/// uses to find one. A review is free to discuss the fence tag in prose, and
-/// cutting at the first mention would throw away the review under it.
+/// Two conditions, and both matter. The block must parse, so a review may
+/// discuss the fence tag in prose without losing everything under it. And it
+/// must end the reply, which is where the reviewer is asked to put it -- a
+/// parseable block quoted mid-review is an example, and cutting there would
+/// throw away the conclusion after it.
 fn strip_trailer(answer: &str) -> &str {
     let mut search_end = answer.len();
     while let Some(start) = answer[..search_end].rfind("```autoreview") {
@@ -90,7 +92,8 @@ fn strip_trailer(answer: &str) -> &str {
         if let Some(end) = body.find("```")
             && serde_json::from_str::<Trailer>(body[..end].trim()).is_ok()
         {
-            return &answer[..start];
+            let after = &body[end + "```".len()..];
+            return if after.trim().is_empty() { &answer[..start] } else { answer };
         }
         search_end = start;
     }
@@ -343,6 +346,12 @@ mod tests {
         let chatty = "The reviewer emits a ```autoreview block.\n\nReal finding here.";
         std::fs::write(&path, serde_json::json!({ "answer": chatty }).to_string()).unwrap();
         assert_eq!(read_review(&path).unwrap(), chatty);
+
+        // A parseable block quoted mid-review is an example, not the
+        // trailer: the conclusion after it must survive.
+        let quoting = "I would emit:\n\n```autoreview\n{\"decision\":\"none\"}\n```\n\nBut the real finding is here.";
+        std::fs::write(&path, serde_json::json!({ "answer": quoting }).to_string()).unwrap();
+        assert_eq!(read_review(&path).unwrap(), quoting);
 
         // Nothing to write rather than an empty file.
         std::fs::write(&path, serde_json::json!({ "answer": "```autoreview\n{}\n```" }).to_string())

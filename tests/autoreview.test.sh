@@ -754,7 +754,10 @@ out="$(AUTOREVIEW_AUTO_CMD='my-review' run_autoreview --auto --no-post)"
 assert_equals "--no-post with an override exits nonzero" "$(last_status)" "1"
 assert_contains "...and says which variable is in the way" \
   "$out" "AUTOREVIEW_AUTO_CMD"
-assert_not_contains "...and runs nothing" "$(override_calls)" "my-review"
+# The override log records "args=... session=... resume=..." and never the
+# command name, so grepping it for "my-review" passed whether or not the
+# override ran. Emptiness is the thing being claimed.
+assert_equals "...and runs nothing" "$(override_calls)" ""
 
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
