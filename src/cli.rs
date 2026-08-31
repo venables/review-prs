@@ -45,7 +45,9 @@ PRs (nothing has changed since you last engaged) are left alone.
                       approval. The reviewer runs the skill that has no
                       posting step, so nothing is trusted to hold back. Each
                       review is written to <log-dir>/pr-N.review.md, which is
-                      also written on an ordinary run.
+                      also written on an ordinary run. Refused alongside a
+                      command override, which decides for itself what it
+                      posts.
   --continue, -C      Resume this machine's earlier review session for a PR
                       (a second look at the findings) instead of reviewing it
                       from scratch. Marked RESUMABLE in the picker.
@@ -160,10 +162,19 @@ pub const FOCUS_MAX_CHARS: usize = 2000;
 /// and cut a value that would crowd out the rest of the prompt.
 fn clean_focus(raw: &str) -> Option<String> {
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
+    // The prompt wraps this in double quotes. A quote would close the option
+    // early and a trailing backslash would escape the closing one, so neither
+    // survives -- an apostrophe reads the same in guidance, and a backslash
+    // means nothing in it.
+    let safe: String = collapsed
+        .chars()
+        .filter(|c| *c != '\\')
+        .map(|c| if c == '"' { '\'' } else { c })
+        .collect();
+    if safe.trim().is_empty() {
         return None;
     }
-    Some(collapsed.chars().take(FOCUS_MAX_CHARS).collect())
+    Some(safe.chars().take(FOCUS_MAX_CHARS).collect())
 }
 
 pub enum Parsed {
@@ -413,6 +424,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         cmd
     };
 
+    // --no-post works by choosing the reviewer, and an override is not ours
+    // to choose. Every other flag that cannot reach an override settles for a
+    // note; this one refuses, because a safety flag that silently does not
+    // apply is worse than no flag. The way out is to make the override not
+    // post, and then not pass --no-post.
+    if no_post && review_cmd.is_some() {
+        let which = if unattended { "AUTOREVIEW_AUTO_CMD" } else { "AUTOREVIEW_CMD" };
+        return Err(err(format!(
+            "error: --no-post cannot be honoured while ${which} is set; that command decides what it posts"
+        )));
+    }
+
     Ok(Parsed::Run(Box::new(Config {
         pick,
         babysit: babysit_interval,
@@ -565,6 +588,37 @@ mod tests {
         // given nothing: the run costs the same either way.
         assert!(msg(&["--focus", "   "]).contains("--focus expects"));
         assert!(msg(&["--focus="]).contains("--focus expects"));
+    }
+
+    #[test]
+    fn a_focus_cannot_break_out_of_the_option_it_travels_in() {
+        // The prompt wraps focus in double quotes. A quote would close it
+        // early; a trailing backslash would escape the closing one.
+        assert_eq!(cfg(&["--focus", r#"the "fast" path"#]).focus.as_deref(), Some("the 'fast' path"));
+        assert_eq!(cfg(&["--focus", r"strict about C:\paths"]).focus.as_deref(), Some("strict about C:paths"));
+        assert!(msg(&["--focus", r"\"]).contains("--focus expects"));
+    }
+
+    #[test]
+    fn no_post_refuses_an_override_it_cannot_reach() {
+        // The override decides what it posts, so autoreview cannot promise
+        // anything about it. Saying so beats a flag that quietly does nothing.
+        let e = match run_env(&["--no-post"], &[("AUTOREVIEW_AUTO_CMD", "my-review")]) {
+            Err(e) => e.msg,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(e.contains("--no-post cannot be honoured"), "got {e}");
+        assert!(e.contains("AUTOREVIEW_AUTO_CMD"), "names the one that is set: {e}");
+
+        // The picker path names its own variable.
+        let e = match run_env(&["--pick", "--no-post"], &[("AUTOREVIEW_CMD", "my-review")]) {
+            Err(e) => e.msg,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(e.contains("AUTOREVIEW_CMD"), "got {e}");
+
+        // An unattended run ignores AUTOREVIEW_CMD anyway, so it is no bar.
+        assert!(run_env(&["--no-post"], &[("AUTOREVIEW_CMD", "my-review")]).is_ok());
     }
 
     #[test]

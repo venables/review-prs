@@ -74,11 +74,27 @@ pub fn read_review(stdout_path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(stdout_path).ok()?;
     let envelope: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let answer = envelope.get("answer")?.as_str()?;
-    let body = match answer.rfind("```autoreview") {
-        Some(at) => answer[..at].trim_end(),
-        None => answer.trim_end(),
-    };
+    let body = strip_trailer(answer).trim_end();
     (!body.is_empty()).then(|| body.to_string())
+}
+
+/// The reply without the machine trailer on the end.
+///
+/// Only a block that actually parses is removed, the same rule `parse_trailer`
+/// uses to find one. A review is free to discuss the fence tag in prose, and
+/// cutting at the first mention would throw away the review under it.
+fn strip_trailer(answer: &str) -> &str {
+    let mut search_end = answer.len();
+    while let Some(start) = answer[..search_end].rfind("```autoreview") {
+        let body = &answer[start + "```autoreview".len()..];
+        if let Some(end) = body.find("```")
+            && serde_json::from_str::<Trailer>(body[..end].trim()).is_ok()
+        {
+            return &answer[..start];
+        }
+        search_end = start;
+    }
+    answer
 }
 
 pub fn parse_trailer(answer: &str) -> Option<Trailer> {
@@ -321,6 +337,12 @@ mod tests {
         // No trailer is ordinary: an overridden reviewer promises nothing.
         std::fs::write(&path, serde_json::json!({ "answer": "just prose" }).to_string()).unwrap();
         assert_eq!(read_review(&path).unwrap(), "just prose");
+
+        // Prose that merely mentions the fence keeps the review under it:
+        // only a block that parses is a trailer.
+        let chatty = "The reviewer emits a ```autoreview block.\n\nReal finding here.";
+        std::fs::write(&path, serde_json::json!({ "answer": chatty }).to_string()).unwrap();
+        assert_eq!(read_review(&path).unwrap(), chatty);
 
         // Nothing to write rather than an empty file.
         std::fs::write(&path, serde_json::json!({ "answer": "```autoreview\n{}\n```" }).to_string())
