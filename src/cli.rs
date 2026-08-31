@@ -163,18 +163,33 @@ pub const FOCUS_MAX_CHARS: usize = 2000;
 fn clean_focus(raw: &str) -> Option<String> {
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     // The prompt wraps this in double quotes. A quote would close the option
-    // early and a trailing backslash would escape the closing one, so neither
-    // survives -- an apostrophe reads the same in guidance, and a backslash
-    // means nothing in it.
-    let safe: String = collapsed
-        .chars()
-        .filter(|c| *c != '\\')
-        .map(|c| if c == '"' { '\'' } else { c })
-        .collect();
+    // early, so it becomes an apostrophe, which reads the same in guidance.
+    //
+    // Only a *trailing* backslash is dropped, because only that one can
+    // escape the closing quote. Deleting every backslash would quietly
+    // rewrite the guidance: "check the \\d{4} regex" would arrive as
+    // "d{4}", which asks for something else.
+    let safe = collapsed.replace('"', "'").trim_end_matches('\\').to_string();
     if safe.trim().is_empty() {
         return None;
     }
-    Some(safe.chars().take(FOCUS_MAX_CHARS).collect())
+    Some(safe)
+}
+
+/// `clean_focus`, with both ways it can refuse spelled out. Over-length is
+/// refused rather than cut: a run costs the same whether or not the guidance
+/// survived, and losing its tail in silence is the failure a blank value is
+/// already refused to avoid.
+fn checked_focus(raw: &str) -> Result<String, CliError> {
+    let focus = clean_focus(raw)
+        .ok_or_else(|| err("error: --focus expects text, not blank space".to_string()))?;
+    if focus.chars().count() > FOCUS_MAX_CHARS {
+        return Err(err(format!(
+            "error: --focus is {} characters; the most a prompt will carry is {FOCUS_MAX_CHARS}",
+            focus.chars().count()
+        )));
+    }
+    Ok(focus)
 }
 
 pub enum Parsed {
@@ -318,9 +333,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--version" | "-V" => return Ok(Parsed::Version),
             "--focus" => {
                 let raw = require_value("--focus", it.next())?;
-                focus = Some(clean_focus(&raw).ok_or_else(|| {
-                    err("error: --focus expects text, not blank space".to_string())
-                })?);
+                focus = Some(checked_focus(&raw)?);
             }
             "--jobs" | "-j" => jobs_raw = require_value("--jobs", it.next())?,
             "--max-passes" => max_passes_raw = require_value("--max-passes", it.next())?,
@@ -333,9 +346,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
                     watch = true;
                     watch_interval_raw = v.to_string();
                 } else if let Some(v) = other.strip_prefix("--focus=") {
-                    focus = Some(clean_focus(v).ok_or_else(|| {
-                        err("error: --focus expects text, not blank space".to_string())
-                    })?);
+                    focus = Some(checked_focus(v)?);
                 } else if let Some(v) = other.strip_prefix("--babysit=") {
                     babysit = true;
                     babysit_interval_raw = v.to_string();
@@ -595,7 +606,12 @@ mod tests {
         // The prompt wraps focus in double quotes. A quote would close it
         // early; a trailing backslash would escape the closing one.
         assert_eq!(cfg(&["--focus", r#"the "fast" path"#]).focus.as_deref(), Some("the 'fast' path"));
-        assert_eq!(cfg(&["--focus", r"strict about C:\paths"]).focus.as_deref(), Some("strict about C:paths"));
+        // An interior backslash is the operator's own text and stays: a focus
+        // of "the \d{4} regex" must not reach the panel as "d{4}", which asks
+        // for something else.
+        assert_eq!(cfg(&["--focus", r"the \d{4} regex"]).focus.as_deref(), Some(r"the \d{4} regex"));
+        // Only a trailing one goes, because only that can escape the quote.
+        assert_eq!(cfg(&["--focus", r"strict about paths\"]).focus.as_deref(), Some("strict about paths"));
         assert!(msg(&["--focus", r"\"]).contains("--focus expects"));
     }
 
@@ -622,10 +638,14 @@ mod tests {
     }
 
     #[test]
-    fn a_focus_that_would_flood_the_prompt_is_cut() {
+    fn a_focus_that_would_flood_the_prompt_is_refused_not_cut() {
         let long = "x".repeat(4000);
-        let c = cfg(&["--focus", &long]);
-        assert_eq!(c.focus.as_deref().unwrap().chars().count(), FOCUS_MAX_CHARS);
+        let m = msg(&["--focus", &long]);
+        assert!(m.contains("4000 characters"), "says how long it was: {m}");
+        assert!(m.contains(&FOCUS_MAX_CHARS.to_string()), "and the limit: {m}");
+        // The limit itself is fine.
+        let ok = "x".repeat(FOCUS_MAX_CHARS);
+        assert_eq!(cfg(&["--focus", &ok]).focus.as_deref().unwrap().chars().count(), FOCUS_MAX_CHARS);
     }
 
     #[test]
