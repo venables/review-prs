@@ -102,12 +102,25 @@ impl Job {
     /// would throw away. Slash names, not prose: an unattended one-shot has
     /// no human to correct a prompt that failed to trigger the skill.
     pub fn prompt(&self, cfg: &Config) -> String {
-        if self.resume {
+        let base = if cfg.no_post {
+            // Structural, not a request. /panel-review reviews and reports;
+            // it has no posting step to skip. Telling /auto-review not to
+            // post would leave a model holding gh write access and an
+            // instruction, which is not the same thing as being unable to.
+            format!("/panel-review {}", self.pr)
+        } else if self.resume {
             format!("/recheck-pr {}", self.pr)
         } else if cfg.unattended() {
             format!("/auto-review {}", self.pr)
         } else {
             format!("/panel-review {}", self.pr)
+        };
+        // The skills below all take --focus and pass it down to the panel, so
+        // the flag travels as the option it already is rather than as prose
+        // the skill would have to interpret.
+        match &cfg.focus {
+            Some(focus) => format!("{base} --focus \"{}\"", focus.replace('"', "'")),
+            None => base,
         }
     }
 
@@ -271,6 +284,8 @@ mod tests {
             pick,
             babysit: None,
             watch: None,
+            focus: None,
+            no_post: false,
             continue_sessions: false,
             jobs: 2,
             max_passes: 3,
@@ -300,6 +315,34 @@ mod tests {
         assert_eq!(job.prompt(&cfg_with(0, None, false)), "/auto-review 9");
         job.resume = true;
         assert_eq!(job.prompt(&cfg_with(0, None, false)), "/recheck-pr 9");
+    }
+
+    #[test]
+    fn no_post_reviews_without_a_posting_step() {
+        // Every path that would post goes to the skill that cannot.
+        let mut cfg = cfg_with(0, None, false);
+        cfg.no_post = true;
+        assert_eq!(Job::new(9).prompt(&cfg), "/panel-review 9");
+        let mut resumed = Job::new(9);
+        resumed.resume = true;
+        assert_eq!(resumed.prompt(&cfg), "/panel-review 9", "a recheck posts too");
+    }
+
+    #[test]
+    fn a_focus_rides_along_as_an_option_the_skills_understand() {
+        let job = Job::new(9);
+        let mut cfg = cfg_with(0, None, false);
+        cfg.focus = Some("be strict about the migration".into());
+        assert_eq!(
+            job.prompt(&cfg),
+            "/auto-review 9 --focus \"be strict about the migration\""
+        );
+        // One line, always: the prompt is one argv element and one line in
+        // the reviewer call log.
+        assert!(!job.prompt(&cfg).contains('\n'));
+        // A quote in the text must not close the option early.
+        cfg.focus = Some("the \"fast\" path".into());
+        assert_eq!(job.prompt(&cfg), "/auto-review 9 --focus \"the 'fast' path\"");
     }
 
     #[test]

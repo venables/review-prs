@@ -9,8 +9,9 @@ use std::path::PathBuf;
 pub const HELP: &str = r#"autoreview: review open PRs headlessly, with progress and a real exit status.
 
 Usage: autoreview [--pick] [--watch[=MINUTES]] [--babysit[=MINUTES]]
-                  [--continue] [--jobs N] [--timeout SECONDS] [--budget USD]
-                  [--log-dir DIR] [--all] [--dependabot] [--help]
+                  [--focus TEXT] [--no-post] [--continue] [--jobs N]
+                  [--timeout SECONDS] [--budget USD] [--log-dir DIR]
+                  [--all] [--dependabot] [--help]
 
 Every NEW or UPDATED PR is reviewed by default -- the actionable ones. SEEN
 PRs (nothing has changed since you last engaged) are left alone.
@@ -34,6 +35,17 @@ PRs (nothing has changed since you last engaged) are left alone.
                       minutes; 30m/1h/2d also work. Under --watch this is
                       not a sleep but a per-PR cooldown: how long a PR rests
                       after a review before it may be reviewed again.
+  --focus TEXT        What the reviewers should pay attention to this run,
+                      e.g. --focus "be strict about the migration". Passed to
+                      the review skill, which hands it to every panelist.
+                      Per-run and ad hoc: anything this repo always cares
+                      about belongs in its CLAUDE.md, which panelists read
+                      anyway.
+  --no-post, -n       Review, but leave the PR alone: no comments, no
+                      approval. The reviewer runs the skill that has no
+                      posting step, so nothing is trusted to hold back. Each
+                      review is written to <log-dir>/pr-N.review.md, which is
+                      also written on an ordinary run.
   --continue, -C      Resume this machine's earlier review session for a PR
                       (a second look at the findings) instead of reviewing it
                       from scratch. Marked RESUMABLE in the picker.
@@ -103,6 +115,13 @@ pub struct Config {
     /// Always on: poll this often for new PRs and never stop. Only a signal
     /// ends a watch run, so none of the bounds --babysit respects apply.
     pub watch: Option<Interval>,
+    /// What the reviewers should pay attention to this run, handed to the
+    /// review skill as --focus. Per-run and ad hoc: anything a repo always
+    /// cares about belongs in its CLAUDE.md, which the panelists already read.
+    pub focus: Option<String>,
+    /// Review, but leave the PR alone. The reviewer runs the skill that has
+    /// no posting step, so nothing is asked not to post.
+    pub no_post: bool,
     pub continue_sessions: bool,
     pub jobs: u32,
     /// How often --babysit may review one PR before leaving it alone.
@@ -129,6 +148,22 @@ impl Config {
     pub fn unattended(&self) -> bool {
         !self.pick || self.babysit.is_some() || self.watch.is_some()
     }
+}
+
+/// How much focus text a prompt will carry. It is one argv element travelling
+/// to dash-p and one line in the reviewer call log, and a pasted essay would
+/// crowd out the review instructions it is meant to qualify.
+pub const FOCUS_MAX_CHARS: usize = 2000;
+
+/// Focus is typed by the operator, so this is tidying rather than defence:
+/// collapse the whitespace that a paste brings so the prompt stays one line,
+/// and cut a value that would crowd out the rest of the prompt.
+fn clean_focus(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(FOCUS_MAX_CHARS).collect())
 }
 
 pub enum Parsed {
@@ -233,6 +268,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     let mut pick = false;
     let mut babysit = false;
     let mut watch = false;
+    let mut focus: Option<String> = None;
+    let mut no_post = false;
     let mut continue_sessions = false;
     let mut include_approved = false;
     let mut include_dependabot = false;
@@ -263,10 +300,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--babysit" | "-b" => babysit = true,
             "--watch" | "-w" => watch = true,
             "--continue" | "-C" => continue_sessions = true,
+            "--no-post" | "-n" => no_post = true,
             "--all" | "-a" => include_approved = true,
             "--dependabot" | "-d" => include_dependabot = true,
             "--help" | "-h" => return Ok(Parsed::Help),
             "--version" | "-V" => return Ok(Parsed::Version),
+            "--focus" => {
+                let raw = require_value("--focus", it.next())?;
+                focus = Some(clean_focus(&raw).ok_or_else(|| {
+                    err("error: --focus expects text, not blank space".to_string())
+                })?);
+            }
             "--jobs" | "-j" => jobs_raw = require_value("--jobs", it.next())?,
             "--max-passes" => max_passes_raw = require_value("--max-passes", it.next())?,
             "--max-idle" => max_idle_raw = require_value("--max-idle", it.next())?,
@@ -277,6 +321,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
                 if let Some(v) = other.strip_prefix("--watch=") {
                     watch = true;
                     watch_interval_raw = v.to_string();
+                } else if let Some(v) = other.strip_prefix("--focus=") {
+                    focus = Some(clean_focus(v).ok_or_else(|| {
+                        err("error: --focus expects text, not blank space".to_string())
+                    })?);
                 } else if let Some(v) = other.strip_prefix("--babysit=") {
                     babysit = true;
                     babysit_interval_raw = v.to_string();
@@ -369,6 +417,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         pick,
         babysit: babysit_interval,
         watch: watch_interval,
+        focus,
+        no_post,
         continue_sessions,
         jobs,
         max_passes,
@@ -484,6 +534,44 @@ mod tests {
         // unattended prompt and override like --babysit does.
         assert!(cfg(&["--watch"]).unattended());
         assert!(cfg(&["--pick", "--watch"]).unattended());
+    }
+
+    #[test]
+    fn focus_is_absent_unless_asked_for() {
+        assert!(cfg(&[]).focus.is_none());
+    }
+
+    #[test]
+    fn focus_takes_text() {
+        assert_eq!(cfg(&["--focus", "the auth path"]).focus.as_deref(), Some("the auth path"));
+        assert_eq!(cfg(&["--focus=the auth path"]).focus.as_deref(), Some("the auth path"));
+    }
+
+    #[test]
+    fn focus_arrives_on_one_line() {
+        // The prompt travels to dash-p as a single argv element and the test
+        // suite logs each reviewer call on one line. A pasted paragraph must
+        // not break either, so the whitespace is collapsed rather than
+        // refused -- pasting several lines is the ordinary way to use this.
+        let c = cfg(&["--focus", "be strict about
+
+  the migration	today  "]);
+        assert_eq!(c.focus.as_deref(), Some("be strict about the migration today"));
+    }
+
+    #[test]
+    fn an_empty_focus_is_rejected() {
+        // Silently reviewing with no focus is worse than saying the flag was
+        // given nothing: the run costs the same either way.
+        assert!(msg(&["--focus", "   "]).contains("--focus expects"));
+        assert!(msg(&["--focus="]).contains("--focus expects"));
+    }
+
+    #[test]
+    fn a_focus_that_would_flood_the_prompt_is_cut() {
+        let long = "x".repeat(4000);
+        let c = cfg(&["--focus", &long]);
+        assert_eq!(c.focus.as_deref().unwrap().chars().count(), FOCUS_MAX_CHARS);
     }
 
     #[test]
