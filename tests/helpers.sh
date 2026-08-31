@@ -361,9 +361,18 @@ log_line() {
 # scenario onto the dash-p contract.
 set -uo pipefail
 
-# The prompt is the last argument, and ends with the PR number.
+# The prompt is the last argument. The PR number is the first bare integer in
+# it, not the last word: a prompt carrying --focus ends with the focus text,
+# and reading the tail made this fake answer "reviewed migration" and emit
+# malformed JSON, which no assertion looked at.
 prompt="${!#}"
-n="${prompt##* }"
+n=""
+for word in $prompt; do
+  case "$word" in
+    ''|*[!0-9]*) ;;
+    *) n="$word"; break ;;
+  esac
+done
 
 log_line "$CLAUDE_LOG" "$*"
 log_line "$CLAUDE_LOG.events" "start $n"
