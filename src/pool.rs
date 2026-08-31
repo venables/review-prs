@@ -330,7 +330,14 @@ pub fn run_pass(
                     if let Some(review) = report::read_review(&rundir.stdout_path(job.pr)) {
                         let _ = std::fs::write(rundir.review_path(job.pr), review);
                     }
-                    job.verdict = report::resolve_verdict(&gh, job.trailer.as_ref());
+                    // A --no-post reviewer ran the skill with no posting
+                    // step, so its own claim about what landed cannot be
+                    // true. GitHub alone decides, which is also what makes
+                    // the "nothing was posted" line under the summary safe
+                    // to print. The rest of the trailer -- risk, findings,
+                    // the panel -- is still worth reading.
+                    let claimed = (!cfg.no_post).then_some(job.trailer.as_ref()).flatten();
+                    job.verdict = report::resolve_verdict(&gh, claimed);
                     if let Some(claim) = report::vetoed_claim(&gh, job.trailer.as_ref()) {
                         ui.note(format!(
                             "note: PR #{}'s reviewer reported \"{claim}\" but GitHub shows no such review landed",

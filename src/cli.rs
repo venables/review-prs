@@ -285,6 +285,13 @@ pub fn require_int(flag: &str, value: &str, min: u64, max: u64) -> Result<u64, C
 /// must not pass silently for an empty cap while "--budget ''" is refused.
 fn require_value(flag: &str, value: Option<String>) -> Result<String, CliError> {
     match value {
+        // A value that is itself a flag is a forgotten argument, not a value.
+        // This matters beyond tidiness: "--focus --no-post" would otherwise
+        // review with the focus "--no-post" and post to the PR, which is the
+        // one thing the swallowed flag was there to prevent.
+        Some(v) if v.starts_with("--") => {
+            Err(err(format!("error: {flag} expects a value, but found the flag {v}")))
+        }
         Some(v) if !v.is_empty() => Ok(v),
         _ => Err(err(format!("error: {flag} expects a value"))),
     }
@@ -613,6 +620,21 @@ mod tests {
         // Only a trailing one goes, because only that can escape the quote.
         assert_eq!(cfg(&["--focus", r"strict about paths\"]).focus.as_deref(), Some("strict about paths"));
         assert!(msg(&["--focus", r"\"]).contains("--focus expects"));
+    }
+
+    #[test]
+    fn a_forgotten_value_does_not_swallow_the_next_flag() {
+        // The one that matters: --focus swallowing --no-post would review
+        // with the focus "--no-post" and post to the PR, which is precisely
+        // what the swallowed flag was there to stop.
+        let m = msg(&["--focus", "--no-post"]);
+        assert!(m.contains("--focus expects a value"), "got {m}");
+        assert!(m.contains("found the flag --no-post"), "names what it found: {m}");
+        // The same guard covers every flag that takes a value.
+        assert!(msg(&["--jobs", "--no-post"]).contains("found the flag"));
+        assert!(msg(&["--log-dir", "--all"]).contains("found the flag"));
+        // A value that merely starts with a dash is still a value.
+        assert_eq!(cfg(&["--focus", "-heavy on tests"]).focus.as_deref(), Some("-heavy on tests"));
     }
 
     #[test]
