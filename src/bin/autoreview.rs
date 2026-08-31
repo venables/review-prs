@@ -224,6 +224,15 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             let jobs =
                 pool::run_pass(&queue, &info, &cfg, &ctx, &rundir, &dashp, &rx, &tx, &mut ui);
             ui.print_summary(&jobs, &rundir.pass_dir);
+            if cfg.no_post {
+                // Every VERDICT in that table reads "nothing posted", which
+                // is the alarming state on an ordinary run and the whole
+                // point of this one. Say which it was.
+                println!(
+                    "nothing was posted to any PR; the reviews are in {}",
+                    rundir.pass_dir.display()
+                );
+            }
             tracker.record_pass(&queue, now_secs());
             pass += 1;
             jobs

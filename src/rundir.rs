@@ -89,6 +89,12 @@ impl RunDir {
     pub fn meta_path(&self, pr: u64) -> PathBuf {
         self.pass_dir.join(format!("pr-{pr}.meta.json"))
     }
+    /// The review itself, as text. `pr-N.json` already holds it, wrapped in
+    /// dash-p's envelope and JSON-escaped -- readable by a program and not by
+    /// a person. This is the same review with the wrapper taken off.
+    pub fn review_path(&self, pr: u64) -> PathBuf {
+        self.pass_dir.join(format!("pr-{pr}.review.md"))
+    }
     fn session_file(&self, pr: u64) -> PathBuf {
         self.root.join(format!("session-{pr}.id"))
     }

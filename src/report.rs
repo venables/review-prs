@@ -67,6 +67,20 @@ pub fn read_trailer(stdout_path: &std::path::Path) -> Option<Trailer> {
     parse_trailer(envelope.get("answer")?.as_str()?)
 }
 
+/// The reviewer's reply, out of dash-p's envelope, with the machine-readable
+/// trailer taken off the end. What a person wants to read when the review did
+/// not land on the PR -- or when they want to see what did.
+pub fn read_review(stdout_path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(stdout_path).ok()?;
+    let envelope: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let answer = envelope.get("answer")?.as_str()?;
+    let body = match answer.rfind("```autoreview") {
+        Some(at) => answer[..at].trim_end(),
+        None => answer.trim_end(),
+    };
+    (!body.is_empty()).then(|| body.to_string())
+}
+
 pub fn parse_trailer(answer: &str) -> Option<Trailer> {
     // The last complete, parseable block wins -- scanned backwards so prose
     // that merely quotes the fence tag after the real block cannot hide it.
@@ -294,6 +308,31 @@ pub fn vetoed_claim<'a>(gh: &Readback, trailer: Option<&'a Trailer>) -> Option<&
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_review_comes_out_of_the_envelope_without_its_trailer() {
+        let dir = std::env::temp_dir().join(format!("ar-review-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pr-9.json");
+
+        let answer = "## Overview\n\nLooks fine.\n\n```autoreview\n{\"decision\":\"none\"}\n```";
+        std::fs::write(&path, serde_json::json!({ "answer": answer }).to_string()).unwrap();
+        assert_eq!(read_review(&path).unwrap(), "## Overview\n\nLooks fine.");
+
+        // No trailer is ordinary: an overridden reviewer promises nothing.
+        std::fs::write(&path, serde_json::json!({ "answer": "just prose" }).to_string()).unwrap();
+        assert_eq!(read_review(&path).unwrap(), "just prose");
+
+        // Nothing to write rather than an empty file.
+        std::fs::write(&path, serde_json::json!({ "answer": "```autoreview\n{}\n```" }).to_string())
+            .unwrap();
+        assert_eq!(read_review(&path), None);
+
+        // A stdout that is not the envelope at all must not panic.
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(read_review(&path), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     #[test]
