@@ -748,6 +748,19 @@ review="$(cat "$SANDBOX/out/logs"/run-*/pass-1/pr-9.review.md 2>/dev/null || tru
 assert_equals "an ordinary run writes the review too" "$review" "reviewed 9"
 assert_not_contains "...and says nothing about withholding" "$out" "nothing was posted to any PR"
 
+# A reviewer's own claim about what it posted cannot be true under --no-post,
+# because the skill it ran has no posting step. GitHub decides the verdict; the
+# rest of the trailer is still worth reading.
+out="$(FAKE_CLAUDE_TRAILER="9" run_autoreview --auto --no-post)"
+assert_contains "a claimed verdict does not survive --no-post" "$out" "nothing posted"
+assert_not_contains "...so the summary cannot contradict the notice under it" \
+  "$out" "commented"
+assert_contains "...while the risk it reported still shows" "$out" "LOW"
+
+# ...and the same trailer is believed on an ordinary run.
+out="$(FAKE_CLAUDE_TRAILER="9" FAKE_GH_MY_REVIEW="9:COMMENTED" run_autoreview --auto)"
+assert_contains "an ordinary run still reports what landed" "$out" "commented"
+
 # --no-post cannot reach an override, so the two are refused together rather
 # than the flag quietly doing nothing.
 out="$(AUTOREVIEW_AUTO_CMD='my-review' run_autoreview --auto --no-post)"
