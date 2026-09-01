@@ -115,9 +115,15 @@ impl Job {
         } else {
             format!("/panel-review {}", self.pr)
         };
-        // The skills below all take --focus and pass it down to the panel, so
-        // the flag travels as the option it already is rather than as prose
-        // the skill would have to interpret.
+        // /panel-review and /auto-review both define --focus and pass it down
+        // to the panel, so it travels as the option it already is rather than
+        // as prose a skill would have to interpret.
+        //
+        // /recheck-pr does not define it. The option still reaches a model
+        // reading its own instructions, so it reads as guidance rather than
+        // failing, but nothing carries it to the panelists. A --continue run
+        // is a second look at findings that already exist, which is the case
+        // that needs steering least.
         match &cfg.focus {
             Some(focus) => format!("{base} --focus \"{focus}\""),
             None => base,
