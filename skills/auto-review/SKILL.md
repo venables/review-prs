@@ -50,8 +50,9 @@ finding-based blocker (see step 2):
   metaphors, and figures of speech.
 - Do not make a noun out of a verb.
 
-The two canonical approval bodies under "Approval body" are fixed
-strings. Use them exactly as written; do not restyle them.
+The two canonical approval bodies under "Approval body" and the
+`DECISION:` line that ends the report are fixed strings. Use them exactly
+as written; do not restyle them.
 
 ## Prerequisite
 
@@ -195,6 +196,25 @@ auto-post did (posted / `+1`'d / filed to Linear / dropped / needs
 attention), and the **approval decision** — approved (with the body used
 and the PR URL) or not approved (with the specific gate condition that
 failed).
+
+Then end with one line, on its own, and nothing after it except a machine
+trailer the caller's system prompt asks for:
+
+```
+DECISION: Approve
+```
+
+The verdict is what actually happened on the PR, one of four fixed strings:
+- `DECISION: Approve` — an approving review was submitted.
+- `DECISION: Comment` — findings were posted and no approval was submitted.
+- `DECISION: Request changes` — a blocking review was submitted (only when
+  the user asked for one; see Gotchas).
+- `DECISION: No action` — nothing landed on the PR: the coverage gate
+  failed before posting, the head moved, or this was a dry run.
+
+Put no reason on the line; the report above is the reason. A reader who
+scrolls to the end gets the answer, and a caller that only reads the last
+line gets the same one. The line is fixed text, like the approval bodies.
 
 ## The approval gate
 

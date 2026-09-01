@@ -355,13 +355,29 @@ New (n):
 
 Panel re-review: skipped (<why>) | ran (<risk>, <bucket counts>)
 Threads: <n> resolved, <n> replied, <n> left open, <n> skipped (already resolved)
-Decision: approved <url> with "<body>" | not approved — <the gate condition that failed>
+Approval: approved <url> with "<body>" | not approved — <the gate condition that failed>
+
+DECISION: <verdict>
 ```
 
 Keep **Explained** honest — record what you _checked_, not just what the
 author _said_. That line is how the user audits whether your second look
 was real. Same for **Outstanding**: name the specific gap, because the
 author is going to read it and needs to act on it.
+
+The `DECISION:` line is the last line of the reply, on its own, with
+nothing after it except a machine trailer the caller's system prompt asks
+for. The verdict is what actually happened on the PR, one of three fixed
+strings:
+- `DECISION: Approve` — an approving review was submitted.
+- `DECISION: Comment` — replies or new inline comments were posted and no
+  approval was submitted.
+- `DECISION: No action` — nothing landed on the PR: the fast path found
+  nothing changed, or the head moved during the pass.
+
+Put no reason on the line; the **Approval** line and the ledger above are
+the reason. A reader who scrolls to the end gets the answer, and a caller
+that only reads the last line gets the same one.
 
 ## The approval gate
 

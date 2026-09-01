@@ -45,8 +45,8 @@ and stay readable when a downstream skill posts them to a PR verbatim.
 
 Two exceptions. Quoted panelist text stays verbatim, and the fixed labels this
 skill defines (`Goal (clear):`, `Approach (questionable):`,
-`Purpose (unknown):`, `Proof (missing):`, `[HIGH]`, the section headings) stay
-exactly as written — the downstream skills match on them.
+`Purpose (unknown):`, `Proof (missing):`, `[HIGH]`, `DECISION:`, the section
+headings) stay exactly as written — the downstream skills match on them.
 
 ## What a review judges
 
@@ -320,6 +320,30 @@ When _not_ to use:
      a finding (one flags it, another examined the same code and said it's fine;
      or verification falsified a raised finding). Omit when there's nothing to
      surface — do NOT emit a "Disagreements: none." line.
+   - `DECISION: <verdict>` — always, and always the last line. See
+     **The decision line** below.
+
+   ### The decision line
+
+   The synthesis ends with one line, on its own, and nothing after it except a
+   machine trailer the caller's system prompt asks for:
+
+   ```
+   DECISION: Approve
+   ```
+
+   The verdict is one of three fixed strings, and it follows from the buckets
+   above, not from a fresh judgment:
+   - `DECISION: Request changes` — `### must-fix` has an entry.
+   - `DECISION: Comment` — `### must-fix` is empty and `### should-fix` has an
+     entry, or a `Purpose` or `Proof` flag was promoted.
+   - `DECISION: Approve` — no finding above `### polish`, and Risk is LOW or
+     MEDIUM.
+
+   This skill posts nothing, so the line says what the review recommends, not
+   what happened on the PR. Put no reason on the line; the sections above are
+   the reason. A reader who scrolls to the end gets the answer, and a caller
+   that only reads the last line gets the same one.
 
    ### Overview
 
