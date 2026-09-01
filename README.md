@@ -7,11 +7,11 @@ pushed to while it runs gets picked up too.
 
 You can also drive every part of it by hand.
 
-| Command                     | Reviews                    | Use when                                                                |
-| --------------------------- | -------------------------- | ----------------------------------------------------------------------- |
+| Command                     | Reviews                    | Use when                                                                 |
+| --------------------------- | -------------------------- | ------------------------------------------------------------------------ |
 | [`autoreview`](#autoreview) | a repo's PRs, headlessly   | the default: no terminal needed, and an exit status that means something |
-| [`panel`](#panel)           | one change, several models | you want independent second opinions on a single diff                   |
-| [`review-prs`](#review-prs) | a repo's PRs, one tab each | you want to watch a review happen and steer it mid-flight               |
+| [`panel`](#panel)           | one change, several models | you want independent second opinions on a single diff                    |
+| [`review-prs`](#review-prs) | a repo's PRs, one tab each | you want to watch a review happen and steer it mid-flight                |
 
 ## How a review happens
 
@@ -25,7 +25,7 @@ autoreview             picks every PR that is NEW or UPDATED
 ```
 
 The panel in the middle is the
-[`auto-review`](https://github.com/catena-labs/dev-skills) skill, which each
+[`auto-review`](https://github.com/venables/skills) skill, which each
 agent runs against its own PR. [`panel`](#panel) is that same idea as a binary
 you can point at any diff, with no PR and no skill involved.
 
@@ -270,7 +270,7 @@ for the run, and a stale list cannot put it back into the queue that just
 dropped it.
 
 Nothing new is needed to decide "should I look again": a review autoreview
-posts becomes *your* latest activity on that PR, so an author pushing a fix
+posts becomes _your_ latest activity on that PR, so an author pushing a fix
 afterwards flips it back to `UPDATED` on its own. The sweep filter already
 means "actionable now".
 
@@ -471,7 +471,7 @@ set.
 
 The per-tab command is `REVIEW_PRS_AUTO_CMD` (same `{}`/append substitution as
 `REVIEW_PRS_CMD`), defaulting to the
-[`pr-review-tab`](https://github.com/catena-labs/dev-skills) skill:
+[`pr-review-tab`](https://github.com/venables/skills) skill:
 
 ```sh
 claude --dangerously-skip-permissions --session-id <uuid> "pr-review-tab <number>"
@@ -495,7 +495,7 @@ It uses the same unattended command as `--auto`, so it composes with both the
 sweep (`review-prs --auto --babysit`) and the picker (`review-prs --babysit`,
 then choose which PRs to babysit). Under the hood the `pr-review-tab` skill
 starts an in-session `/loop` that re-runs the
-[`recheck-pr`](https://github.com/catena-labs/dev-skills) skill each interval;
+[`recheck-pr`](https://github.com/venables/skills) skill each interval;
 `recheck-pr`'s fast path makes a no-change cycle cheap, and the loop ends when
 the tab closes on approval.
 
