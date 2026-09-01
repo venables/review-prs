@@ -1,6 +1,6 @@
 [package]
 name = "autoreview"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2024"
 description = "Automated code review: watch a repo's PRs and review each with a panel of models"
 license = "MIT"
