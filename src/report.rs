@@ -96,18 +96,18 @@ pub fn read_review(
 }
 
 /// dash-p's envelope: the final assistant message, and nothing before it.
+///
+/// An overridden reviewer promises no envelope, so stdout that is not one is
+/// taken as the review itself. That is what the override printed, and the
+/// alternative is no review file at all for those runs.
 fn read_answer(stdout_path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(stdout_path).ok()?;
-    let envelope: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    Some(envelope.get("answer")?.as_str()?.to_string())
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(envelope) => envelope.get("answer")?.as_str().map(str::to_string),
+        Err(_) => (!raw.trim().is_empty()).then(|| raw.trim().to_string()),
+    }
 }
 
-/// Every assistant message in a Claude Code transcript, in order.
-///
-/// Tool calls and their results are skipped: what is wanted is what the
-/// reviewer said, not the mechanics of it saying so. A line that will not
-/// parse is skipped rather than failing the read -- the file is written by
-/// another program while this one reads it, and a torn last line is ordinary.
 /// A transcript timestamp as an epoch second.
 ///
 /// Claude Code writes milliseconds ("...T06:54:13.139Z") and parse_iso wants
@@ -122,6 +122,11 @@ fn transcript_epoch(ts: &str) -> Option<i64> {
 }
 
 /// Every assistant message written since `since`, in order.
+///
+/// Tool calls and their results are skipped: what is wanted is what the
+/// reviewer said, not the mechanics of it saying so. A line that will not
+/// parse is skipped rather than failing the read -- the file is written by
+/// another program while this one reads it, and a torn last line is ordinary.
 ///
 /// Filtered by the entry's own timestamp rather than by where it sits in the
 /// file. A resumed session already holds every earlier review, and those
@@ -163,26 +168,34 @@ fn read_transcript(path: &std::path::Path, since: i64) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-/// The reply without the machine trailer on the end.
+/// The reply without the machine trailer.
 ///
-/// Two conditions, and both matter. The block must parse, so a review may
-/// discuss the fence tag in prose without losing everything under it. And it
-/// must end the reply, which is where the reviewer is asked to put it -- a
-/// parseable block quoted mid-review is an example, and cutting there would
-/// throw away the conclusion after it.
-fn strip_trailer(answer: &str) -> &str {
+/// The block must parse, so a review may discuss the fence tag in prose
+/// without losing everything under it.
+///
+/// It does not have to end the text. The reviewer is asked to end its *reply*
+/// with the block, but a review file is every message joined -- the review,
+/// then the block, then whatever the reviewer said last. Requiring the block
+/// to come last left the raw JSON sitting in the middle of the file, which is
+/// the shape the sign-off bug produces. What follows the block is kept.
+fn strip_trailer(answer: &str) -> String {
     let mut search_end = answer.len();
     while let Some(start) = answer[..search_end].rfind("```autoreview") {
         let body = &answer[start + "```autoreview".len()..];
         if let Some(end) = body.find("```")
             && serde_json::from_str::<Trailer>(body[..end].trim()).is_ok()
         {
-            let after = &body[end + "```".len()..];
-            return if after.trim().is_empty() { &answer[..start] } else { answer };
+            let before = answer[..start].trim_end();
+            let after = body[end + "```".len()..].trim();
+            return if after.is_empty() {
+                before.to_string()
+            } else {
+                format!("{before}\n\n{after}")
+            };
         }
         search_end = start;
     }
-    answer
+    answer.to_string()
 }
 
 pub fn parse_trailer(answer: &str) -> Option<Trailer> {
@@ -412,8 +425,9 @@ pub fn vetoed_claim<'a>(gh: &Readback, trailer: Option<&'a Trailer>) -> Option<&
 
 #[cfg(test)]
 mod tests {
-    /// A session store holding one transcript, laid out the way Claude Code
-    /// does: $CLAUDE_CONFIG_DIR/projects/<some-dir>/<id>.jsonl.
+    /// A transcript file with the entries a reader has to cope with. The
+    /// directory layout mirrors Claude Code's, but finding a transcript by id
+    /// is session.rs's job and is tested there; these tests hand over a path.
     fn with_transcript(id: &str, turns: &[(&str, &str)]) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("ar-tx-{}-{id}", std::process::id()));
         let dir = root.join("projects").join("-some-repo");
@@ -441,6 +455,34 @@ mod tests {
         lines.push_str("{\"type\":\"assis");
         std::fs::write(dir.join(format!("{id}.jsonl")), lines).unwrap();
         root
+    }
+
+    #[test]
+    fn the_machine_trailer_leaves_the_review_file_wherever_it_sits() {
+        // The joined transcript of the reported bug: the review, the block the
+        // summary reads, then the sign-off. Requiring the block to come last
+        // left its raw JSON in the middle of the file.
+        let joined = "## Overview\n\nThe review.\n\n```autoreview\n{\"decision\":\"none\"}\n```\n\nThe script exited cleanly.";
+        let out = strip_trailer(joined);
+        assert!(out.contains("The review."), "keeps what came before");
+        assert!(out.contains("The script exited cleanly."), "and what came after");
+        assert!(!out.contains("autoreview"), "but not the block: {out:?}");
+        assert!(!out.contains("decision"), "and none of its json");
+    }
+
+    #[test]
+    fn an_overridden_reviewer_still_gets_a_review_file() {
+        // An override prints its review straight to stdout; there is no
+        // envelope to unwrap, and rejecting it left those runs with nothing.
+        let dir = std::env::temp_dir().join(format!("ar-ovr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pr-9.json");
+        std::fs::write(&path, "  my own reviewer said this  \n").unwrap();
+        assert_eq!(read_review(&path, None, 0).unwrap(), "my own reviewer said this");
+        // Empty stdout is still nothing to write.
+        std::fs::write(&path, "   \n").unwrap();
+        assert_eq!(read_review(&path, None, 0), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -537,20 +579,29 @@ mod tests {
         std::fs::write(&path, serde_json::json!({ "answer": chatty }).to_string()).unwrap();
         assert_eq!(read_review(&path, None, 0).unwrap(), chatty);
 
-        // A parseable block quoted mid-review is an example, not the
-        // trailer: the conclusion after it must survive.
+        // A parseable block is removed wherever it sits, and the prose on
+        // both sides is kept. The cost is a quoted example that happens to
+        // parse: it goes too. That is the right way round -- an example lost
+        // from a log file is a smaller loss than raw JSON in the middle of
+        // every review, which is what requiring the block to come last did
+        // once the file became every message joined.
         let quoting = "I would emit:\n\n```autoreview\n{\"decision\":\"none\"}\n```\n\nBut the real finding is here.";
         std::fs::write(&path, serde_json::json!({ "answer": quoting }).to_string()).unwrap();
-        assert_eq!(read_review(&path, None, 0).unwrap(), quoting);
+        assert_eq!(
+            read_review(&path, None, 0).unwrap(),
+            "I would emit:\n\nBut the real finding is here."
+        );
 
         // Nothing to write rather than an empty file.
         std::fs::write(&path, serde_json::json!({ "answer": "```autoreview\n{}\n```" }).to_string())
             .unwrap();
         assert_eq!(read_review(&path, None, 0), None);
 
-        // A stdout that is not the envelope at all must not panic.
+        // A stdout that is not the envelope is an overridden reviewer's own
+        // output, so it is the review. See an_overridden_reviewer_still_gets_
+        // a_review_file; what must never happen here is a panic.
         std::fs::write(&path, "not json").unwrap();
-        assert_eq!(read_review(&path, None, 0), None);
+        assert_eq!(read_review(&path, None, 0).unwrap(), "not json");
         std::fs::remove_dir_all(&dir).ok();
     }
 
