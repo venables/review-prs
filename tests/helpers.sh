@@ -104,6 +104,7 @@ setup_sandbox() {
         AUTOREVIEW_MAX_IDLE AUTOREVIEW_CI_WAIT REVIEW_PRS_CI_WAIT || true
   unset FAKE_CLAUDE_FAIL FAKE_CLAUDE_IS_ERROR FAKE_CLAUDE_SLEEP \
         FAKE_CLAUDE_GARBAGE FAKE_CLAUDE_KILL_JOB FAKE_CLAUDE_TRAILER \
+        FAKE_CLAUDE_TRANSCRIPT \
         FAKE_GH_APPROVED FAKE_GH_CLOSED FAKE_GH_MY_REVIEW \
         FAKE_GH_VIEW_FAIL FAKE_GH_GRAPHQL_FAIL_AFTER || true
   # The host may have a real dash-p and an inherited override for it; the
@@ -393,6 +394,23 @@ done
 if [[ -z "$sid" ]]; then
   sid="00000000-0000-5000-a000-0000000000$(printf '%02d' "$n")"
 fi
+
+# PRs named in $FAKE_CLAUDE_TRANSCRIPT get a transcript written under the
+# session store as the review "runs": two assistant lines, the shape Claude
+# Code writes as a reviewer works. The board follows it live; nothing else
+# reads it. Only a pinned or resumed session has one to write.
+case " ${FAKE_CLAUDE_TRANSCRIPT:-} " in
+  *" $n "*)
+    if [[ -n "$sid" && -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+      mkdir -p "$CLAUDE_CONFIG_DIR/projects/-fake-project"
+      stamp="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+      {
+        printf '{"type":"assistant","timestamp":"%s","message":{"role":"assistant","content":[{"type":"text","text":"Reading the diff."}]}}\n' "$stamp"
+        printf '{"type":"assistant","timestamp":"%s","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test --quiet"}}]}}\n' "$stamp"
+      } >"$CLAUDE_CONFIG_DIR/projects/-fake-project/$sid.jsonl"
+    fi
+    ;;
+esac
 
 if [[ -n "${FAKE_CLAUDE_SLEEP:-}" ]]; then
   # Sleep in a marked grandchild, so a test can find survivors by name and so

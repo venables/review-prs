@@ -61,11 +61,29 @@ else
   not_ok "the terminal is given back cooked" "stty -a after the run: $(tail -c 300 "$SANDBOX/out/pty" | tr '\r\n' '  ')"
 fi
 
-# --- q stops the pass -------------------------------------------------------
+# --- space shows what a review is doing, q stops the pass -------------------
+# The fake dash-p writes #9's transcript as it starts: a line of text and a
+# Bash call, the shape Claude Code writes as a reviewer works. #8 gets none.
+# At 0.8s a space expands every running row: #9's block names its session
+# and what it did, #8's says it is still waiting for a transcript, and the
+# footer's hint flips to the key that hides them again. At 1.6s q ends the
+# pass.
+#
 # With the board up the terminal is in raw mode, so ctrl-C is a key; q is the
 # same key by another name. Both take the interrupt path: stop every review's
 # process group, print the summary, exit 130, and give the terminal back.
-out="$(FAKE_CLAUDE_SLEEP=5 run_on_pty --key 0.8:q)"
+out="$(FAKE_CLAUDE_TRANSCRIPT=9 FAKE_CLAUDE_SLEEP=5 run_on_pty --key '0.8: ' --key 1.6:q)"
+assert_contains "a running row names the tool the review is in" "$out" "· Bash"
+assert_contains "space expands a running row" "$out" "2 turns · 1 tool call"
+# One word at a time: the board writes only the cells that changed, and a
+# plain space over a blank cell is not a change, so an unstyled sentence
+# reaches the terminal as its words with cursor moves between them.
+assert_contains "...with what the reviewer said" "$out" "Reading"
+assert_contains "...to the end of the line" "$out" "diff."
+assert_contains "...and what it ran" "$out" "--quiet"
+assert_contains "...and which session it runs in" "$out" "session "
+assert_contains "a review with no transcript yet says so" "$out" "waiting for its transcript"
+assert_contains "...and the footer offers to hide the details" "$out" "hide · q stop"
 assert_contains "q interrupts the pass" "$out" "interrupted; stopping running reviews"
 assert_contains "...and exits 130" "$out" "autoreview-exit=130"
 assert_contains "...after printing the summary" "$out" "╭"
