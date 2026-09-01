@@ -18,6 +18,10 @@ assert_not_contains "approved PRs are hidden by default" "$out" "#5"
 assert_not_contains "your own PRs are always hidden" "$out" "#4"
 assert_not_contains "dependabot PRs are hidden by default" "$out" "#3"
 assert_not_contains "draft PRs are hidden" "$out" "#2"
+# A tab is a fresh claude with no install step behind it, so the skills the
+# binary was built with ride in the command.
+assert_contains "tabs are handed the bundled skills" \
+  "$(spawned_cmd 'pr-review-tab 9')" "--add-dir "
 
 out="$(run_review_prs --auto --dependabot)"
 assert_contains "--dependabot includes bot PRs" "$out" "#3"

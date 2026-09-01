@@ -9,7 +9,7 @@ pub mod spawner;
 
 use crate::repo::{self, AlreadyReported};
 use crate::status::{Status, step};
-use crate::{select, session, ui};
+use crate::{rundir, select, session, skills, ui};
 use anyhow::{Result, bail};
 use cli::Config;
 
@@ -53,6 +53,19 @@ pub fn run(cfg: &Config) -> Result<i32> {
         spawner::rename_workspace(spawner, label);
     }
 
+    // The skills every tab runs, written where the tabs can read them. A
+    // tab outlives this process, so the directory is not cleaned up; it is
+    // one small tree under the temp directory per run. Only the built-in
+    // command needs it, but staging is cheap and the note is worth having
+    // either way.
+    let skills_dir = skills::stage(&rundir::make_unique_dir(
+        &std::env::temp_dir(),
+        "review-prs-skills.",
+    )?)?;
+    if let Some(note) = skills::shadow_note(&session::user_skills_dir()) {
+        eprintln!("{note}");
+    }
+
     let mut failures = 0usize;
     for &n in &numbers {
         // Decide this PR's session before anything else: the flag, the prompt
@@ -70,7 +83,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
         let resuming = if plan.resume { " (resuming earlier review)" } else { "" };
         println!("spawning tab for PR #{n} via {}{resuming}", spawner.name());
 
-        let cmd = command::line(cfg, n, &plan, &ctx.repo_root);
+        let cmd = command::line(cfg, n, &plan, &ctx.repo_root, &skills_dir);
         let label = command::label(cfg, n, plan.resume);
         // A tab that fails to spawn must not take the rest of the sweep with
         // it: warn and keep going, so one bad tab costs one review rather than
