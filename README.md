@@ -366,7 +366,9 @@ run and again in the summary. The per-run directory is what lets two runs share
 a `--log-dir` — ordinary under cron, where the default hour-long timeout outlasts
 most intervals — without reading each other's results:
 
-- `pr-N.review.md` — the review as text, which is the one to open
+- `pr-N.review.md` — the review as text, which is the one to open. Its last
+  line is `DECISION: Approve`, `Comment`, `Request changes`, or `No action`:
+  what the reviewer did, without the reasoning above it
 - `pr-N.json` — dash-p's answer (`{"answer": ..., "metadata": ...}`)
 - `pr-N.meta.json` — the metadata envelope (session id, cost, exit status);
   written even when a timeout or interrupt leaves stdout empty
