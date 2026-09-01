@@ -107,9 +107,9 @@ the point.) `--auto` / `-A` still parse —
 an old alias or cron line keeps working — they just name the default now.
 
 It takes the same selection flags as `review-prs` (`--continue`, `--all`,
-`--dependabot`, `--babysit`) plus nine of its own: `--pick`, `--focus`,
-`--no-post`, `--jobs`, `--timeout`, `--budget`, `--log-dir`, `--max-passes`
-and `--max-idle`.
+`--dependabot`, `--babysit`) plus ten of its own: `--pick`, `--watch`,
+`--focus`, `--no-post`, `--jobs`, `--timeout`, `--budget`, `--log-dir`,
+`--max-passes` and `--max-idle`.
 
 **`--focus` steers a run.** It reaches every panelist as the reviewer focus:
 
