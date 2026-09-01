@@ -16,7 +16,7 @@ use autoreview::cli::Config;
 use autoreview::queue::Queue;
 use autoreview::rundir::RunDir;
 use autoreview::status::{Status, step};
-use autoreview::{cli, pool, prlist, queue, repo, select, signals, ui};
+use autoreview::{cli, pool, prlist, queue, repo, select, session, signals, skills, ui};
 use std::collections::HashMap;
 
 fn select_prs(cfg: &Config) -> select::Opts<'static> {
@@ -162,6 +162,12 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         (None, false) => return Ok(0),
     };
     let mut rundir = RunDir::new(cfg.log_dir.clone())?;
+    // Every reviewer this run spawns is handed this directory. Written
+    // before the first pass so a failure is the run's, not one review's.
+    skills::stage(&rundir.agent_dir())?;
+    if let Some(note) = skills::shadow_note(&session::user_skills_dir()) {
+        eprintln!("{note}");
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     signals::install(tx.clone());
     let mut ui = ui::Ui::new(ui::pr_url_base(&ctx.owner, &ctx.name));
