@@ -226,6 +226,38 @@ run_autoreview --auto --budget 2.50 >/dev/null
 assert_contains "--budget reaches the reviewer" \
   "$(claude_call_for '/auto-review 9')" "--max-budget-usd=2.50"
 
+# --- Which skills a run stages --------------------------------------------
+# One source per run, said up front. The default is the bundle; a directory
+# replaces it; "installed" stages nothing and hands the reviewer no
+# directory, which is what every run did before the binaries carried them.
+out="$(run_autoreview)"
+assert_contains "a run says it staged the bundled skills" "$out" "skills: bundled ("
+mkdir -p "$SANDBOX/myskills/my-review"
+printf -- '---\nname: my-review\n---\n' >"$SANDBOX/myskills/my-review/SKILL.md"
+out="$(run_autoreview --skills "$SANDBOX/myskills")"
+assert_contains "--skills DIR names the directory" "$out" "skills: $SANDBOX/myskills"
+staged="$(find "$SANDBOX/out/logs" -path '*/agent/.claude/skills/my-review/SKILL.md' | head -1)"
+assert_contains "...and stages that directory in place of the bundle" \
+  "$staged" "/agent/.claude/skills/my-review/SKILL.md"
+assert_equals "...with nothing bundled beside it" \
+  "$(find "$SANDBOX/out/logs" -path '*/agent/.claude/skills/auto-review' | wc -l | tr -d ' ')" "0"
+out="$(AUTOREVIEW_SKILLS="$SANDBOX/myskills" run_autoreview)"
+assert_contains "\$AUTOREVIEW_SKILLS is the default for --skills" "$out" "skills: $SANDBOX/myskills"
+out="$(run_autoreview --skills installed)"
+assert_contains "--skills installed says so" "$out" "skills: installed"
+assert_not_contains "...hands the reviewer no directory" \
+  "$(claude_call_for '/auto-review 9')" "--add-dir"
+assert_equals "...and stages nothing" \
+  "$(find "$SANDBOX/out/logs" -type d -name agent | wc -l | tr -d ' ')" "0"
+out="$(run_autoreview --skills "$SANDBOX/nowhere")"
+assert_equals "a --skills value that names no skills exits nonzero" "$(last_status)" "1"
+assert_contains "...and says what was expected" \
+  "$out" "error: --skills expects a directory of skills (<name>/SKILL.md) or 'installed'"
+mkdir -p "$SANDBOX/empty"
+out="$(run_autoreview --skills "$SANDBOX/empty")"
+assert_equals "an empty --skills directory exits nonzero" "$(last_status)" "1"
+assert_contains "...and says the directory holds none" "$out" "holds none"
+
 # --- Overrides ------------------------------------------------------------
 AUTOREVIEW_AUTO_CMD='my-review' run_autoreview --auto >/dev/null
 assert_contains "an override without {} gets the number appended" \
@@ -237,6 +269,9 @@ assert_equals "an override replaces claude entirely" "$(claude_calls)" ""
 # are in play.
 assert_equals "an override run stages no skills" \
   "$(find "$SANDBOX/out/logs" -type d -name agent | wc -l | tr -d ' ')" "0"
+out="$(AUTOREVIEW_AUTO_CMD='my-review' run_autoreview --auto --skills installed)"
+assert_contains "--skills with an override is noted, not silently dropped" \
+  "$out" "note: --skills is not passed to \$AUTOREVIEW_AUTO_CMD"
 
 AUTOREVIEW_AUTO_CMD='my-review {} --extra {}' run_autoreview --auto >/dev/null
 assert_contains "{} is substituted everywhere" "$(override_calls)" "args=9 --extra 9"
