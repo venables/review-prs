@@ -91,7 +91,7 @@ pub fn read_review(
 ) -> Option<String> {
     let full = transcript.and_then(|p| read_transcript(p, since));
     let text = full.or_else(|| read_answer(stdout_path))?;
-    let body = strip_trailer(&text).trim_end().to_string();
+    let body = strip_trailer(&text).trim().to_string();
     (!body.is_empty()).then_some(body)
 }
 
@@ -490,6 +490,17 @@ mod tests {
         let out = strip_trailer(two);
         assert!(out.contains("First pass.") && out.contains("Second pass."));
         assert!(!out.contains("autoreview"), "neither block survives: {out:?}");
+    }
+
+    #[test]
+    fn a_review_does_not_open_with_the_gap_the_trailer_left() {
+        let dir = std::env::temp_dir().join(format!("ar-lead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pr-9.json");
+        let leading = "```autoreview\n{\"decision\":\"none\"}\n```\n\nThe review.";
+        std::fs::write(&path, serde_json::json!({ "answer": leading }).to_string()).unwrap();
+        assert_eq!(read_review(&path, None, 0).unwrap(), "The review.");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
