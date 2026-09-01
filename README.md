@@ -24,10 +24,9 @@ autoreview             picks every PR that is NEW or UPDATED, once CI passes
   ↻ --babysit          watch on an interval: new PRs join, fixed ones leave
 ```
 
-The panel in the middle is the
-[`auto-review`](https://github.com/venables/skills) skill, which each
-agent runs against its own PR. [`panel`](#panel) is that same idea as a binary
-you can point at any diff, with no PR and no skill involved.
+The panel in the middle is the [`auto-review`](skills/auto-review) skill,
+which each agent runs against its own PR. [`panel`](#panel) is that same idea
+as a binary you can point at any diff, with no PR and no skill involved.
 
 Four things that shape the whole design:
 
@@ -80,6 +79,35 @@ cargo install --path autoreview
 Either way you get all three binaries. All three are self-contained: nothing is
 read from the checkout at runtime, so a copy or a symlink anywhere on `$PATH`
 works.
+
+### Skills
+
+The reviewer each agent runs is a set of skills, and they live in this repo
+under [`skills/`](skills). The binaries invoke them by slash name, so the agent
+has to be able to find them. Install them once, for every agent that supports
+the [Agent Skills](https://agentskills.io) layout:
+
+```sh
+npx skills add venabots/autoreview --skill '*' --global
+```
+
+Or point a skills directory at the checkout:
+
+```sh
+ln -s "$PWD/skills/"* ~/.claude/skills/
+```
+
+| Skill                                                                       | Run by                                               |
+| --------------------------------------------------------------------------- | ---------------------------------------------------- |
+| [`auto-review`](skills/auto-review)                                         | the default sweep, and `--babysit`                   |
+| [`panel-review`](skills/panel-review)                                       | `--pick`, `--no-post`, and `auto-review`             |
+| [`recheck-pr`](skills/recheck-pr)                                           | `--continue`, and every later babysit pass           |
+| [`auto-post-panel-review-comments`](skills/auto-post-panel-review-comments) | `auto-review`, to post what the panel found          |
+| [`approve-pr`](skills/approve-pr)                                           | `auto-review` and `recheck-pr`, when the gate passes |
+| [`pr-review-tab`](skills/pr-review-tab)                                     | `review-prs --auto`, to close its own tab            |
+
+They are versioned with the binaries because they change with them: a flag the
+binary passes down is a flag the skill has to understand.
 
 ## autoreview
 
@@ -498,8 +526,8 @@ pending checks are waited for before the tabs open (see
 widen the set, and `--skip-wait-for-ci` to fan out regardless of checks.
 
 The per-tab command is `REVIEW_PRS_AUTO_CMD` (same `{}`/append substitution as
-`REVIEW_PRS_CMD`), defaulting to the
-[`pr-review-tab`](https://github.com/venables/skills) skill:
+`REVIEW_PRS_CMD`), defaulting to the [`pr-review-tab`](skills/pr-review-tab)
+skill:
 
 ```sh
 claude --dangerously-skip-permissions --session-id <uuid> "pr-review-tab <number>"
@@ -523,7 +551,7 @@ It uses the same unattended command as `--auto`, so it composes with both the
 sweep (`review-prs --auto --babysit`) and the picker (`review-prs --babysit`,
 then choose which PRs to babysit). Under the hood the `pr-review-tab` skill
 starts an in-session `/loop` that re-runs the
-[`recheck-pr`](https://github.com/venables/skills) skill each interval;
+[`recheck-pr`](skills/recheck-pr) skill each interval;
 `recheck-pr`'s fast path makes a no-change cycle cheap, and the loop ends when
 the tab closes on approval.
 
@@ -780,6 +808,7 @@ src/cli.rs         autoreview's flags
 src/tabs/          review-prs: cli, per-tab command, terminal spawners
 src/panel/         panel: cli, target, worktrees, fan-out, synthesis
 prompts/           the panelist and synthesis prompts, compiled in
+skills/            the review skills the agents run, one directory each
 src/pool.rs        autoreview: the event-driven job pool
 src/job.rs         autoreview: one review, spawned and classified
 src/report.rs      autoreview: verdict readback and the agent's trailer
@@ -801,7 +830,8 @@ shapes), then runs the bash suites — the real binaries against fake `gh`,
 `gum`, `cmux` and `dash-p` on `PATH`, inside a throwaway git repo, with
 `$CLAUDE_CONFIG_DIR` pointed at a throwaway session store. They never touch
 your repos, your Claude Code sessions, or GitHub. It finishes with `bash -n`
-and `shellcheck -x` over the suite itself, which is the only bash in the repo.
+and `shellcheck` over the suite itself and over the scripts in `skills/`, which
+is all the bash in the repo.
 
 The suite takes about a minute and a half, most of it one test: whether a
 babysit pass resumes the session the previous pass ran in can only be shown by
