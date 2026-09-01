@@ -233,6 +233,10 @@ assert_contains "an override without {} gets the number appended" \
 assert_contains "an override is handed the session id" "$(override_calls)" "session=$sid9"
 assert_contains "an override is told whether it is resuming" "$(override_calls)" "resume=0"
 assert_equals "an override replaces claude entirely" "$(claude_calls)" ""
+# ...so the bundled skills are not staged for it, and no note claims they
+# are in play.
+assert_equals "an override run stages no skills" \
+  "$(find "$SANDBOX/out/logs" -type d -name agent | wc -l | tr -d ' ')" "0"
 
 AUTOREVIEW_AUTO_CMD='my-review {} --extra {}' run_autoreview --auto >/dev/null
 assert_contains "{} is substituted everywhere" "$(override_calls)" "args=9 --extra 9"

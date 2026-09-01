@@ -162,12 +162,15 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         (None, false) => return Ok(0),
     };
     let mut rundir = RunDir::new(cfg.log_dir.clone())?;
-    // Every reviewer this run spawns is handed this directory. Written
-    // before the first pass so a failure is the run's, not one review's.
-    skills::stage(&rundir.agent_dir())?;
-    let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
-    if let Some(note) = skills::shadow_note(&shadowing) {
-        eprintln!("{note}");
+    // Every built-in reviewer this run spawns is handed this directory.
+    // Written before the first pass so a failure is the run's, not one
+    // review's. An override brings its own reviewer and never sees it.
+    if cfg.review_cmd.is_none() {
+        skills::stage(&rundir.agent_dir())?;
+        let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
+        if let Some(note) = skills::shadow_note(&shadowing) {
+            eprintln!("{note}");
+        }
     }
     let (tx, rx) = std::sync::mpsc::channel();
     signals::install(tx.clone());
