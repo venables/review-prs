@@ -22,6 +22,28 @@ assert_not_contains "draft PRs are hidden" "$out" "#2"
 out="$(run_review_prs --auto --dependabot)"
 assert_contains "--dependabot includes bot PRs" "$out" "#3"
 
+# --- Checks that have not passed hold a PR back ---------------------------
+# Failing is settled, so there is nothing to wait for: the sweep holds the PR,
+# says so, and fans out the rest. (Pending, which is waited for, is covered in
+# autoreview.test.sh -- the wait is the same shared code.)
+set_ci 8 FAILURE
+out="$(run_review_prs --auto)"
+assert_contains "a PR with failing checks is held" \
+  "$out" "holding 1 PR until CI passes: #8 (failing)"
+assert_contains "...and the way round it is named" "$out" "--skip-wait-for-ci reviews it anyway"
+assert_contains "...while the green one is swept" "$out" "1 PR to review: #9 (new)"
+assert_equals "...and the held PR gets no tab" "$(spawned_cmd 'pr-review-tab 8')" ""
+
+out="$(run_review_prs --auto --skip-wait-for-ci)"
+assert_contains "--skip-wait-for-ci sweeps it anyway" "$out" "2 PRs to review: #9 (new) #8 (new)"
+assert_not_contains "...without holding anything" "$out" "holding"
+
+# The picker does not hold: a pick is a pick. The column is how you know.
+FAKE_GUM_PICK="#8" run_review_prs >/dev/null
+assert_contains "a picked PR opens whatever its checks say" \
+  "$(spawned_cmd 'panel review 8')" "panel review 8"
+default_prs
+
 # --- What it is doing while it waits on the network ------------------------
 out="$(run_review_prs --auto)"
 assert_contains "it says it is reading the repo" "$out" "reading the repo"

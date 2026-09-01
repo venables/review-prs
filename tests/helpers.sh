@@ -101,7 +101,7 @@ setup_sandbox() {
   unset AUTOREVIEW_CMD AUTOREVIEW_AUTO_CMD AUTOREVIEW_JOBS AUTOREVIEW_TIMEOUT \
         AUTOREVIEW_MAX_BUDGET_USD AUTOREVIEW_LOG_DIR \
         AUTOREVIEW_BABYSIT_INTERVAL AUTOREVIEW_MAX_PASSES \
-        AUTOREVIEW_MAX_IDLE || true
+        AUTOREVIEW_MAX_IDLE AUTOREVIEW_CI_WAIT REVIEW_PRS_CI_WAIT || true
   unset FAKE_CLAUDE_FAIL FAKE_CLAUDE_IS_ERROR FAKE_CLAUDE_SLEEP \
         FAKE_CLAUDE_GARBAGE FAKE_CLAUDE_KILL_JOB FAKE_CLAUDE_TRAILER \
         FAKE_GH_APPROVED FAKE_GH_CLOSED FAKE_GH_MY_REVIEW \
@@ -491,8 +491,21 @@ EOF
 
 # --- Fixtures -------------------------------------------------------------
 
+# Set the checks on PR $1's head commit to $2 (SUCCESS, PENDING, FAILURE...)
+# in the fixture the fake gh serves. The rename is atomic, so a run polling
+# the list mid-swap sees the old fixture or the new one, never half of each.
+set_ci() {
+  jq --argjson n "$1" --arg s "$2" \
+    '(.data.repository.pullRequests.nodes[] | select(.number == $n)).headCommit
+       = {"nodes":[{"commit":{"statusCheckRollup":{"state":$s}}}]}' \
+    "$SANDBOX/fixtures/prs.json" >"$SANDBOX/fixtures/prs.next"
+  mv "$SANDBOX/fixtures/prs.next" "$SANDBOX/fixtures/prs.json"
+}
+
 # Three open PRs by other people, one draft, one of yours, one Dependabot.
 # PR 9 and 8 are NEW (no engagement by "me"); 6 is SEEN (you commented last).
+# 9 and 8 have passing checks; the rest have no checks at all, which the
+# sweep never holds a PR for.
 default_prs() {
   cat >"$SANDBOX/fixtures/repo.json" <<'EOF'
 {"owner":{"login":"acme"},"name":"widgets"}
@@ -505,14 +518,16 @@ EOF
    "headRefOid":"sha9",
    "author":{"login":"alice"},
    "comments":{"nodes":[]},"reviews":{"nodes":[]},
-   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-10T10:00:00Z","author":{"user":{"login":"alice"}}}}]}},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-10T10:00:00Z","author":{"user":{"login":"alice"}}}}]},
+   "headCommit":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}},
 
   {"number":8,"title":"Fix typo","isDraft":false,
    "updatedAt":"2026-08-09T10:00:00Z","reviewDecision":"CHANGES_REQUESTED",
    "headRefOid":"sha8",
    "author":{"login":"bob"},
    "comments":{"nodes":[]},"reviews":{"nodes":[]},
-   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-09T10:00:00Z","author":{"user":{"login":"bob"}}}}]}},
+   "commits":{"nodes":[{"commit":{"committedDate":"2026-08-09T10:00:00Z","author":{"user":{"login":"bob"}}}}]},
+   "headCommit":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}},
 
   {"number":6,"title":"Refactor client","isDraft":false,
    "updatedAt":"2026-08-08T10:00:00Z","reviewDecision":null,
