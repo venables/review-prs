@@ -162,11 +162,11 @@ pub fn dashp_args(job: &Job, cfg: &Config, rundir: &RunDir) -> Vec<String> {
         // forwards unrecognized flags only that way.
         format!("--append-system-prompt={}", crate::report::TRAILER_INSTRUCTION),
     ];
-    // The skills staged for this run, unless the run stages none. An
-    // installed skill of the same name still wins inside claude; the
-    // startup note says so.
-    if cfg.skills != crate::skills::Source::Installed {
-        argv.push(crate::skills::add_dir_flag(&rundir.agent_dir()));
+    // The skills staged for this run, when it staged any. An installed
+    // skill of the same name still wins inside claude; the startup note
+    // says so.
+    if let Some(dir) = rundir.skills_dir() {
+        argv.push(crate::skills::add_dir_flag(dir));
     }
     match &job.flag {
         SessionFlag::Pin(id) => {
@@ -385,14 +385,14 @@ mod tests {
         let job = Job::new(9);
         let argv = dashp_args(&job, &cfg_with(0, None, true), &rd);
         assert!(argv.join(" ").contains(&format!("--timeout {DASHP_TIMEOUT_DISABLED}")));
-        // The staged skills ride along as one token, under the run.
-        let add_dir = format!("--add-dir={}", rd.agent_dir().display());
-        assert!(argv.contains(&add_dir), "{argv:?}");
-        // ...and not at all when the run stages none.
-        let mut installed = cfg_with(0, None, false);
-        installed.skills = crate::skills::Source::Installed;
-        let argv = dashp_args(&job, &installed, &rd);
+        // A run that staged nothing hands the reviewer nothing.
         assert!(!argv.iter().any(|a| a.starts_with("--add-dir")), "{argv:?}");
+        // One that did hands it the directory, as one token.
+        let mut rd = rd;
+        let staged = rd.stage_skills(&crate::skills::Source::Bundled).unwrap().unwrap().to_path_buf();
+        let argv = dashp_args(&job, &cfg_with(0, None, false), &rd);
+        let add_dir = format!("--add-dir={}", staged.display());
+        assert!(argv.contains(&add_dir), "{argv:?}");
     }
 
     #[test]
