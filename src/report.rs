@@ -64,12 +64,12 @@ pub const TRAILER_INSTRUCTION: &str = "When your reply concludes a PR review tas
 pub fn read_trailer(
     stdout_path: &std::path::Path,
     transcript: Option<&std::path::Path>,
-    from: u64,
+    since: i64,
 ) -> Option<Trailer> {
     // Same reason read_review looks here first: the trailer is asked for at
     // the end of the review, and a reviewer that says anything afterwards
     // pushes it out of dash-p's `answer` and into an earlier message.
-    let full = transcript.and_then(|p| read_transcript(p, from));
+    let full = transcript.and_then(|p| read_transcript(p, since));
     full.as_deref()
         .and_then(parse_trailer)
         .or_else(|| read_answer(stdout_path).as_deref().and_then(parse_trailer))
@@ -87,9 +87,9 @@ pub fn read_trailer(
 pub fn read_review(
     stdout_path: &std::path::Path,
     transcript: Option<&std::path::Path>,
-    from: u64,
+    since: i64,
 ) -> Option<String> {
-    let full = transcript.and_then(|p| read_transcript(p, from));
+    let full = transcript.and_then(|p| read_transcript(p, since));
     let text = full.or_else(|| read_answer(stdout_path))?;
     let body = strip_trailer(&text).trim_end().to_string();
     (!body.is_empty()).then_some(body)
@@ -108,18 +108,42 @@ fn read_answer(stdout_path: &std::path::Path) -> Option<String> {
 /// reviewer said, not the mechanics of it saying so. A line that will not
 /// parse is skipped rather than failing the read -- the file is written by
 /// another program while this one reads it, and a torn last line is ordinary.
-fn read_transcript(path: &std::path::Path, from: u64) -> Option<String> {
+/// A transcript timestamp as an epoch second.
+///
+/// Claude Code writes milliseconds ("...T06:54:13.139Z") and parse_iso wants
+/// exactly twenty bytes, so the fraction is dropped first. Without this every
+/// timestamp fails to parse, every entry is kept, and the filter below is a
+/// no-op that nothing would have noticed.
+fn transcript_epoch(ts: &str) -> Option<i64> {
+    match ts.split_once('.') {
+        Some((whole, _)) => crate::prlist::parse_iso(&format!("{whole}Z")),
+        None => crate::prlist::parse_iso(ts),
+    }
+}
+
+/// Every assistant message written since `since`, in order.
+///
+/// Filtered by the entry's own timestamp rather than by where it sits in the
+/// file. A resumed session already holds every earlier review, and those
+/// belong to the passes that produced them. A byte offset would say the same
+/// thing until the file was compacted or rewritten, and then say it wrongly;
+/// a timestamp survives all of that.
+///
+/// An entry with no timestamp is kept. It should not happen, and if it does,
+/// a duplicated review reads better than a missing one -- which is the bug
+/// this function exists to fix.
+fn read_transcript(path: &std::path::Path, since: i64) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
-    // Everything before `from` belongs to an earlier pass of a resumed
-    // session. A byte offset past the end means the file was replaced rather
-    // than appended to, so the whole of it is this pass's.
-    let raw = raw.get(from as usize..).unwrap_or(&raw);
     let mut parts: Vec<String> = Vec::new();
     for line in raw.lines() {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let written = entry.get("timestamp").and_then(|t| t.as_str()).and_then(transcript_epoch);
+        if written.is_some_and(|at| at < since) {
             continue;
         }
         let Some(content) = entry.pointer("/message/content").and_then(|c| c.as_array()) else {
@@ -390,14 +414,15 @@ pub fn vetoed_claim<'a>(gh: &Readback, trailer: Option<&'a Trailer>) -> Option<&
 mod tests {
     /// A session store holding one transcript, laid out the way Claude Code
     /// does: $CLAUDE_CONFIG_DIR/projects/<some-dir>/<id>.jsonl.
-    fn with_transcript(id: &str, turns: &[&str]) -> std::path::PathBuf {
+    fn with_transcript(id: &str, turns: &[(&str, &str)]) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("ar-tx-{}-{id}", std::process::id()));
         let dir = root.join("projects").join("-some-repo");
         std::fs::create_dir_all(&dir).unwrap();
         let mut lines = String::new();
-        for t in turns {
+        for (at, t) in turns {
             let entry = serde_json::json!({
                 "type": "assistant",
+                "timestamp": at,
                 "message": { "content": [{ "type": "text", "text": t }] },
             });
             lines.push_str(&entry.to_string());
@@ -419,6 +444,19 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_timestamp_carries_milliseconds() {
+        // The shape Claude Code actually writes. parse_iso wants twenty bytes
+        // and this is twenty-four, so without the fraction being dropped every
+        // entry parses as unknown, every entry is kept, and the resume filter
+        // quietly does nothing.
+        let with_ms = transcript_epoch("2026-09-01T06:54:13.139Z").unwrap();
+        let without = transcript_epoch("2026-09-01T06:54:13Z").unwrap();
+        assert_eq!(with_ms, without, "the fraction is dropped, not the value");
+        assert_eq!(transcript_epoch("2026-09-01T06:54:14.000Z").unwrap(), without + 1);
+        assert!(transcript_epoch("not a time").is_none());
+    }
+
+    #[test]
     fn a_review_survives_the_reviewer_signing_off_after_it() {
         // The reported bug. A panel review is many messages: the panelist
         // sections, the synthesis, then whatever the reviewer says last.
@@ -426,7 +464,13 @@ mod tests {
         // pr-N.review.md containing one sentence about the script exiting.
         let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
         let signoff = "The panel-review script has exited cleanly (exit 0).";
-        let root = with_transcript(id, &["## Overview\n\nThe real review.", signoff]);
+        let root = with_transcript(
+            id,
+            &[
+                ("2026-09-01T10:00:00.000Z", "## Overview\n\nThe real review."),
+                ("2026-09-01T10:00:05.000Z", signoff),
+            ],
+        );
 
         let dir = std::env::temp_dir().join(format!("ar-tx-out-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -446,9 +490,9 @@ mod tests {
         // A resumed session already holds every earlier review. This pass's
         // file must hold this pass's review, not the whole history -- a watch
         // run resuming for days would otherwise grow one file without end.
-        let from = std::fs::metadata(&tx).unwrap().len();
         let second = serde_json::json!({
             "type": "assistant",
+            "timestamp": "2026-09-01T11:00:00.000Z",
             "message": { "content": [{ "type": "text", "text": "## Second look\n\nStill fine." }] },
         });
         let mut appended = std::fs::read_to_string(&tx).unwrap();
@@ -457,9 +501,17 @@ mod tests {
         appended.push('\n');
         std::fs::write(&tx, appended).unwrap();
 
-        let later = read_review(&stdout, Some(&tx), from).unwrap();
+        // 10:30, between the two passes.
+        let since = transcript_epoch("2026-09-01T10:30:00.000Z").unwrap();
+        let later = read_review(&stdout, Some(&tx), since).unwrap();
         assert!(later.contains("Still fine."), "this pass's review: {later:?}");
         assert!(!later.contains("The real review."), "not the earlier pass's");
+
+        // Rewriting the file shorter, as a compaction would, does not confuse
+        // it: the filter is the timestamp, not a position in the file.
+        std::fs::write(&tx, second.to_string()).unwrap();
+        let compacted = read_review(&stdout, Some(&tx), since).unwrap();
+        assert!(compacted.contains("Still fine."), "survives a rewrite: {compacted:?}");
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&dir).ok();
