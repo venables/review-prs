@@ -325,30 +325,32 @@ When _not_ to use:
 
    ### The decision line
 
-   The synthesis ends with one line, on its own, and nothing after it except a
+   The synthesis ends with one line, on its own. Nothing follows it except a
    machine trailer the caller's system prompt asks for:
 
    ```
    DECISION: Approve
    ```
 
-   The verdict is one of three fixed strings, and it follows from the buckets
-   and the Risk above, not from a fresh judgment. Apply the rules in order;
-   the first that matches wins, so every synthesis has exactly one verdict:
+   The verdict is one of three fixed strings. It follows from the buckets
+   above, not from a fresh judgment, and it agrees with the gate
+   `auto-review` applies to the same synthesis. Apply the rules in order. The
+   first rule that matches wins, so every synthesis has exactly one verdict:
    1. `DECISION: Request changes` — `### must-fix` has an entry. A promoted
       `Approach`, `Purpose`, or `Proof` flag already sits in a bucket, so it
       needs no rule of its own.
-   2. `DECISION: Comment` — `### should-fix` has an entry, or Risk is HIGH or
-      CRITICAL. Risk can be HIGH with no finding at all, from the area touched
-      or from panelists that disagreed on the goal; that is still not an
-      approval.
-   3. `DECISION: Approve` — everything else: no finding, or polish only, with
-      Risk LOW or MEDIUM.
+   2. `DECISION: Comment` — `### should-fix` has an entry.
+   3. `DECISION: Approve` — everything else: no finding, or polish only.
 
    This skill posts nothing, so the line says what the review recommends, not
    what happened on the PR. Put no reason on the line; the sections above are
-   the reason. A reader who scrolls to the end gets the answer, and a caller
-   that only reads the last line gets the same one.
+   the reason. A reader who scrolls to the end gets the answer. A caller that
+   reads only the last line gets the same one.
+
+   When another skill drives this one (`auto-review`, `recheck-pr`), that
+   skill's own `DECISION:` line ends the reply. This line then ends the
+   synthesis only, and the two may differ: the panel recommends, the driver
+   reports what it did.
 
    ### Overview
 

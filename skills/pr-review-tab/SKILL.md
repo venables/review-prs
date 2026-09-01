@@ -66,11 +66,11 @@ still do the review and the babysit loop, but there is no tab to close:
 report the decision instead and, in babysit mode, say the loop won't
 self-terminate (press Esc to stop it). Never guess a tab id.
 
-Whatever happened to the tab, end your own reply the way `auto-review` and
-`recheck-pr` end theirs: with their `DECISION:` line, repeated as the last
-line, on its own, with nothing after it except a machine trailer the
-caller's system prompt asks for. A reader of the tab gets one answer at the
-bottom.
+End your report with the `DECISION:` line of the skill that ran,
+`auto-review` or `recheck-pr`. Put it last, on its own. Only a machine
+trailer the caller asks for may follow it. On approval, the close command
+ends the tab, so write the report and its `DECISION:` line before you run
+the close. A reader of the tab gets one answer at the bottom.
 
 ## Arguments
 
@@ -141,8 +141,8 @@ esac
 ```
 
 Closing the tab kills this process — that is intended, and it is the last
-thing you do. Report the approval first (one line) so the outcome is in the
-transcript before the pane goes away.
+thing you do. Report the approval first (one line, then the `DECISION:`
+line) so the outcome is in the transcript before the pane goes away.
 
 ### 4b. Not approved, no `--babysit`
 

@@ -131,10 +131,12 @@ Exit immediately when **both** hold:
 
 There is nothing to adjudicate: no new code, no new argument. Don't rebuild
 the ledger, don't diff, don't re-read the PR, don't reply, don't resolve,
-don't approve. Say it in one line and stop:
+don't approve. Say it in one line, add the decision line, and stop:
 
 ```
 PR #61 — nothing changed since aaaa1111. 2 findings still open.
+
+DECISION: No action
 ```
 
 Name the open count so the user knows the state without asking. If the PR
@@ -365,21 +367,21 @@ author _said_. That line is how the user audits whether your second look
 was real. Same for **Outstanding**: name the specific gap, because the
 author is going to read it and needs to act on it.
 
-The `DECISION:` line is the last line of the reply, on its own, with
-nothing after it except a machine trailer the caller's system prompt asks
-for. The verdict is what actually happened on the PR, one of three fixed
-strings. Apply the rules in order; the first that matches wins:
-1. `DECISION: Approve` — an approving review was submitted.
-2. `DECISION: Comment` — anything else landed on the PR: a reply, a
-   resolved thread, or a new inline comment, with no approval. A head that
-   moved at approval time lands here when step 5 had already replied.
-3. `DECISION: No action` — nothing landed on the PR: the fast path found
-   nothing changed, a gate stopped the pass before anything was posted, or
-   this was a dry run.
+The `DECISION:` line is the last line of the reply, on its own. Nothing
+follows it except a machine trailer the caller's system prompt asks for.
+The verdict is what you did to the PR, one of three fixed strings. Apply the
+rules in order. The first rule that matches wins:
+1. `DECISION: Approve` — you submitted an approving review.
+2. `DECISION: Comment` — you posted something and did not approve: a
+   reply, a resolved thread, or a new inline comment. A head that moved at
+   approval time ends here when step 5 had already replied.
+3. `DECISION: No action` — you posted nothing: the fast path found nothing
+   changed, a stop before step 5 (no prior review in context, a merged or
+   closed PR, a dirty working tree), or a dry run.
 
 Put no reason on the line; the **Approval** line and the ledger above are
-the reason. A reader who scrolls to the end gets the answer, and a caller
-that only reads the last line gets the same one.
+the reason. A reader who scrolls to the end gets the answer. A caller that
+reads only the last line gets the same one.
 
 ## The approval gate
 

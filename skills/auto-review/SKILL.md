@@ -197,27 +197,29 @@ attention), and the **approval decision** — approved (with the body used
 and the PR URL) or not approved (with the specific gate condition that
 failed).
 
-Then end with one line, on its own, and nothing after it except a machine
+Then end with one line, on its own. Nothing follows it except a machine
 trailer the caller's system prompt asks for:
 
 ```
 DECISION: Approve
 ```
 
-The verdict is what actually happened on the PR, one of four fixed strings.
-Apply the rules in order; the first that matches wins:
-1. `DECISION: Approve` — an approving review was submitted.
-2. `DECISION: Request changes` — a blocking review was submitted (only when
+The verdict is what you did to the PR, one of four fixed strings. Apply the
+rules in order. The first rule that matches wins:
+1. `DECISION: Approve` — you submitted an approving review.
+2. `DECISION: Request changes` — you submitted a blocking review (only when
    the user asked for one; see Gotchas).
-3. `DECISION: Comment` — anything else landed on the PR: comments, `+1`s,
-   or replies, with no approval. A coverage gate that failed or a head that
-   moved lands here too, because step 2 had already posted by then.
-4. `DECISION: No action` — nothing landed on the PR: a dry run, a target
-   that is not a PR, or a pass in which every post failed.
+3. `DECISION: Comment` — you posted something and did not approve: a
+   comment, a `+1`, or a reply. A failed coverage gate or a moved head ends
+   here when step 2 posted something. When step 2 posted nothing, rule 4
+   applies.
+4. `DECISION: No action` — you posted nothing: a dry run, a target that is
+   not a PR, a clean panel that failed the coverage gate, or a pass in which
+   every post failed.
 
 Put no reason on the line; the report above is the reason. A reader who
-scrolls to the end gets the answer, and a caller that only reads the last
-line gets the same one. The line is fixed text, like the approval bodies.
+scrolls to the end gets the answer. A caller that reads only the last line
+gets the same one. The line is fixed text, like the approval bodies.
 
 ## The approval gate
 

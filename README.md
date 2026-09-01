@@ -367,10 +367,10 @@ a `--log-dir` — ordinary under cron, where the default hour-long timeout outla
 most intervals — without reading each other's results:
 
 - `pr-N.review.md` — the review as text, which is the one to open. The
-  built-in reviewer ends it with one line, `DECISION: Approve`, `Comment`,
-  `Request changes`, or `No action`: what landed on the PR, or under `--pick`
-  and `--no-post` what the panel recommends. An override writes what it
-  writes
+  built-in reviewer ends it with one of `DECISION: Approve`,
+  `DECISION: Comment`, `DECISION: Request changes`, or `DECISION: No action`:
+  what the reviewer posted to the PR, or under `--pick` and `--no-post` what
+  the panel recommends. An override is not bound to these strings.
 - `pr-N.json` — dash-p's answer (`{"answer": ..., "metadata": ...}`)
 - `pr-N.meta.json` — the metadata envelope (session id, cost, exit status);
   written even when a timeout or interrupt leaves stdout empty
