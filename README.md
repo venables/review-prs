@@ -94,7 +94,7 @@ any directory a run adds. So a copy in either place is the override. Both
 binaries say when that is happening:
 
 ```
-note: auto-review, panel-review under /Users/you/.claude/skills shadow the bundled copies; the installed skills run
+note: auto-review, panel-review under /Users/you/.claude/skills shadow the staged copies; the installed skills run
 ```
 
 `--skills` chooses the source for a run, and both binaries take it (or
