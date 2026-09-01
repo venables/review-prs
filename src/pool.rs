@@ -10,6 +10,7 @@ use crate::report;
 use crate::repo::RepoContext;
 use crate::rundir::RunDir;
 use crate::session::{self, SessionFlag};
+use crate::board::Action;
 use crate::ui::Ui;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -52,8 +53,8 @@ pub fn stop_group(pgid: i32) {
 /// reviews that already finished are still worth reopening -- so hand back
 /// their session ids on the way out rather than dropping them.
 fn interrupt(jobs: &[Job], ui: &mut Ui, rundir: &RunDir) -> ! {
-    // The board first: its tick threads keep repainting until it is torn
-    // down, and would overdraw the interrupt message below.
+    // The board first: it holds the terminal in raw mode, and the message
+    // below must land on a terminal that has been given back.
     ui.end_pass();
     println!();
     eprintln!("interrupted; stopping running reviews");
@@ -244,8 +245,10 @@ pub fn run_pass(
             break;
         }
 
+        // Ten frames a second on a terminal: the tick is what turns the
+        // spinner now, and one turn a second is what a spinner looks like.
         let wait = if ui.tty {
-            Duration::from_millis(200)
+            Duration::from_millis(100)
         } else {
             // Event-driven: sleep to the nearest deadline, or just wait for
             // an exit. The cap keeps a wrong deadline from wedging the loop.
@@ -376,6 +379,13 @@ pub fn run_pass(
             Ok(Event::Signal) => interrupt(&jobs, ui, rundir),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        // With the board up the terminal is in raw mode, so ctrl-C is a key
+        // rather than a signal. Read here, on this thread, after every wake:
+        // the board must never own a reader thread (see src/board.rs).
+        if ui.poll_input().contains(&Action::Stop) {
+            interrupt(&jobs, ui, rundir);
         }
 
         // Trip the guard on anything past its deadline. The job stays Running
