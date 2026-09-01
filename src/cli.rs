@@ -47,7 +47,8 @@ PRs (nothing has changed since you last engaged) are left alone.
                       review is written to <log-dir>/pr-N.review.md, which is
                       also written on an ordinary run. Refused alongside a
                       command override, which decides for itself what it
-                      posts.
+                      posts. The session stays resumable, so a later
+                      --continue run can pick the review up and post it.
   --continue, -C      Resume this machine's earlier review session for a PR
                       (a second look at the findings) instead of reviewing it
                       from scratch. Marked RESUMABLE in the picker.

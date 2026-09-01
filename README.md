@@ -107,8 +107,31 @@ the point.) `--auto` / `-A` still parse —
 an old alias or cron line keeps working — they just name the default now.
 
 It takes the same selection flags as `review-prs` (`--continue`, `--all`,
-`--dependabot`, `--babysit`) plus six of its own: `--pick`, `--jobs`,
-`--timeout`, `--budget`, `--log-dir`, `--max-passes` and `--max-idle`.
+`--dependabot`, `--babysit`) plus nine of its own: `--pick`, `--focus`,
+`--no-post`, `--jobs`, `--timeout`, `--budget`, `--log-dir`, `--max-passes`
+and `--max-idle`.
+
+**`--focus` steers a run.** It reaches every panelist as the reviewer focus:
+
+```sh
+autoreview --focus "be strict about the ledger migration"
+```
+
+Use it for what you care about today. Anything the repo always cares about
+belongs in its `CLAUDE.md`, which the panelists read anyway.
+
+**`--no-post` leaves the PR alone.** No comments, no approval — the reviews go
+to `pr-N.review.md` and the summary says nothing was posted:
+
+```sh
+autoreview --no-post
+```
+
+This works by choosing the reviewer, not by asking one to hold back: the run
+gets the skill that has no posting step. That is also why it is refused
+alongside `$AUTOREVIEW_AUTO_CMD`, which decides for itself what it posts. The
+session stays resumable, so a later `--continue` run can pick the review up
+and post it.
 
 On a terminal the pass is a live board -- finished reviews settle into
 permanent result lines, running ones spin, and a progress bar tracks the
@@ -315,6 +338,7 @@ run and again in the summary. The per-run directory is what lets two runs share
 a `--log-dir` — ordinary under cron, where the default hour-long timeout outlasts
 most intervals — without reading each other's results:
 
+- `pr-N.review.md` — the review as text, which is the one to open
 - `pr-N.json` — dash-p's answer (`{"answer": ..., "metadata": ...}`)
 - `pr-N.meta.json` — the metadata envelope (session id, cost, exit status);
   written even when a timeout or interrupt leaves stdout empty
