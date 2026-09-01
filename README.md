@@ -83,8 +83,8 @@ works.
 ### Skills
 
 The reviewer each agent runs is a set of skills, and they live in this repo
-under [`skills/`](skills). The binaries invoke them by slash name, so the agent
-has to be able to find them. Install them once, for every agent that supports
+under [`skills/`](skills). The binaries invoke them by name, so the agent has
+to be able to find them. Install them once, for every agent that supports
 the [Agent Skills](https://agentskills.io) layout:
 
 ```sh
@@ -97,14 +97,14 @@ Or point a skills directory at the checkout:
 ln -s "$PWD/skills/"* ~/.claude/skills/
 ```
 
-| Skill                                                                       | Run by                                               |
-| --------------------------------------------------------------------------- | ---------------------------------------------------- |
-| [`auto-review`](skills/auto-review)                                         | the default sweep, and `--babysit`                   |
-| [`panel-review`](skills/panel-review)                                       | `--pick`, `--no-post`, and `auto-review`             |
-| [`recheck-pr`](skills/recheck-pr)                                           | `--continue`, and every later babysit pass           |
-| [`auto-post-panel-review-comments`](skills/auto-post-panel-review-comments) | `auto-review`, to post what the panel found          |
-| [`approve-pr`](skills/approve-pr)                                           | `auto-review` and `recheck-pr`, when the gate passes |
-| [`pr-review-tab`](skills/pr-review-tab)                                     | `review-prs --auto`, to close its own tab            |
+| Skill                                                                       | Run by                                                                                         |
+| --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| [`auto-review`](skills/auto-review)                                         | `autoreview` unattended: the sweep, `--babysit`, `--watch`                                     |
+| [`panel-review`](skills/panel-review)                                       | `autoreview --pick`, and `--no-post` (even with `--continue`); the first step of `auto-review` |
+| [`recheck-pr`](skills/recheck-pr)                                           | `autoreview --continue`, and every later `--babysit` or `--watch` pass                         |
+| [`auto-post-panel-review-comments`](skills/auto-post-panel-review-comments) | `auto-review`, to post what the panel found                                                    |
+| [`approve-pr`](skills/approve-pr)                                           | `auto-review` and `recheck-pr`, when the gate passes                                           |
+| [`pr-review-tab`](skills/pr-review-tab)                                     | `review-prs --auto` and `review-prs --babysit`, to close its own tab                           |
 
 They are versioned with the binaries because they change with them: a flag the
 binary passes down is a flag the skill has to understand.
