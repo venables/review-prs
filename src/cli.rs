@@ -464,18 +464,22 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         cmd
     };
 
-    // Checked whenever it is set, flag or env: a value that names no skills
-    // would otherwise surface as a review that found none.
-    let skills = match &skills_raw {
-        Some(raw) => Source::parse(raw).map_err(err)?,
-        None => Source::Bundled,
+    // An override never stages, so a value cannot reach it: say so, and do
+    // not check it, so a stale $AUTOREVIEW_SKILLS in a profile does not fail
+    // a run that would not have read it. For the built-in reviewer the
+    // value is checked here, flag or env, rather than surfacing as a review
+    // that found no skill.
+    let skills = match (&skills_raw, &review_cmd) {
+        (Some(_), Some(_)) => {
+            let which = if unattended { "AUTOREVIEW_AUTO_CMD" } else { "AUTOREVIEW_CMD" };
+            startup_notes.push(format!(
+                "note: --skills is not passed to ${which}; that command finds its own skills"
+            ));
+            Source::Bundled
+        }
+        (Some(raw), None) => Source::parse(raw).map_err(err)?,
+        (None, _) => Source::Bundled,
     };
-    if skills != Source::Bundled && review_cmd.is_some() {
-        let which = if unattended { "AUTOREVIEW_AUTO_CMD" } else { "AUTOREVIEW_CMD" };
-        startup_notes.push(format!(
-            "note: --skills is not passed to ${which}; that command finds its own skills"
-        ));
-    }
 
     // --no-post works by choosing the reviewer, and an override is not ours
     // to choose. Every other flag that cannot reach an override settles for a
@@ -553,6 +557,14 @@ mod tests {
         // fails loudly rather than as a review that found no skill.
         let e = run_env(&[], &[("AUTOREVIEW_SKILLS", "/nowhere/at/all")]).err().unwrap();
         assert!(e.msg.starts_with("error: --skills expects"), "{}", e.msg);
+        // ...unless the run would never have read it.
+        let Ok(Parsed::Run(c)) = run_env(
+            &[],
+            &[("AUTOREVIEW_SKILLS", "/nowhere/at/all"), ("AUTOREVIEW_AUTO_CMD", "my-review")],
+        ) else {
+            panic!("an override run must not fail on a value it cannot use")
+        };
+        assert_eq!(c.skills, Source::Bundled);
     }
 
     #[test]

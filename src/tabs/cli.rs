@@ -138,10 +138,6 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         }
     }
 
-    let skills = match &skills_raw {
-        Some(raw) => Source::parse(raw).map_err(|msg| CliError { msg, show_help: false })?,
-        None => Source::Bundled,
-    };
 
     // Validated only once babysitting is actually on, so an unrelated bad env
     // var never blocks a plain review run.
@@ -170,12 +166,23 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
 
     let unattended = auto || babysit;
     let review_cmd = if unattended { auto_cmd } else { cmd };
-    if skills != Source::Bundled && review_cmd.is_some() {
-        let which = if unattended { "REVIEW_PRS_AUTO_CMD" } else { "REVIEW_PRS_CMD" };
-        startup_notes.push(format!(
-            "note: --skills is not passed to ${which}; that command finds its own skills"
-        ));
-    }
+
+    // An override never stages, so a value cannot reach it: say so, and do
+    // not check it, so a stale $REVIEW_PRS_SKILLS in a profile does not fail
+    // a run that would not have read it.
+    let skills = match (&skills_raw, &review_cmd) {
+        (Some(_), Some(_)) => {
+            let which = if unattended { "REVIEW_PRS_AUTO_CMD" } else { "REVIEW_PRS_CMD" };
+            startup_notes.push(format!(
+                "note: --skills is not passed to ${which}; that command finds its own skills"
+            ));
+            Source::Bundled
+        }
+        (Some(raw), None) => {
+            Source::parse(raw).map_err(|msg| CliError { msg, show_help: false })?
+        }
+        (None, _) => Source::Bundled,
+    };
 
     // Unset and empty mean different things here: an explicitly empty
     // REVIEW_PRS_WORKSPACE= opts out entirely, leaving the workspace you
@@ -262,6 +269,9 @@ mod tests {
             c.startup_notes,
             vec!["note: --skills is not passed to $REVIEW_PRS_CMD; that command finds its own skills"]
         );
+        // A value the run would never read is not checked either.
+        let c = cfg_env(&[], &[("REVIEW_PRS_SKILLS", "/nowhere"), ("REVIEW_PRS_CMD", "my-review")]);
+        assert_eq!(c.skills, Source::Bundled);
     }
 
     #[test]
