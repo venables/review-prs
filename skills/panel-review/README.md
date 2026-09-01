@@ -11,7 +11,7 @@ chase downstream effects in parallel without stepping on each other.
 ## Install
 
 ```bash
-npx skills add venables/skills --skill panel-review
+npx skills add venabots/autoreview --skill panel-review
 ```
 
 ## Requirements
