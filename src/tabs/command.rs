@@ -9,9 +9,9 @@ use crate::session::{PlannedSession, SessionFlag};
 use crate::tabs::cli::Config;
 use std::path::Path;
 
-/// POSIX-safe quoting for the two strings that ride into the tab's shell: the
-/// repo path and the session id. A path with a space or a quote in it has to
-/// reach the tab as one word.
+/// POSIX-safe quoting for the strings that ride into the tab's shell: the
+/// repo path, the staged skills path, and the session id. A path with a
+/// space or a quote in it has to reach the tab as one word.
 pub fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()
         && s.bytes()
@@ -47,25 +47,46 @@ fn builtin_prompt(cfg: &Config, pr: u64, resume: bool) -> String {
     }
 }
 
-/// The built-in claude invocation for one PR: the session flag it was planned
-/// with, and the prompt that goes with it.
-fn builtin_invocation(cfg: &Config, pr: u64, plan: &PlannedSession) -> String {
+/// The built-in claude invocation for one PR: the skills this binary was
+/// built with, the session flag it was planned with, and the prompt that
+/// goes with it. `skills_dir` is where those skills were staged; the tab is
+/// told about it with --add-dir, so it finds them without an install.
+fn builtin_invocation(
+    cfg: &Config,
+    pr: u64,
+    plan: &PlannedSession,
+    skills_dir: Option<&Path>,
+) -> String {
+    // The `=` form, not `--add-dir <dir>`: claude's --add-dir takes every
+    // following argument as another directory, so with no session flag in
+    // between it would eat the prompt.
+    let skills = skills_dir
+        .map(|d| format!("--add-dir={} ", shell_quote(&d.display().to_string())))
+        .unwrap_or_default();
     let flag = match &plan.flag {
         SessionFlag::Pin(id) => format!("--session-id {id} "),
         SessionFlag::Resume(id) => format!("--resume {id} "),
         SessionFlag::None => String::new(),
     };
     format!(
-        "claude --dangerously-skip-permissions {flag}\"{}\"",
+        "claude --dangerously-skip-permissions {skills}{flag}\"{}\"",
         builtin_prompt(cfg, pr, plan.resume)
     )
 }
 
-/// The whole line: cd to the repo root, then review.
-pub fn line(cfg: &Config, pr: u64, plan: &PlannedSession, repo_root: &Path) -> String {
+/// The whole line: cd to the repo root, then review. `skills_dir` is the
+/// staged skills for the built-in command; an override has no use for it,
+/// and the caller does not stage one for it.
+pub fn line(
+    cfg: &Config,
+    pr: u64,
+    plan: &PlannedSession,
+    repo_root: &Path,
+    skills_dir: Option<&Path>,
+) -> String {
     let cd = format!("cd {} &&", shell_quote(&repo_root.display().to_string()));
     match &cfg.review_cmd {
-        None => format!("{cd} {}", builtin_invocation(cfg, pr, plan)),
+        None => format!("{cd} {}", builtin_invocation(cfg, pr, plan, skills_dir)),
         Some(cmd) => {
             // An overridden command owns its own session handling, so hand it
             // the id and let it decide.
@@ -147,20 +168,24 @@ mod tests {
         Path::new("/sandbox/repo")
     }
 
+    fn skills() -> Option<&'static Path> {
+        Some(Path::new("/sandbox/skills"))
+    }
+
     #[test]
     fn a_picker_run_reviews_from_scratch() {
-        let line = line(&cfg(), 9, &fresh(), root());
+        let line = line(&cfg(), 9, &fresh(), root(), skills());
         assert_eq!(
             line,
             format!(
-                "cd /sandbox/repo && claude --dangerously-skip-permissions --session-id {SID} \"panel review 9\""
+                "cd /sandbox/repo && claude --dangerously-skip-permissions --add-dir=/sandbox/skills --session-id {SID} \"panel review 9\""
             )
         );
     }
 
     #[test]
     fn continue_swaps_the_prompt_as_well_as_the_flag() {
-        let line = line(&cfg(), 9, &resumed(), root());
+        let line = line(&cfg(), 9, &resumed(), root(), skills());
         assert!(line.contains(&format!("--resume {SID}")));
         assert!(line.ends_with("\"recheck-pr 9\""));
     }
@@ -169,13 +194,13 @@ mod tests {
     fn an_unattended_run_seeds_the_pr_review_tab_skill() {
         let mut c = cfg();
         c.auto = true;
-        assert!(line(&c, 9, &fresh(), root()).ends_with("\"pr-review-tab 9\""));
-        assert!(line(&c, 9, &resumed(), root()).ends_with("\"pr-review-tab 9 --recheck\""));
+        assert!(line(&c, 9, &fresh(), root(), skills()).ends_with("\"pr-review-tab 9\""));
+        assert!(line(&c, 9, &resumed(), root(), skills()).ends_with("\"pr-review-tab 9 --recheck\""));
 
         c.babysit = Some(interval::normalize("15").unwrap());
-        assert!(line(&c, 9, &fresh(), root()).ends_with("\"pr-review-tab 9 --babysit 15m\""));
+        assert!(line(&c, 9, &fresh(), root(), skills()).ends_with("\"pr-review-tab 9 --babysit 15m\""));
         assert!(
-            line(&c, 9, &resumed(), root()).ends_with("\"pr-review-tab 9 --recheck --babysit 15m\"")
+            line(&c, 9, &resumed(), root(), skills()).ends_with("\"pr-review-tab 9 --recheck --babysit 15m\"")
         );
     }
 
@@ -184,15 +209,17 @@ mod tests {
         // --babysit without --auto is still unattended: the loop outlives you.
         let mut c = cfg();
         c.babysit = Some(interval::normalize("1h").unwrap());
-        assert!(line(&c, 9, &fresh(), root()).ends_with("\"pr-review-tab 9 --babysit 1h\""));
+        assert!(line(&c, 9, &fresh(), root(), skills()).ends_with("\"pr-review-tab 9 --babysit 1h\""));
     }
 
     #[test]
     fn a_planned_session_with_no_flag_sends_none() {
         let plan = planned(SessionFlag::None, false);
-        let line = line(&cfg(), 9, &plan, root());
+        let line = line(&cfg(), 9, &plan, root(), skills());
         assert!(!line.contains("--session-id") && !line.contains("--resume"));
-        assert!(line.contains("claude --dangerously-skip-permissions \"panel review 9\""));
+        // With no session flag the prompt follows --add-dir directly, which is
+        // the case the `=` form exists for.
+        assert!(line.contains("claude --dangerously-skip-permissions --add-dir=/sandbox/skills \"panel review 9\""));
     }
 
     #[test]
@@ -200,19 +227,19 @@ mod tests {
         let mut c = cfg();
         c.review_cmd = Some("my-review".into());
         assert_eq!(
-            line(&c, 9, &fresh(), root()),
+            line(&c, 9, &fresh(), root(), skills()),
             format!(
                 "export REVIEW_PRS_SESSION_ID={SID} REVIEW_PRS_SESSION_RESUME=0; cd /sandbox/repo && my-review 9"
             )
         );
-        assert!(line(&c, 9, &resumed(), root()).contains("REVIEW_PRS_SESSION_RESUME=1"));
+        assert!(line(&c, 9, &resumed(), root(), skills()).contains("REVIEW_PRS_SESSION_RESUME=1"));
     }
 
     #[test]
     fn the_cd_guard_still_covers_a_compound_override() {
         let mut c = cfg();
         c.review_cmd = Some("gh pr checkout {} && my-review {}".into());
-        let line = line(&c, 9, &fresh(), root());
+        let line = line(&c, 9, &fresh(), root(), skills());
         assert!(line.starts_with("export REVIEW_PRS_SESSION_ID="));
         assert!(line.contains("; cd /sandbox/repo && gh pr checkout 9 && my-review 9"));
     }
@@ -225,8 +252,10 @@ mod tests {
         // An empty id is still one (empty) word rather than nothing at all.
         assert_eq!(shell_quote(""), "''");
 
-        let line = line(&cfg(), 9, &fresh(), Path::new("/has space/repo"));
+        let line = line(&cfg(), 9, &fresh(), Path::new("/has space/repo"), Some(Path::new("/tmp dir/skills")));
         assert!(line.starts_with("cd '/has space/repo' &&"));
+        // The skills directory is a temp path, so it gets the same care.
+        assert!(line.contains("--add-dir='/tmp dir/skills' "), "{line}");
     }
 
     #[test]

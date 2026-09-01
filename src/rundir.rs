@@ -80,6 +80,14 @@ impl RunDir {
         Ok(&self.pass_dir)
     }
 
+    /// Where the bundled skills are written for this run, and what every
+    /// reviewer is handed with --add-dir. Once per run, not per pass: the
+    /// skills do not change between passes, and a resumed session is told
+    /// the same directory it started with.
+    pub fn agent_dir(&self) -> PathBuf {
+        self.root.join("agent")
+    }
+
     pub fn stdout_path(&self, pr: u64) -> PathBuf {
         self.pass_dir.join(format!("pr-{pr}.json"))
     }

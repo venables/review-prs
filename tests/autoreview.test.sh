@@ -53,6 +53,43 @@ assert_contains "reviews carry the timeout" \
 assert_contains "a first review pins --session-id" \
   "$(claude_call_for '/auto-review 9')" "--session-id"
 
+# The skills the binary was built with travel with every review, written
+# under the run directory and handed over as one token dash-p forwards.
+assert_contains "reviews are handed the bundled skills" \
+  "$(claude_call_for '/auto-review 9')" "--add-dir="
+staged="$(find "$SANDBOX/out/logs" -path '*/agent/.claude/skills/auto-review/SKILL.md' | head -1)"
+assert_contains "...written under the run directory in the layout an agent reads" \
+  "$staged" "/agent/.claude/skills/auto-review/SKILL.md"
+
+# An installed skill of the same name wins inside claude, so the run says so
+# rather than reviewing with the wrong instructions in silence.
+mkdir -p "$CLAUDE_CONFIG_DIR/skills/auto-review"
+printf -- '---\nname: auto-review\n---\n' >"$CLAUDE_CONFIG_DIR/skills/auto-review/SKILL.md"
+out="$(run_autoreview)"
+assert_contains "an installed skill is reported as shadowing the bundled one" \
+  "$out" "note: auto-review under $CLAUDE_CONFIG_DIR/skills shadow the bundled copies"
+rm "$CLAUDE_CONFIG_DIR/skills/auto-review/SKILL.md"
+# The reviewed repo's own skills win the same way.
+mkdir -p "$SANDBOX/repo/.claude/skills/recheck-pr"
+printf -- '---\nname: recheck-pr\n---\n' >"$SANDBOX/repo/.claude/skills/recheck-pr/SKILL.md"
+out="$(run_autoreview)"
+# The repo path is git's, resolved, so it can differ from $SANDBOX by a
+# /private prefix on macOS; the assertion holds the parts that cannot.
+assert_contains "a repo's own skill is reported as shadowing too" \
+  "$out" "note: recheck-pr under "
+assert_contains "...naming the repo's skills directory" \
+  "$out" "/repo/.claude/skills shadow the bundled copies"
+rm "$SANDBOX/repo/.claude/skills/recheck-pr/SKILL.md"
+out="$(run_autoreview)"
+assert_not_contains "...and nothing is said when nothing shadows" "$out" "shadow the bundled"
+# The staged scripts run as the skills run them: directly.
+staged_script="$(find "$SANDBOX/out/logs" -path '*/agent/.claude/skills/recheck-pr/scripts/fetch_pr_threads.sh' | head -1)"
+if [[ -x "$staged_script" ]]; then
+  ok "staged helper scripts are executable"
+else
+  not_ok "staged helper scripts are executable" "not executable: $staged_script"
+fi
+
 FAKE_GUM_PICK="#9" run_autoreview --pick >/dev/null
 assert_contains "--pick runs the picker, and a panel review on what it chose" \
   "$(claude_calls)" "/panel-review 9"
@@ -196,6 +233,10 @@ assert_contains "an override without {} gets the number appended" \
 assert_contains "an override is handed the session id" "$(override_calls)" "session=$sid9"
 assert_contains "an override is told whether it is resuming" "$(override_calls)" "resume=0"
 assert_equals "an override replaces claude entirely" "$(claude_calls)" ""
+# ...so the bundled skills are not staged for it, and no note claims they
+# are in play.
+assert_equals "an override run stages no skills" \
+  "$(find "$SANDBOX/out/logs" -type d -name agent | wc -l | tr -d ' ')" "0"
 
 AUTOREVIEW_AUTO_CMD='my-review {} --extra {}' run_autoreview --auto >/dev/null
 assert_contains "{} is substituted everywhere" "$(override_calls)" "args=9 --extra 9"
