@@ -16,7 +16,7 @@ You can also drive every part of it by hand.
 ## How a review happens
 
 ```
-autoreview             picks every PR that is NEW or UPDATED
+autoreview             picks every PR that is NEW or UPDATED, once CI passes
   └─ dash-p → claude   one headless agent per PR, --jobs at a time
        └─ /auto-review a panel of models reviews the diff independently,
                        their findings are synthesized, verified, and posted
@@ -96,6 +96,7 @@ autoreview --jobs 3         # ...three at a time (default 2)
 autoreview --pick           # picker, then review each selection headlessly
 autoreview --continue       # resume earlier sessions for a second look
 autoreview --babysit=15     # re-run every 15 min, picking up new PRs as they open
+autoreview --skip-wait-for-ci # review a PR whatever its checks say
 autoreview --help           # usage
 ```
 
@@ -107,7 +108,7 @@ the point.) `--auto` / `-A` still parse —
 an old alias or cron line keeps working — they just name the default now.
 
 It takes the same selection flags as `review-prs` (`--continue`, `--all`,
-`--dependabot`, `--babysit`) plus ten of its own: `--pick`, `--watch`,
+`--dependabot`, `--skip-wait-for-ci`, `--babysit`) plus ten of its own: `--pick`, `--watch`,
 `--focus`, `--no-post`, `--jobs`, `--timeout`, `--budget`, `--log-dir`,
 `--max-passes` and `--max-idle`.
 
@@ -446,6 +447,7 @@ review-prs --babysit=15 # ...every 15 minutes (default 30)
 review-prs --continue   # resume an earlier review session instead of starting over
 review-prs --all        # also include PRs already marked APPROVED
 review-prs --dependabot # also include Dependabot PRs (shown dimmed)
+review-prs --auto --skip-wait-for-ci # fan out a PR whatever its checks say
 review-prs --help       # usage
 ```
 
@@ -490,8 +492,10 @@ wire up resumption however it likes.
 `--auto` skips the picker entirely: it fans out **every `NEW` and `UPDATED` PR**
 (the actionable ones) and runs an auto-review command in each tab. `SEEN` PRs
 are skipped on purpose — nothing has changed since you last engaged, so there's
-no reason to re-review them. Combine with `--all` / `--dependabot` to widen the
-set.
+no reason to re-review them. A PR whose checks have not passed is held, and
+pending checks are waited for before the tabs open (see
+[Waiting for CI](#waiting-for-ci)). Combine with `--all` / `--dependabot` to
+widen the set, and `--skip-wait-for-ci` to fan out regardless of checks.
 
 The per-tab command is `REVIEW_PRS_AUTO_CMD` (same `{}`/append substitution as
 `REVIEW_PRS_CMD`), defaulting to the
@@ -603,18 +607,53 @@ spawn time would be overwritten by the review command within seconds.
 1. List the current repo's open, non-draft PRs (via the GitHub GraphQL API).
 2. Annotate each with an engagement badge, a review-state flag, and a relative
    "last activity" time, then sort the most actionable to the top.
-3. Take every `NEW` and `UPDATED` PR, or let you multi-select with
-   [gum](https://github.com/charmbracelet/gum).
+3. Take every `NEW` and `UPDATED` PR whose checks have passed, or let you
+   multi-select with [gum](https://github.com/charmbracelet/gum).
 
 Then they diverge: `review-prs` opens a terminal tab per PR and runs the
 [review command](#the-review-command) in it; `autoreview` runs a headless
 subprocess per PR instead. `panel` does none of this — it takes one diff and
 asks several models about it.
 
+### Waiting for CI
+
+A PR opened a minute ago has its linter still running, and a review of code the
+author is about to fix is a review wasted. So the sweep reads the checks on
+each PR's head commit (from the same GraphQL call, so nothing extra is fetched)
+and **holds a PR until they pass**:
+
+- **Pending** checks are waited for. A one-shot run — `autoreview`,
+  `autoreview --babysit`, `review-prs --auto` — has no next poll, so it waits
+  right there, polling every 30 seconds for up to 30 minutes
+  (`$AUTOREVIEW_CI_WAIT` / `$REVIEW_PRS_CI_WAIT`, in the `--babysit` shapes:
+  `45`, `1h`). The wait is announced, counted up on the spinner, and a PR
+  still pending at the limit is held rather than reviewed.
+- **Failing** checks hold the PR with no wait: failing is settled, and the
+  author's next push is what changes it. The run says which PRs it is holding
+  and why.
+- A `--watch` run, and the refresh between `--babysit` passes, never wait: they
+  look again on their next poll, and a held PR joins the queue the moment its
+  checks go green. A loop names a held PR once per state, not once per poll.
+  A `--babysit` run that finds only held PRs keeps checking on its interval,
+  within `--max-idle`, rather than exiting with nothing reviewed.
+- The wait tolerates a refresh that fails, up to three in a row, and is
+  bounded by the limit either way. The limit is validated only by a run that
+  will wait, so a bad value in a shell profile does not refuse a `--watch` run
+  or the picker.
+- A PR with **no checks at all** is never held. A repo without CI is not a
+  repo that waits for ever.
+
+`--skip-wait-for-ci` turns all of this off and reviews whatever the checks
+say. The picker never holds a pick — it shows the checks in a
+[CI column](#ci) so you choose knowing, and reviews what you chose. A loop
+after a pick (`--pick --babysit`, `--pick --watch`) holds like any loop on its
+later polls: a picked PR that is pushed to is reviewed again once its checks
+pass.
+
 ## Columns
 
 ```
-#NUM   ENGAGEMENT   REVIEW   SESSION   TIME   AUTHOR   TITLE
+#NUM   ENGAGEMENT   REVIEW   CI   SESSION   TIME   AUTHOR   TITLE
 ```
 
 ### Engagement
@@ -636,6 +675,18 @@ The PR's overall review decision:
 | `CHANGES`  | Reviewers requested changes (`CHANGES_REQUESTED`).            |
 | `APPROVED` | Already approved. Hidden by default; shown only with `--all`. |
 | `-`        | No decision yet.                                              |
+
+### CI
+
+The checks on the PR's head commit, which decide whether the sweep reviews it
+now (see [Waiting for CI](#waiting-for-ci)):
+
+| Flag      | Meaning                                                     |
+| --------- | ----------------------------------------------------------- |
+| `PASSING` | Every check passed. The sweep reviews it.                   |
+| `PENDING` | Checks still running. The sweep waits for them.             |
+| `FAILING` | A check failed or errored. The sweep holds it until a push. |
+| `-`       | No checks on this commit. Never held.                       |
 
 ### Session
 
@@ -718,6 +769,7 @@ src/lib.rs         the shared core all three binaries are built on
 src/bin/           the three entry points: review-prs, autoreview, panel
 
 src/prlist.rs      the GraphQL query, engagement ranking, the sweep
+src/ci.rs          the head commit's checks, and the wait for them
 src/picker.rs      the gum picker
 src/select.rs      fetch, rank, then sweep or pick
 src/session.rs     derived session ids, and how a PR attaches to one
