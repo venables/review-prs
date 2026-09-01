@@ -89,8 +89,9 @@ with `--add-dir`. Nothing is installed, and the skill a review ran is the one
 the binary was built with.
 
 Skills you install yourself still win. Claude Code resolves a name from your
-own skills directory before any directory a run adds, so a copy you put in
-`~/.claude/skills` is the override. Both binaries say when that is happening:
+own skills directory, and from the reviewed repo's `.claude/skills`, before
+any directory a run adds. So a copy in either place is the override. Both
+binaries say when that is happening:
 
 ```
 note: auto-review, panel-review under /Users/you/.claude/skills shadow the bundled copies; the installed skills run
