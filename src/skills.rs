@@ -145,6 +145,11 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
     for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
         let entry = entry?;
+        // A skill installed by git clone carries its history; the agent
+        // has no use for it, and it can outweigh the skill many times over.
+        if entry.file_name() == ".git" {
+            continue;
+        }
         let path = entry.path();
         let dest = to.join(entry.file_name());
         // is_dir follows a link; file_type() would report the link itself.
@@ -368,8 +373,9 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        std::fs::create_dir_all(dir.join("approve-pr")).unwrap();
+        std::fs::create_dir_all(dir.join("approve-pr/.git/objects")).unwrap();
         std::fs::write(dir.join("approve-pr/SKILL.md"), "").unwrap();
+        std::fs::write(dir.join("approve-pr/.git/HEAD"), "").unwrap();
         // Not a skill: no SKILL.md. Must not be staged either.
         std::fs::create_dir_all(dir.join("notes")).unwrap();
         std::fs::write(dir.join("notes/README.md"), "").unwrap();
@@ -416,6 +422,8 @@ mod tests {
         // nothing beside the skills comes along either.
         assert!(!skills.join("auto-review").exists());
         assert!(!skills.join("notes").exists());
+        // Nor a skill's own git history.
+        assert!(!skills.join("approve-pr/.git").exists());
         let mode = std::fs::metadata(skills.join("my-review/scripts/helper.sh"))
             .unwrap()
             .permissions()
