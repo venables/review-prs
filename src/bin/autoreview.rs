@@ -165,7 +165,8 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // Every reviewer this run spawns is handed this directory. Written
     // before the first pass so a failure is the run's, not one review's.
     skills::stage(&rundir.agent_dir())?;
-    if let Some(note) = skills::shadow_note(&session::user_skills_dir()) {
+    let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
+    if let Some(note) = skills::shadow_note(&shadowing) {
         eprintln!("{note}");
     }
     let (tx, rx) = std::sync::mpsc::channel();

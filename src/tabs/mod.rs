@@ -62,7 +62,8 @@ pub fn run(cfg: &Config) -> Result<i32> {
         &std::env::temp_dir(),
         "review-prs-skills.",
     )?)?;
-    if let Some(note) = skills::shadow_note(&session::user_skills_dir()) {
+    let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
+    if let Some(note) = skills::shadow_note(&shadowing) {
         eprintln!("{note}");
     }
 

@@ -69,8 +69,22 @@ out="$(run_autoreview)"
 assert_contains "an installed skill is reported as shadowing the bundled one" \
   "$out" "note: auto-review under $CLAUDE_CONFIG_DIR/skills shadow the bundled copies"
 rm "$CLAUDE_CONFIG_DIR/skills/auto-review/SKILL.md"
+# The reviewed repo's own skills win the same way.
+mkdir -p "$SANDBOX/repo/.claude/skills/recheck-pr"
+printf -- '---\nname: recheck-pr\n---\n' >"$SANDBOX/repo/.claude/skills/recheck-pr/SKILL.md"
+out="$(run_autoreview)"
+assert_contains "a repo's own skill is reported as shadowing too" \
+  "$out" "note: recheck-pr under $SANDBOX/repo/.claude/skills shadow the bundled copies"
+rm "$SANDBOX/repo/.claude/skills/recheck-pr/SKILL.md"
 out="$(run_autoreview)"
 assert_not_contains "...and nothing is said when nothing shadows" "$out" "shadow the bundled"
+# The staged scripts run as the skills run them: directly.
+staged_script="$(find "$SANDBOX/out/logs" -path '*/agent/.claude/skills/recheck-pr/scripts/fetch_pr_threads.sh' | head -1)"
+if [[ -x "$staged_script" ]]; then
+  ok "staged helper scripts are executable"
+else
+  not_ok "staged helper scripts are executable" "not executable: $staged_script"
+fi
 
 FAKE_GUM_PICK="#9" run_autoreview --pick >/dev/null
 assert_contains "--pick runs the picker, and a panel review on what it chose" \

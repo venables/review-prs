@@ -45,8 +45,9 @@ pub fn projects_dir() -> PathBuf {
     config_dir().join("projects")
 }
 
-/// Where the user's own skills live. A name found here beats the same name
-/// in any directory the agent is handed with --add-dir.
+/// Where the user's own skills live. A name found here, or under the
+/// reviewed repo's own .claude/skills, beats the same name in any directory
+/// the agent is handed with --add-dir.
 pub fn user_skills_dir() -> PathBuf {
     config_dir().join("skills")
 }
