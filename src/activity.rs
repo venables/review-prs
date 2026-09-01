@@ -54,6 +54,12 @@ enum Source {
 #[derive(Debug)]
 pub struct Tail {
     source: Source,
+    /// Start at the end of the file when it is first seen. A resumed
+    /// session's transcript already holds every earlier pass, which `since`
+    /// would filter out one parsed line at a time; skipping it is the
+    /// difference between one stat and re-reading the history on every
+    /// pass of a run that lasts all day.
+    from_end: bool,
     offset: u64,
     /// The bytes after the last newline read: a line the writer had not
     /// finished when the poll happened.
@@ -69,7 +75,24 @@ pub struct Tail {
 
 impl Tail {
     fn new(source: Source, since: i64) -> Tail {
-        Tail { source, offset: 0, partial: String::new(), since, events: VecDeque::new(), turns: 0, tool_calls: 0 }
+        Tail {
+            source,
+            from_end: false,
+            offset: 0,
+            partial: String::new(),
+            since,
+            events: VecDeque::new(),
+            turns: 0,
+            tool_calls: 0,
+        }
+    }
+
+    /// Follow from the end of the file as it is when first seen, not from
+    /// its start. For a session that existed before this run: what was
+    /// written before is another pass's review.
+    pub fn from_end(mut self) -> Tail {
+        self.from_end = true;
+        self
     }
 
     /// A review with nothing to follow: an override reviewer, or a session
@@ -157,6 +180,14 @@ impl Tail {
         };
         let Ok(meta) = std::fs::metadata(&path) else { return };
         let len = meta.len();
+        if self.from_end {
+            // Seen for the first time: everything in it so far is history.
+            // A line the writer is in the middle of reads as a fragment
+            // that parses as nothing, which is what a fragment should be.
+            self.from_end = false;
+            self.offset = len;
+            return;
+        }
         if len < self.offset {
             // Shorter than last time: a new file under the same name. Start
             // over rather than read from the middle of a line.
@@ -444,6 +475,27 @@ mod tests {
         std::io::Write::write_all(&mut f, format!("{}\n", assistant(AT, tool("Grep", serde_json::json!({"pattern": "x"})))).as_bytes()).unwrap();
         tail.poll();
         assert_eq!(tail.events.len(), 2);
+        assert_eq!(tail.current_tool(), Some("Grep"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resumed_transcript_is_followed_from_its_end() {
+        let dir = std::env::temp_dir().join(format!("ar-activity-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        // Two passes of history, written before this run started.
+        let old = assistant("2026-09-01T10:00:00.000Z", tool("Read", serde_json::json!({"file_path": "old.rs"})));
+        std::fs::write(&path, format!("{old}\n{old}\n")).unwrap();
+        let mut tail = Tail::transcript_at(path.clone(), 0).from_end();
+        tail.poll();
+        assert!(tail.events.is_empty(), "history is skipped, not parsed");
+        assert!(tail.found());
+        // What this run writes is read as it lands.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, format!("{}\n", assistant(AT, tool("Grep", serde_json::json!({"pattern": "new"})))).as_bytes()).unwrap();
+        tail.poll();
+        assert_eq!(tail.events.len(), 1);
         assert_eq!(tail.current_tool(), Some("Grep"));
         let _ = std::fs::remove_dir_all(&dir);
     }

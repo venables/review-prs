@@ -140,6 +140,9 @@ fn follow(job: &Job, is_override: bool, rundir: &RunDir) -> Tail {
         return Tail::plain(rundir.log_path(job.pr));
     }
     match &job.sid {
+        // A resumed session's transcript already holds every earlier pass;
+        // this run's activity starts at its end.
+        Some(sid) if job.resume => Tail::transcript(sid.clone(), job.started_epoch).from_end(),
         Some(sid) => Tail::transcript(sid.clone(), job.started_epoch),
         None => Tail::silent("claude named this session itself; its transcript is found when the review ends"),
     }

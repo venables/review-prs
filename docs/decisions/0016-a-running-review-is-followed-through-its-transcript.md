@@ -34,6 +34,9 @@ parsed, with a partial last line kept for the next poll.
 - Only assistant lines count. A tool call becomes `Bash cargo test --quiet`,
   a text block its first line; thinking is skipped. Entries older than the
   job's start belong to the review being resumed, not this run.
+- A resumed session's transcript is followed from its end as first seen.
+  The history it holds is skipped, not read and filtered, so a babysit run
+  that resumes the same session all day never re-parses it.
 - Summaries take the part of a tool's input a reader wants: a command's
   description or first line, a file's basename, a pattern, a skill's name.
   Every summary passes through the same display sanitizer as a PR title.
