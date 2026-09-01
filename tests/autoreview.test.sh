@@ -772,6 +772,154 @@ assert_contains "...and says which variable is in the way" \
 # override ran. Emptiness is the thing being claimed.
 assert_equals "...and runs nothing" "$(override_calls)" ""
 
+# --- A PR whose checks are still running is waited for --------------------
+# A one-shot run has no next poll, so it waits here: the first fetch sees #9
+# pending, the run says so and sleeps a poll (30s of wall clock, the one poll
+# this test costs), the fixture turns green meanwhile, and the refetch lets the
+# sweep through. Both PRs are then reviewed in the same pass.
+default_prs
+set_ci 9 PENDING
+reset_spawn_log
+rm -rf "$SANDBOX/out/logs"
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+waited=0
+while [[ "$waited" -lt 100 ]]; do
+  grep -q "waiting for CI on #9" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+reviewed_early="$(claude_calls)"
+set_ci 9 SUCCESS
+waited=0
+while [[ "$waited" -lt 900 ]]; do
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+if kill -0 "$bg" 2>/dev/null; then
+  pkill -P "$bg" >/dev/null 2>&1 || true
+  kill "$bg" >/dev/null 2>&1 || true
+  wait_status="timeout"
+else
+  wait "$bg"
+  wait_status=$?
+fi
+out="$(cat "$SANDBOX/out/bg")"
+assert_contains "a pending check is waited for, and the wait is announced" \
+  "$out" "waiting for CI on #9 (up to 30m)"
+assert_equals "...and nothing is reviewed while it waits" "$reviewed_early" ""
+assert_equals "...then the run finishes on its own" "$wait_status" "0"
+assert_contains "...reviewing the PR once its checks pass" "$(claude_calls)" "/auto-review 9"
+assert_contains "...alongside the one that was green all along" "$(claude_calls)" "/auto-review 8"
+assert_not_contains "...with nothing held" "$out" "holding"
+
+# --- Failing checks hold a PR without a wait ------------------------------
+default_prs
+set_ci 9 FAILURE
+out="$(run_autoreview --auto)"
+assert_equals "a run with a held PR still exits 0" "$(last_status)" "0"
+assert_contains "failing checks hold the PR" \
+  "$out" "holding 1 PR until CI passes: #9 (failing); --skip-wait-for-ci reviews it anyway"
+assert_not_contains "...without waiting, since failing is settled" "$out" "waiting for CI"
+assert_not_contains "...and it is not reviewed" "$(claude_calls)" "/auto-review 9"
+assert_contains "...while the green one is" "$(claude_calls)" "/auto-review 8"
+
+set_ci 8 FAILURE
+out="$(run_autoreview --auto)"
+assert_equals "everything held is nothing to do, not an error" "$(last_status)" "0"
+assert_contains "...and says so" "$out" "no NEW or UPDATED PRs to review"
+assert_contains "...after naming what it held" "$out" "holding 2 PRs until CI passes"
+
+out="$(run_autoreview --auto --skip-wait-for-ci)"
+assert_contains "--skip-wait-for-ci reviews red PRs" "$(claude_calls)" "/auto-review 9"
+assert_not_contains "...and holds nothing" "$out" "holding"
+
+# --- A babysit run with only held PRs keeps checking ----------------------
+# Failing is settled, so there is no wait; but a babysit run is meant to pick
+# up PRs as they become reviewable, and exiting "nothing to review" on a repo
+# whose PRs are red would leave them for the next cron run. It keeps looking
+# on its interval, bounded by --max-idle like any quiet PR.
+default_prs
+set_ci 9 FAILURE
+set_ci 8 FAILURE
+out="$(run_autoreview_until "next check in" 20 --auto --babysit=1)"
+assert_contains "a babysit run holds red PRs rather than exiting" \
+  "$out" "holding 2 PRs until CI passes: #9 (failing) #8 (failing)"
+assert_contains "...and keeps checking, saying what it waits on" \
+  "$out" "next check in 1m (2 PRs held for CI)"
+assert_not_contains "...rather than concluding it is done" "$out" "nothing left to babysit"
+holds="$(printf '%s\n' "$out" | grep -c "holding 2 PRs" || true)"
+assert_equals "...naming the hold once across selection and refresh" "$holds" "1"
+
+# --- A held watch PR joins the queue when its checks pass -----------------
+# The README's central claim for the loop: held is not dropped. #9 is pending
+# at the start, so the sweep holds it and reviews #8; the fixture turns green
+# during the first interval, and the next poll picks #9 up as new work. Costs
+# a minute of wall clock, like the other join test: one poll has to elapse.
+default_prs
+set_ci 9 PENDING
+reset_spawn_log
+rm -rf "$SANDBOX/out/logs"
+: >"$SANDBOX/out/bg"
+( cd "$SANDBOX/repo" && FAKE_GH_APPROVED="8" "$AUTOREVIEW" \
+    --log-dir "$SANDBOX/out/logs" --auto --watch=1 >"$SANDBOX/out/bg" 2>&1 ) &
+bg=$!
+waited=0
+while [[ "$waited" -lt 600 ]]; do
+  grep -q "next check in" "$SANDBOX/out/bg" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+set_ci 9 SUCCESS
+# The review lands in pass 2, whatever prompt it takes: a later pass resumes
+# a session where one exists, and earlier tests in this sandbox left #9 one.
+waited=0
+while [[ "$waited" -lt 1800 ]]; do
+  grep -q -- "pass-2/pr-9.meta.json" "$CLAUDE_LOG" 2>/dev/null && break
+  kill -0 "$bg" 2>/dev/null || break
+  sleep 0.1
+  waited=$((waited + 1))
+done
+pkill -P "$bg" >/dev/null 2>&1 || true
+kill "$bg" >/dev/null 2>&1 || true
+wait "$bg" 2>/dev/null || true
+out="$(cat "$SANDBOX/out/bg")"
+assert_contains "a watch run holds the pending PR at the start" \
+  "$out" "holding 1 PR until CI passes: #9 (pending)"
+assert_contains "...and picks it up once its checks pass" "$out" "joined the queue: #9"
+assert_contains "...reviewing it in a second pass without a restart" \
+  "$(claude_calls)" "pass-2/pr-9.meta.json"
+assert_not_contains "...and not before" "$(claude_calls)" "pass-1/pr-9.meta.json"
+
+# --- A watch run holds without waiting, and says so once ------------------
+# The loop looks again in a minute anyway, so a one-shot wait would only delay
+# the PRs that are ready. The held PR is named at the selection and not again
+# on the first refresh: once per PR and state, or the log fills with it.
+default_prs
+set_ci 9 PENDING
+out="$(run_autoreview_until "next check in" 20 --auto --watch=1)"
+assert_contains "a watch run holds a pending PR" \
+  "$out" "holding 1 PR until CI passes: #9 (pending)"
+assert_not_contains "...without waiting on it" "$out" "waiting for CI"
+assert_contains "...and reviews the green one now" "$(claude_calls)" "/auto-review 8"
+assert_not_contains "...but not the held one" "$(claude_calls)" "/auto-review 9"
+holds="$(printf '%s\n' "$out" | grep -c "holding 1 PR" || true)"
+assert_equals "...naming the hold once, not once per poll" "$holds" "1"
+
+# --- The flag is documented ----------------------------------------------
+out="$(run_autoreview --help)"
+assert_contains "--help names --skip-wait-for-ci" "$out" "--skip-wait-for-ci"
+assert_contains "...and the wait it turns off" "$out" "AUTOREVIEW_CI_WAIT"
+out="$(AUTOREVIEW_CI_WAIT=soon run_autoreview --auto)"
+assert_equals "a bad CI wait is refused" "$(last_status)" "1"
+assert_contains "...by name" "$out" "invalid CI wait interval"
+default_prs
+
 # --- Nothing to do --------------------------------------------------------
 echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}' >"$SANDBOX/fixtures/prs.json"
 out="$(run_autoreview --auto)"
