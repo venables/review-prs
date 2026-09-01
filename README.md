@@ -788,6 +788,11 @@ paid for by the time it starts.
 bash tests/run.sh
 ```
 
+`AGENTS.md` holds the rules for working in this repo, for people and for
+coding agents alike (`CLAUDE.md` points at it). The design decisions behind
+the code, and what each one rules out, are one file each under
+[`docs/decisions/`](docs/decisions). A PR that decides something adds one.
+
 ### Layout
 
 One crate, one library, two binaries:
