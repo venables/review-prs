@@ -58,9 +58,9 @@ pub struct Panelist {
 /// test suite logs each reviewer call on a single line.
 pub const TRAILER_INSTRUCTION: &str = "When your reply concludes a PR review task, end it with a fenced code block tagged autoreview containing exactly one JSON object shaped like {\"decision\":\"approved|commented|changes-requested|none\",\"risk\":\"LOW|MEDIUM|HIGH|CRITICAL\",\"findings\":{\"must_fix\":0,\"should_fix\":0,\"polish\":0},\"panel\":[{\"name\":\"codex\",\"model\":\"gpt-5.5\",\"ok\":true,\"findings\":2,\"top\":\"MEDIUM\"}]}. decision is what actually happened on the PR: approved = an approving review was submitted, commented = findings were posted without approval, changes-requested = a blocking review was submitted, none = nothing landed on the PR. risk and findings come from the synthesized review. panel lists every launched panelist with its self-reported model, whether it returned a verdict (ok), its finding count, and its top severity. Use null for anything unknown. No prose inside the block.";
 
-/// The trailer out of the reviewer's stdout envelope (dash-p's
-/// {"answer": ...}). The last fenced block wins: a review that quotes an
-/// earlier block is reporting the newer state.
+/// The trailer the summary reads: from the session transcript when there is
+/// one, and from dash-p's stdout envelope otherwise. The last fenced block
+/// wins: a review that quotes an earlier block is reporting the newer state.
 pub fn read_trailer(
     stdout_path: &std::path::Path,
     transcript: Option<&std::path::Path>,
@@ -102,10 +102,13 @@ pub fn read_review(
 /// alternative is no review file at all for those runs.
 fn read_answer(stdout_path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(stdout_path).ok()?;
-    match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(envelope) => envelope.get("answer")?.as_str().map(str::to_string),
-        Err(_) => (!raw.trim().is_empty()).then(|| raw.trim().to_string()),
-    }
+    let answer = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("answer").and_then(|a| a.as_str()).map(str::to_string));
+    // Anything that is not dash-p's envelope -- an override's prose, or its
+    // own JSON with no "answer" in it -- is the review, because that is what
+    // the override printed.
+    answer.or_else(|| (!raw.trim().is_empty()).then(|| raw.trim().to_string()))
 }
 
 /// A transcript timestamp as an epoch second.
@@ -179,23 +182,35 @@ fn read_transcript(path: &std::path::Path, since: i64) -> Option<String> {
 /// to come last left the raw JSON sitting in the middle of the file, which is
 /// the shape the sign-off bug produces. What follows the block is kept.
 fn strip_trailer(answer: &str) -> String {
-    let mut search_end = answer.len();
-    while let Some(start) = answer[..search_end].rfind("```autoreview") {
-        let body = &answer[start + "```autoreview".len()..];
+    let mut text = answer.to_string();
+    // Every one of them: a joined transcript can hold a block per pass, and
+    // leaving the earlier ones is the same raw JSON in the same file.
+    while let Some(next) = strip_one_trailer(&text) {
+        text = next;
+    }
+    text
+}
+
+/// The text without its last parseable trailer block, or None when it has no
+/// such block left.
+fn strip_one_trailer(text: &str) -> Option<String> {
+    let mut search_end = text.len();
+    while let Some(start) = text[..search_end].rfind("```autoreview") {
+        let body = &text[start + "```autoreview".len()..];
         if let Some(end) = body.find("```")
             && serde_json::from_str::<Trailer>(body[..end].trim()).is_ok()
         {
-            let before = answer[..start].trim_end();
+            let before = text[..start].trim_end();
             let after = body[end + "```".len()..].trim();
-            return if after.is_empty() {
+            return Some(if after.is_empty() {
                 before.to_string()
             } else {
                 format!("{before}\n\n{after}")
-            };
+            });
         }
         search_end = start;
     }
-    answer.to_string()
+    None
 }
 
 pub fn parse_trailer(answer: &str) -> Option<Trailer> {
@@ -468,6 +483,26 @@ mod tests {
         assert!(out.contains("The script exited cleanly."), "and what came after");
         assert!(!out.contains("autoreview"), "but not the block: {out:?}");
         assert!(!out.contains("decision"), "and none of its json");
+
+        // A resumed session's transcript holds one block per pass. Removing
+        // only the last would leave the earlier ones as raw JSON.
+        let two = "First pass.\n\n```autoreview\n{\"decision\":\"none\"}\n```\n\nSecond pass.\n\n```autoreview\n{\"decision\":\"approved\"}\n```";
+        let out = strip_trailer(two);
+        assert!(out.contains("First pass.") && out.contains("Second pass."));
+        assert!(!out.contains("autoreview"), "neither block survives: {out:?}");
+    }
+
+    #[test]
+    fn an_override_that_prints_json_still_gets_a_review_file() {
+        // Valid JSON that is not dash-p's envelope is still the override's
+        // own output, so it is the review.
+        let dir = std::env::temp_dir().join(format!("ar-ovrj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pr-9.json");
+        let body = r#"{"result":"my reviewer speaks json"}"#;
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(read_review(&path, None, 0).unwrap(), body);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
