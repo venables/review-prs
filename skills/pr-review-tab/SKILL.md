@@ -164,8 +164,8 @@ closes the tab on approval:
 ```
 /loop <interval> Re-check PR <N> with the recheck-pr skill against the
 auto-review already in this session's context. recheck-pr's fast path makes
-a no-change cycle cheap: if nothing was pushed, it reports one line and
-waits for the next wakeup. If the author has pushed and recheck-pr's gate
+a no-change cycle cheap: if nothing was pushed, it reports a status line
+and its `DECISION:` line, then waits for the next wakeup. If the author has pushed and recheck-pr's gate
 passes so you approve the PR, close this review tab — `herdr tab close
 "$HERDR_TAB_ID"` under Herdr, else `cmux close-surface --surface
 "$CMUX_SURFACE_ID"` — which ends the loop.
@@ -199,7 +199,7 @@ Then stop and let the wakeups run. Notes that matter:
   worst possible trade.
 - **Report before you close.** The close kills the pane; if the only record
   of the decision was going to be on screen, it's gone. Emit the one-line
-  outcome first.
+  outcome and the `DECISION:` line first.
 - **Babysit loops in-session for a reason.** `recheck-pr` needs the prior
   review in context. Don't restructure this to spawn a fresh review each
   cycle — you'd lose the baseline and turn every wakeup into a full

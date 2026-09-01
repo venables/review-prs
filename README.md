@@ -369,8 +369,9 @@ most intervals — without reading each other's results:
 - `pr-N.review.md` — the review as text, which is the one to open. The
   built-in reviewer ends it with one of `DECISION: Approve`,
   `DECISION: Comment`, `DECISION: Request changes`, or `DECISION: No action`:
-  what the reviewer posted to the PR, or under `--pick` and `--no-post` what
-  the panel recommends. An override is not bound to these strings.
+  what the reviewer did to the PR, or what the panel recommends when the
+  reviewer was `panel-review` (`--no-post`, or a first review under `--pick`).
+  An override is not bound to these strings.
 - `pr-N.json` — dash-p's answer (`{"answer": ..., "metadata": ...}`)
 - `pr-N.meta.json` — the metadata envelope (session id, cost, exit status);
   written even when a timeout or interrupt leaves stdout empty

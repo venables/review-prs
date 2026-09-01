@@ -140,9 +140,10 @@ DECISION: No action
 ```
 
 Name the open count so the user knows the state without asking. If the PR
-was already fully satisfied at `OLD` but you never approved it, say that
-instead (`nothing changed; 0 open — rerun with approval intent to stamp it`)
-rather than silently approving off a stale read.
+was already fully satisfied at `OLD` but you never approved it, put that
+on the first line instead (`nothing changed; 0 open — rerun with approval
+intent to stamp it`) rather than silently approving off a stale read. The
+`DECISION: No action` line stays.
 
 Anything else — a push (`NEW != OLD`), or a reply you haven't adjudicated —
 means there's real work, so fall through to the full pass below.
@@ -374,14 +375,17 @@ rules in order. The first rule that matches wins:
 1. `DECISION: Approve` — you submitted an approving review.
 2. `DECISION: Comment` — you posted something and did not approve: a
    reply, a resolved thread, or a new inline comment. A head that moved at
-   approval time ends here when step 5 had already replied.
+   approval time ends here when step 5 had already replied or resolved a
+   thread.
 3. `DECISION: No action` — you posted nothing: the fast path found nothing
    changed, a stop before step 5 (no prior review in context, a merged or
    closed PR, a dirty working tree), or a dry run.
 
 Put no reason on the line; the **Approval** line and the ledger above are
 the reason. A reader who scrolls to the end gets the answer. A caller that
-reads only the last line gets the same one.
+reads only the last line gets the same one. When `pr-review-tab` drives
+this skill, the tab's one-line outcome goes above the line, and the line
+stays last.
 
 ## The approval gate
 

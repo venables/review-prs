@@ -81,8 +81,9 @@ needed (this is gate condition #7 below).
 
 If the review ends up running against a non-PR target (`--uncommitted`,
 `--base`, a bare `--commit` with no PR), there's nothing to post to or
-approve: run the review, report its synthesis, and stop — note that
-posting/approval were skipped because the target isn't a PR.
+approve: run the review, report its synthesis, note that posting and
+approval were skipped because the target isn't a PR, write
+`DECISION: No action`, and stop.
 
 Pass the user's `panel-review` options through (panelist selection,
 `--focus`, deep mode if they asked for a "deep auto-review"). Default to
@@ -219,7 +220,9 @@ rules in order. The first rule that matches wins:
 
 Put no reason on the line; the report above is the reason. A reader who
 scrolls to the end gets the answer. A caller that reads only the last line
-gets the same one. The line is fixed text, like the approval bodies.
+gets the same one. The line is fixed text, like the approval bodies. When
+`pr-review-tab` drives this skill, the tab's one-line outcome goes above
+the line, and the line stays last.
 
 ## The approval gate
 
