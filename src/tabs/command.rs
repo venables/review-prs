@@ -51,26 +51,38 @@ fn builtin_prompt(cfg: &Config, pr: u64, resume: bool) -> String {
 /// built with, the session flag it was planned with, and the prompt that
 /// goes with it. `skills_dir` is where those skills were staged; the tab is
 /// told about it with --add-dir, so it finds them without an install.
-fn builtin_invocation(cfg: &Config, pr: u64, plan: &PlannedSession, skills_dir: &Path) -> String {
+fn builtin_invocation(
+    cfg: &Config,
+    pr: u64,
+    plan: &PlannedSession,
+    skills_dir: Option<&Path>,
+) -> String {
+    // The `=` form, not `--add-dir <dir>`: claude's --add-dir takes every
+    // following argument as another directory, so with no session flag in
+    // between it would eat the prompt.
+    let skills = skills_dir
+        .map(|d| format!("--add-dir={} ", shell_quote(&d.display().to_string())))
+        .unwrap_or_default();
     let flag = match &plan.flag {
         SessionFlag::Pin(id) => format!("--session-id {id} "),
         SessionFlag::Resume(id) => format!("--resume {id} "),
         SessionFlag::None => String::new(),
     };
     format!(
-        "claude --dangerously-skip-permissions --add-dir {} {flag}\"{}\"",
-        shell_quote(&skills_dir.display().to_string()),
+        "claude --dangerously-skip-permissions {skills}{flag}\"{}\"",
         builtin_prompt(cfg, pr, plan.resume)
     )
 }
 
-/// The whole line: cd to the repo root, then review.
+/// The whole line: cd to the repo root, then review. `skills_dir` is the
+/// staged skills for the built-in command; an override has no use for it,
+/// and the caller does not stage one for it.
 pub fn line(
     cfg: &Config,
     pr: u64,
     plan: &PlannedSession,
     repo_root: &Path,
-    skills_dir: &Path,
+    skills_dir: Option<&Path>,
 ) -> String {
     let cd = format!("cd {} &&", shell_quote(&repo_root.display().to_string()));
     match &cfg.review_cmd {
@@ -156,8 +168,8 @@ mod tests {
         Path::new("/sandbox/repo")
     }
 
-    fn skills() -> &'static Path {
-        Path::new("/sandbox/skills")
+    fn skills() -> Option<&'static Path> {
+        Some(Path::new("/sandbox/skills"))
     }
 
     #[test]
@@ -166,7 +178,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "cd /sandbox/repo && claude --dangerously-skip-permissions --add-dir /sandbox/skills --session-id {SID} \"panel review 9\""
+                "cd /sandbox/repo && claude --dangerously-skip-permissions --add-dir=/sandbox/skills --session-id {SID} \"panel review 9\""
             )
         );
     }
@@ -205,7 +217,9 @@ mod tests {
         let plan = planned(SessionFlag::None, false);
         let line = line(&cfg(), 9, &plan, root(), skills());
         assert!(!line.contains("--session-id") && !line.contains("--resume"));
-        assert!(line.contains("claude --dangerously-skip-permissions --add-dir /sandbox/skills \"panel review 9\""));
+        // With no session flag the prompt follows --add-dir directly, which is
+        // the case the `=` form exists for.
+        assert!(line.contains("claude --dangerously-skip-permissions --add-dir=/sandbox/skills \"panel review 9\""));
     }
 
     #[test]
@@ -238,10 +252,10 @@ mod tests {
         // An empty id is still one (empty) word rather than nothing at all.
         assert_eq!(shell_quote(""), "''");
 
-        let line = line(&cfg(), 9, &fresh(), Path::new("/has space/repo"), Path::new("/tmp dir/skills"));
+        let line = line(&cfg(), 9, &fresh(), Path::new("/has space/repo"), Some(Path::new("/tmp dir/skills")));
         assert!(line.starts_with("cd '/has space/repo' &&"));
         // The skills directory is a temp path, so it gets the same care.
-        assert!(line.contains("--add-dir '/tmp dir/skills' "), "{line}");
+        assert!(line.contains("--add-dir='/tmp dir/skills' "), "{line}");
     }
 
     #[test]

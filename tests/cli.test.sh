@@ -21,7 +21,7 @@ assert_not_contains "draft PRs are hidden" "$out" "#2"
 # A tab is a fresh claude with no install step behind it, so the skills the
 # binary was built with ride in the command.
 assert_contains "tabs are handed the bundled skills" \
-  "$(spawned_cmd 'pr-review-tab 9')" "--add-dir "
+  "$(spawned_cmd 'pr-review-tab 9')" "--add-dir="
 
 out="$(run_review_prs --auto --dependabot)"
 assert_contains "--dependabot includes bot PRs" "$out" "#3"
