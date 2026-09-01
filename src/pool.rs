@@ -125,15 +125,6 @@ fn plan_job(job: &mut Job, cfg: &Config, ctx: &RepoContext, rundir: &RunDir, ui:
         job.sid = planned.sid;
         job.flag = planned.flag;
         job.resume = planned.resume;
-        // Where this pass's half of the transcript begins. A resumed session
-        // already holds every earlier review, and those belong to the passes
-        // that produced them, not to this one.
-        job.transcript_from = job
-            .sid
-            .as_deref()
-            .and_then(crate::session::transcript_path)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map_or(0, |m| m.len());
     }
 }
 
@@ -339,7 +330,7 @@ pub fn run_pass(
                         job.trailer = report::read_trailer(
                             &rundir.stdout_path(job.pr),
                             transcript.as_deref(),
-                            job.transcript_from,
+                            job.started_epoch,
                         );
                     }
                     // The review in a form a person can open. Best effort: a
@@ -348,7 +339,7 @@ pub fn run_pass(
                     if let Some(review) = report::read_review(
                         &rundir.stdout_path(job.pr),
                         transcript.as_deref(),
-                        job.transcript_from,
+                        job.started_epoch,
                     ) {
                         let _ = std::fs::write(rundir.review_path(job.pr), review);
                     }
