@@ -184,6 +184,26 @@ clears the screen and starts the board again at the top; the rows that had
 finished are still in the summary and the logs. `q` (or ctrl-C) stops the
 pass, stops every running review, and prints the summary of what finished.
 
+A running row is not the whole story, so `space` (or `enter`) opens every
+running row: the session the review runs in, how many turns and tool calls
+it has made, and the last few things it did -- read from the transcript
+Claude Code writes as it works. `1` to `9` open one row by its position,
+`esc` closes them all. When the terminal is wide enough the row itself ends
+with the tool the review is in right now:
+
+```
+  ⠹ #8 @bob Fix flaky test · reviewing 1m47s · Bash
+      session fa5ced7b-32dd-578b-a3b9-d4d23195dce1
+      14 turns · 9 tool calls
+        40s ago  Read    pool.rs
+        12s ago  said    The retry path never re-arms the deadline.
+         3s ago  Bash    cargo test --quiet
+```
+
+Only the built-in reviewer in a session this run named has a transcript to
+follow. A session claude named itself is found when the review ends, and a
+command override has no transcript at all; its row follows its stderr.
+
 The header only mentions concurrency when it actually holds reviews back: with
 five PRs and `--jobs 2` it reads `reviewing 5 PRs, 2 at a time`.
 
