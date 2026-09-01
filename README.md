@@ -504,7 +504,7 @@ By default that is a non-interactive [Claude Code](https://claude.com/claude-cod
 panel review:
 
 ```sh
-claude --dangerously-skip-permissions --session-id <uuid> "panel review <number>"
+claude --dangerously-skip-permissions --add-dir=<staged skills> --session-id <uuid> "panel review <number>"
 ```
 
 (The `--session-id` is what makes [`--continue`](#continue-mode) possible later.)
@@ -543,7 +543,7 @@ The per-tab command is `REVIEW_PRS_AUTO_CMD` (same `{}`/append substitution as
 skill:
 
 ```sh
-claude --dangerously-skip-permissions --session-id <uuid> "pr-review-tab <number>"
+claude --dangerously-skip-permissions --add-dir=<staged skills> --session-id <uuid> "pr-review-tab <number>"
 ```
 
 That skill runs an auto-review and, **when the PR is approved, closes its tab**
