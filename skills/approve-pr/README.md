@@ -5,7 +5,7 @@ Approve the GitHub PR you're discussing — the quick, fun last step after a rev
 ## Install
 
 ```
-npx skills add venables/skills --skill approve-pr
+npx skills add venabots/autoreview --skill approve-pr
 ```
 
 ## How to use it

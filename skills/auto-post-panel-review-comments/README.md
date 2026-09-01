@@ -5,7 +5,7 @@ The zero-touch twin of [`post-panel-review-comments`](../post-panel-review-comme
 ## Install
 
 ```
-npx skills add venables/skills --skill auto-post-panel-review-comments
+npx skills add venabots/autoreview --skill auto-post-panel-review-comments
 ```
 
 ## How to use it

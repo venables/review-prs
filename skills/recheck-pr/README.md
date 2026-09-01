@@ -5,7 +5,7 @@ The second look. You panel-reviewed a PR, the findings landed as comments, the a
 ## Install
 
 ```
-npx skills add venables/skills --skill recheck-pr
+npx skills add venabots/autoreview --skill recheck-pr
 ```
 
 ## How to use it

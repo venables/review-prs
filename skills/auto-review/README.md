@@ -11,10 +11,10 @@ It doesn't reimplement any of them — it calls each in turn and adds one new pi
 ## Install
 
 ```
-npx skills add venables/skills --skill auto-review
+npx skills add venabots/autoreview --skill auto-review
 ```
 
-Requires [`panel-review`](https://github.com/catena-labs/dev-skills/tree/main/skills/panel-review) and [`auto-post-panel-review-comments`](../auto-post-panel-review-comments) installed; [`approve-pr`](../approve-pr) is needed only for the approval step (post-only runs don't use it).
+Requires [`panel-review`](../panel-review) and [`auto-post-panel-review-comments`](../auto-post-panel-review-comments) installed; [`approve-pr`](../approve-pr) is needed only for the approval step (post-only runs don't use it).
 
 ## How to use it
 
@@ -52,7 +52,7 @@ Approval also requires that the invocation asked for it (see step 3 above); a po
 - **Not your own PR** — GitHub blocks self-approval; if you authored the PR it reports that instead.
 - **Head unchanged** — the PR head SHA is re-fetched before approving and must still match the SHA that was reviewed; if the author pushed during the multi-minute review, approval is withheld (the current head was never reviewed).
 
-When the gate fails on real findings, the inline comments are already posted — it does **not** leave a blocking `request-changes` review by default; it just reports the recommendation (use [`panel-review-loop`](../panel-review-loop) if you want to iterate to clean).
+When the gate fails on real findings, the inline comments are already posted — it does **not** leave a blocking `request-changes` review by default; it just reports the recommendation (use [`panel-review-loop`](https://github.com/venables/skills/tree/main/skills/panel-review-loop) if you want to iterate to clean).
 
 ## The approval body
 
@@ -74,4 +74,4 @@ Handed to `approve-pr` verbatim (so it adds no emoji of its own).
 - **It targets a PR.** If the review runs against a non-PR target (`--uncommitted`, `--base`), there's nothing to post to or approve — it reports the review and stops.
 - **Coverage below 75% blocks approval.** Losing one of four panelists (3/4) still allows a clean approval; falling below 75% of the launched panel is not a clean bill of health — comments still post, approval is withheld, and the report names the missing panelist.
 - **Same PR throughout.** The PR is resolved once and reused for review, posting, and approval.
-- **Different from its parts.** [`panel-review`](https://github.com/catena-labs/dev-skills/tree/main/skills/panel-review) only reviews; [`auto-post-panel-review-comments`](../auto-post-panel-review-comments) only posts; [`panel-review-loop`](../panel-review-loop) iterates fix-and-rereview; [`approve-pr`](../approve-pr) only approves. `auto-review` is the one-pass review → post → maybe-approve composition.
+- **Different from its parts.** [`panel-review`](../panel-review) only reviews; [`auto-post-panel-review-comments`](../auto-post-panel-review-comments) only posts; [`panel-review-loop`](https://github.com/venables/skills/tree/main/skills/panel-review-loop) iterates fix-and-rereview; [`approve-pr`](../approve-pr) only approves. `auto-review` is the one-pass review → post → maybe-approve composition.
