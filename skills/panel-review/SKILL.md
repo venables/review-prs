@@ -333,12 +333,17 @@ When _not_ to use:
    ```
 
    The verdict is one of three fixed strings, and it follows from the buckets
-   above, not from a fresh judgment:
-   - `DECISION: Request changes` — `### must-fix` has an entry.
-   - `DECISION: Comment` — `### must-fix` is empty and `### should-fix` has an
-     entry, or a `Purpose` or `Proof` flag was promoted.
-   - `DECISION: Approve` — no finding above `### polish`, and Risk is LOW or
-     MEDIUM.
+   and the Risk above, not from a fresh judgment. Apply the rules in order;
+   the first that matches wins, so every synthesis has exactly one verdict:
+   1. `DECISION: Request changes` — `### must-fix` has an entry. A promoted
+      `Approach`, `Purpose`, or `Proof` flag already sits in a bucket, so it
+      needs no rule of its own.
+   2. `DECISION: Comment` — `### should-fix` has an entry, or Risk is HIGH or
+      CRITICAL. Risk can be HIGH with no finding at all, from the area touched
+      or from panelists that disagreed on the goal; that is still not an
+      approval.
+   3. `DECISION: Approve` — everything else: no finding, or polish only, with
+      Risk LOW or MEDIUM.
 
    This skill posts nothing, so the line says what the review recommends, not
    what happened on the PR. Put no reason on the line; the sections above are

@@ -368,12 +368,14 @@ author is going to read it and needs to act on it.
 The `DECISION:` line is the last line of the reply, on its own, with
 nothing after it except a machine trailer the caller's system prompt asks
 for. The verdict is what actually happened on the PR, one of three fixed
-strings:
-- `DECISION: Approve` — an approving review was submitted.
-- `DECISION: Comment` — replies or new inline comments were posted and no
-  approval was submitted.
-- `DECISION: No action` — nothing landed on the PR: the fast path found
-  nothing changed, or the head moved during the pass.
+strings. Apply the rules in order; the first that matches wins:
+1. `DECISION: Approve` — an approving review was submitted.
+2. `DECISION: Comment` — anything else landed on the PR: a reply, a
+   resolved thread, or a new inline comment, with no approval. A head that
+   moved at approval time lands here when step 5 had already replied.
+3. `DECISION: No action` — nothing landed on the PR: the fast path found
+   nothing changed, a gate stopped the pass before anything was posted, or
+   this was a dry run.
 
 Put no reason on the line; the **Approval** line and the ledger above are
 the reason. A reader who scrolls to the end gets the answer, and a caller

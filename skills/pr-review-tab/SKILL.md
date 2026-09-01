@@ -68,7 +68,9 @@ self-terminate (press Esc to stop it). Never guess a tab id.
 
 Whatever happened to the tab, end your own reply the way `auto-review` and
 `recheck-pr` end theirs: with their `DECISION:` line, repeated as the last
-line, on its own. A reader of the tab gets one answer at the bottom.
+line, on its own, with nothing after it except a machine trailer the
+caller's system prompt asks for. A reader of the tab gets one answer at the
+bottom.
 
 ## Arguments
 

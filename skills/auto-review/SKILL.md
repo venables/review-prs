@@ -204,13 +204,16 @@ trailer the caller's system prompt asks for:
 DECISION: Approve
 ```
 
-The verdict is what actually happened on the PR, one of four fixed strings:
-- `DECISION: Approve` — an approving review was submitted.
-- `DECISION: Comment` — findings were posted and no approval was submitted.
-- `DECISION: Request changes` — a blocking review was submitted (only when
-  the user asked for one; see Gotchas).
-- `DECISION: No action` — nothing landed on the PR: the coverage gate
-  failed before posting, the head moved, or this was a dry run.
+The verdict is what actually happened on the PR, one of four fixed strings.
+Apply the rules in order; the first that matches wins:
+1. `DECISION: Approve` — an approving review was submitted.
+2. `DECISION: Request changes` — a blocking review was submitted (only when
+   the user asked for one; see Gotchas).
+3. `DECISION: Comment` — anything else landed on the PR: comments, `+1`s,
+   or replies, with no approval. A coverage gate that failed or a head that
+   moved lands here too, because step 2 had already posted by then.
+4. `DECISION: No action` — nothing landed on the PR: a dry run, a target
+   that is not a PR, or a pass in which every post failed.
 
 Put no reason on the line; the report above is the reason. A reader who
 scrolls to the end gets the answer, and a caller that only reads the last
