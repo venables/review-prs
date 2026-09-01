@@ -60,11 +60,11 @@ PRs (nothing has changed since you last engaged) are left alone.
                       A PR nobody is touching should not keep a process alive
                       forever, least of all one started by cron.
   --max-passes N      How often one PR may be reviewed before it is left
-                      alone (default 3, or $AUTOREVIEW_MAX_PASSES). Under
-                      --watch the count resets when its author pushes again. Every
+                      alone (default 3, or $AUTOREVIEW_MAX_PASSES). Every
                       review is activity on the PR, so an author who answers
                       makes it actionable again; this is what keeps that from
-                      running for as long as the loop does.
+                      running for as long as the loop does. Under --watch the
+                      count resets when its author pushes again.
   --timeout SECONDS   Give up on a review that runs this long (default 3600,
                       or $AUTOREVIEW_TIMEOUT; 0 disables).
   --budget USD        Cap each review's API spend (claude --max-budget-usd).
