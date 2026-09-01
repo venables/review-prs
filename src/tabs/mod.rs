@@ -60,12 +60,16 @@ pub fn run(cfg: &Config) -> Result<i32> {
     let skills_dir = match &cfg.review_cmd {
         Some(_) => None,
         None => {
+            println!("skills: {}", cfg.skills.describe());
             let dir = rundir::make_unique_dir(&std::env::temp_dir(), "review-prs-skills.")?;
-            let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
-            if let Some(note) = skills::shadow_note(&shadowing) {
-                eprintln!("{note}");
+            let staged = skills::stage(&cfg.skills, &dir)?;
+            if staged.is_some() {
+                let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
+                if let Some(note) = skills::shadow_note(&shadowing, &skills::staged_names(&cfg.skills)) {
+                    eprintln!("{note}");
+                }
             }
-            Some(skills::stage(&dir)?)
+            staged
         }
     };
 

@@ -142,6 +142,7 @@ mod tests {
             include_approved: false,
             include_dependabot: false,
             review_cmd: None,
+            skills: crate::skills::Source::Bundled,
             workspace: None,
             startup_notes: vec![],
         }

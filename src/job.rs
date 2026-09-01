@@ -161,11 +161,13 @@ pub fn dashp_args(job: &Job, cfg: &Config, rundir: &RunDir) -> Vec<String> {
         // skill trigger is never at risk. Single-token `=` form: dash-p
         // forwards unrecognized flags only that way.
         format!("--append-system-prompt={}", crate::report::TRAILER_INSTRUCTION),
-        // The skills this version was built with, staged once per run. An
-        // installed skill of the same name still wins inside claude; the
-        // startup note says so.
-        crate::skills::add_dir_flag(&rundir.agent_dir()),
     ];
+    // The skills staged for this run, unless the run stages none. An
+    // installed skill of the same name still wins inside claude; the
+    // startup note says so.
+    if cfg.skills != crate::skills::Source::Installed {
+        argv.push(crate::skills::add_dir_flag(&rundir.agent_dir()));
+    }
     match &job.flag {
         SessionFlag::Pin(id) => {
             argv.push("--session-id".into());
@@ -306,6 +308,7 @@ mod tests {
             include_approved: false,
             include_dependabot: false,
             review_cmd: None,
+            skills: crate::skills::Source::Bundled,
             startup_notes: vec![],
         }
     }
@@ -382,9 +385,14 @@ mod tests {
         let job = Job::new(9);
         let argv = dashp_args(&job, &cfg_with(0, None, true), &rd);
         assert!(argv.join(" ").contains(&format!("--timeout {DASHP_TIMEOUT_DISABLED}")));
-        // The bundled skills ride along as one token, under the run.
+        // The staged skills ride along as one token, under the run.
         let add_dir = format!("--add-dir={}", rd.agent_dir().display());
         assert!(argv.contains(&add_dir), "{argv:?}");
+        // ...and not at all when the run stages none.
+        let mut installed = cfg_with(0, None, false);
+        installed.skills = crate::skills::Source::Installed;
+        let argv = dashp_args(&job, &installed, &rd);
+        assert!(!argv.iter().any(|a| a.starts_with("--add-dir")), "{argv:?}");
     }
 
     #[test]
