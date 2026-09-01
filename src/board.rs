@@ -107,15 +107,17 @@ impl Board {
     pub fn open(height: u16) -> io::Result<Board> {
         install_panic_hook();
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), cursor::Hide)?;
-        let terminal = match open_terminal(height.max(1)) {
-            Ok(t) => t,
+        // Raw mode is on from here. Whatever fails next, the caller falls
+        // back to plain lines and never touches the terminal again, so this
+        // is the last chance to give it back.
+        let terminal = execute!(io::stdout(), cursor::Hide).and_then(|()| open_terminal(height.max(1)));
+        match terminal {
+            Ok(terminal) => Ok(Board { terminal, height: height.max(1) }),
             Err(e) => {
                 restore_terminal();
-                return Err(e);
+                Err(e)
             }
-        };
-        Ok(Board { terminal, height: height.max(1) })
+        }
     }
 
     /// The terminal's width, or what to assume when it will not say.
