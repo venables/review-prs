@@ -37,10 +37,14 @@ for f in "$TESTS_DIR"/*.test.sh; do
   echo
 done
 
-# Both tools are rust now and linted by cargo; this suite is the only bash
-# left in the repo, so it is what gets linted.
+# The tools are rust and linted by cargo. The bash left in the repo is this
+# suite and the helper scripts the vendored skills carry, so both get linted.
 echo "lint"
-for f in "$TESTS_DIR"/*.sh; do
+skill_scripts=()
+while IFS= read -r f; do
+  skill_scripts+=("$f")
+done < <(find "$ROOT/skills" -name '*.sh' | sort)
+for f in "$TESTS_DIR"/*.sh "${skill_scripts[@]}"; do
   if bash -n "$f"; then
     echo "  ok    ${f#"$ROOT"/} parses"
   else
@@ -59,6 +63,14 @@ if command -v shellcheck >/dev/null 2>&1; then
     echo "  ok    shellcheck clean"
   else
     echo "  FAIL  shellcheck reported problems"
+    failed=1
+  fi
+  # The skill scripts run under whatever shell a reviewer's machine has, so
+  # they are checked on their own terms: no suite-specific exclusions.
+  if shellcheck "${skill_scripts[@]}"; then
+    echo "  ok    skill scripts shellcheck clean"
+  else
+    echo "  FAIL  shellcheck reported problems in skills/"
     failed=1
   fi
 else
