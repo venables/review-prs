@@ -61,21 +61,82 @@ pub const TRAILER_INSTRUCTION: &str = "When your reply concludes a PR review tas
 /// The trailer out of the reviewer's stdout envelope (dash-p's
 /// {"answer": ...}). The last fenced block wins: a review that quotes an
 /// earlier block is reporting the newer state.
-pub fn read_trailer(stdout_path: &std::path::Path) -> Option<Trailer> {
-    let raw = std::fs::read_to_string(stdout_path).ok()?;
-    let envelope: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    parse_trailer(envelope.get("answer")?.as_str()?)
+pub fn read_trailer(
+    stdout_path: &std::path::Path,
+    transcript: Option<&std::path::Path>,
+    from: u64,
+) -> Option<Trailer> {
+    // Same reason read_review looks here first: the trailer is asked for at
+    // the end of the review, and a reviewer that says anything afterwards
+    // pushes it out of dash-p's `answer` and into an earlier message.
+    let full = transcript.and_then(|p| read_transcript(p, from));
+    full.as_deref()
+        .and_then(parse_trailer)
+        .or_else(|| read_answer(stdout_path).as_deref().and_then(parse_trailer))
 }
 
-/// The reviewer's reply, out of dash-p's envelope, with the machine-readable
-/// trailer taken off the end. What a person wants to read when the review did
-/// not land on the PR -- or when they want to see what did.
-pub fn read_review(stdout_path: &std::path::Path) -> Option<String> {
+/// Everything the reviewer said, with the machine-readable trailer taken off
+/// the end. What a person wants to read when the review did not land on the
+/// PR -- or when they want to see what did.
+///
+/// The session transcript first, dash-p's envelope second. `answer` holds only
+/// the reviewer's *final* message, and a panel review is many messages: the
+/// panelist sections, then the synthesis, then whatever the model says last.
+/// A reviewer that signs off after its review -- "the script has exited
+/// cleanly" -- leaves `answer` holding the sign-off and nothing else.
+pub fn read_review(
+    stdout_path: &std::path::Path,
+    transcript: Option<&std::path::Path>,
+    from: u64,
+) -> Option<String> {
+    let full = transcript.and_then(|p| read_transcript(p, from));
+    let text = full.or_else(|| read_answer(stdout_path))?;
+    let body = strip_trailer(&text).trim_end().to_string();
+    (!body.is_empty()).then_some(body)
+}
+
+/// dash-p's envelope: the final assistant message, and nothing before it.
+fn read_answer(stdout_path: &std::path::Path) -> Option<String> {
     let raw = std::fs::read_to_string(stdout_path).ok()?;
     let envelope: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let answer = envelope.get("answer")?.as_str()?;
-    let body = strip_trailer(answer).trim_end();
-    (!body.is_empty()).then(|| body.to_string())
+    Some(envelope.get("answer")?.as_str()?.to_string())
+}
+
+/// Every assistant message in a Claude Code transcript, in order.
+///
+/// Tool calls and their results are skipped: what is wanted is what the
+/// reviewer said, not the mechanics of it saying so. A line that will not
+/// parse is skipped rather than failing the read -- the file is written by
+/// another program while this one reads it, and a torn last line is ordinary.
+fn read_transcript(path: &std::path::Path, from: u64) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    // Everything before `from` belongs to an earlier pass of a resumed
+    // session. A byte offset past the end means the file was replaced rather
+    // than appended to, so the whole of it is this pass's.
+    let raw = raw.get(from as usize..).unwrap_or(&raw);
+    let mut parts: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = entry.pointer("/message/content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) != Some("text") {
+                continue;
+            }
+            if let Some(text) = block.get("text").and_then(|t| t.as_str())
+                && !text.trim().is_empty()
+            {
+                parts.push(text.trim().to_string());
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// The reply without the machine trailer on the end.
@@ -327,6 +388,83 @@ pub fn vetoed_claim<'a>(gh: &Readback, trailer: Option<&'a Trailer>) -> Option<&
 
 #[cfg(test)]
 mod tests {
+    /// A session store holding one transcript, laid out the way Claude Code
+    /// does: $CLAUDE_CONFIG_DIR/projects/<some-dir>/<id>.jsonl.
+    fn with_transcript(id: &str, turns: &[&str]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("ar-tx-{}-{id}", std::process::id()));
+        let dir = root.join("projects").join("-some-repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut lines = String::new();
+        for t in turns {
+            let entry = serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "text", "text": t }] },
+            });
+            lines.push_str(&entry.to_string());
+            lines.push('\n');
+        }
+        // A tool call in the middle, which must not reach the review file.
+        lines.push_str(
+            &serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [{ "type": "tool_use", "name": "Bash", "input": {} }] },
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+        // A torn last line, which the writer can leave while we read.
+        lines.push_str("{\"type\":\"assis");
+        std::fs::write(dir.join(format!("{id}.jsonl")), lines).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_review_survives_the_reviewer_signing_off_after_it() {
+        // The reported bug. A panel review is many messages: the panelist
+        // sections, the synthesis, then whatever the reviewer says last.
+        // dash-p's `answer` holds only that last message, so a sign-off left
+        // pr-N.review.md containing one sentence about the script exiting.
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let signoff = "The panel-review script has exited cleanly (exit 0).";
+        let root = with_transcript(id, &["## Overview\n\nThe real review.", signoff]);
+
+        let dir = std::env::temp_dir().join(format!("ar-tx-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stdout = dir.join("pr-9.json");
+        std::fs::write(&stdout, serde_json::json!({ "answer": signoff }).to_string()).unwrap();
+
+        // Without the transcript there is only the envelope, which is the bug.
+        assert_eq!(read_review(&stdout, None, 0).unwrap(), signoff);
+
+        let tx = root.join("projects").join("-some-repo").join(format!("{id}.jsonl"));
+        let got = read_review(&stdout, Some(&tx), 0).unwrap();
+
+        assert!(got.contains("The real review."), "the review is there: {got:?}");
+        assert!(got.contains(signoff), "and so is what came after it");
+        assert!(!got.contains("tool_use"), "but not the tool calls");
+
+        // A resumed session already holds every earlier review. This pass's
+        // file must hold this pass's review, not the whole history -- a watch
+        // run resuming for days would otherwise grow one file without end.
+        let from = std::fs::metadata(&tx).unwrap().len();
+        let second = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [{ "type": "text", "text": "## Second look\n\nStill fine." }] },
+        });
+        let mut appended = std::fs::read_to_string(&tx).unwrap();
+        appended.push('\n');
+        appended.push_str(&second.to_string());
+        appended.push('\n');
+        std::fs::write(&tx, appended).unwrap();
+
+        let later = read_review(&stdout, Some(&tx), from).unwrap();
+        assert!(later.contains("Still fine."), "this pass's review: {later:?}");
+        assert!(!later.contains("The real review."), "not the earlier pass's");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_review_comes_out_of_the_envelope_without_its_trailer() {
         let dir = std::env::temp_dir().join(format!("ar-review-{}", std::process::id()));
@@ -335,32 +473,32 @@ mod tests {
 
         let answer = "## Overview\n\nLooks fine.\n\n```autoreview\n{\"decision\":\"none\"}\n```";
         std::fs::write(&path, serde_json::json!({ "answer": answer }).to_string()).unwrap();
-        assert_eq!(read_review(&path).unwrap(), "## Overview\n\nLooks fine.");
+        assert_eq!(read_review(&path, None, 0).unwrap(), "## Overview\n\nLooks fine.");
 
         // No trailer is ordinary: an overridden reviewer promises nothing.
         std::fs::write(&path, serde_json::json!({ "answer": "just prose" }).to_string()).unwrap();
-        assert_eq!(read_review(&path).unwrap(), "just prose");
+        assert_eq!(read_review(&path, None, 0).unwrap(), "just prose");
 
         // Prose that merely mentions the fence keeps the review under it:
         // only a block that parses is a trailer.
         let chatty = "The reviewer emits a ```autoreview block.\n\nReal finding here.";
         std::fs::write(&path, serde_json::json!({ "answer": chatty }).to_string()).unwrap();
-        assert_eq!(read_review(&path).unwrap(), chatty);
+        assert_eq!(read_review(&path, None, 0).unwrap(), chatty);
 
         // A parseable block quoted mid-review is an example, not the
         // trailer: the conclusion after it must survive.
         let quoting = "I would emit:\n\n```autoreview\n{\"decision\":\"none\"}\n```\n\nBut the real finding is here.";
         std::fs::write(&path, serde_json::json!({ "answer": quoting }).to_string()).unwrap();
-        assert_eq!(read_review(&path).unwrap(), quoting);
+        assert_eq!(read_review(&path, None, 0).unwrap(), quoting);
 
         // Nothing to write rather than an empty file.
         std::fs::write(&path, serde_json::json!({ "answer": "```autoreview\n{}\n```" }).to_string())
             .unwrap();
-        assert_eq!(read_review(&path), None);
+        assert_eq!(read_review(&path, None, 0), None);
 
         // A stdout that is not the envelope at all must not panic.
         std::fs::write(&path, "not json").unwrap();
-        assert_eq!(read_review(&path), None);
+        assert_eq!(read_review(&path, None, 0), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
