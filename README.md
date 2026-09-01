@@ -97,6 +97,20 @@ binaries say when that is happening:
 note: auto-review, panel-review under /Users/you/.claude/skills shadow the bundled copies; the installed skills run
 ```
 
+`--skills` chooses the source for a run, and both binaries take it (or
+`$AUTOREVIEW_SKILLS` / `$REVIEW_PRS_SKILLS`). Exactly one source per run,
+printed as `skills: ...` when the run starts:
+
+| Value       | What runs                                                                                             |
+| ----------- | ----------------------------------------------------------------------------------------------------- |
+| unset       | the skills this binary was built with, staged for the run                                             |
+| a directory | the `<name>/SKILL.md` under it, staged in place of the bundle: a fork, or a repo's own tuned reviewer |
+| `installed` | nothing staged; the reviewer finds what is installed, which is what every run did before              |
+
+A skill you installed still wins over a staged one, as above, and the note
+says so. `--skills` does not reach a command override, which finds its own
+skills; the run notes that too.
+
 To use the skills interactively, outside a run, install them for every agent
 that supports the [Agent Skills](https://agentskills.io) layout:
 
