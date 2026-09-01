@@ -125,6 +125,15 @@ fn plan_job(job: &mut Job, cfg: &Config, ctx: &RepoContext, rundir: &RunDir, ui:
         job.sid = planned.sid;
         job.flag = planned.flag;
         job.resume = planned.resume;
+        // Where this pass's half of the transcript begins. A resumed session
+        // already holds every earlier review, and those belong to the passes
+        // that produced them, not to this one.
+        job.transcript_from = job
+            .sid
+            .as_deref()
+            .and_then(crate::session::transcript_path)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len());
     }
 }
 
@@ -321,13 +330,26 @@ pub fn run_pass(
                 // promises the envelope the trailer lives in -- but the
                 // GitHub readback works under any reviewer.
                 if ok && let Some(gh) = readback {
+                    // dash-p's answer is only the reviewer's last message,
+                    // so the transcript is where a review that was followed
+                    // by a sign-off still lives.
+                    let transcript =
+                        job.sid.as_deref().and_then(crate::session::transcript_path);
                     if !is_override {
-                        job.trailer = report::read_trailer(&rundir.stdout_path(job.pr));
+                        job.trailer = report::read_trailer(
+                            &rundir.stdout_path(job.pr),
+                            transcript.as_deref(),
+                            job.transcript_from,
+                        );
                     }
                     // The review in a form a person can open. Best effort: a
                     // review that ran is not spoiled by a file that could not
                     // be written, and pr-N.json still holds the original.
-                    if let Some(review) = report::read_review(&rundir.stdout_path(job.pr)) {
+                    if let Some(review) = report::read_review(
+                        &rundir.stdout_path(job.pr),
+                        transcript.as_deref(),
+                        job.transcript_from,
+                    ) {
                         let _ = std::fs::write(rundir.review_path(job.pr), review);
                     }
                     // A --no-post reviewer ran the skill with no posting

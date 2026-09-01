@@ -58,6 +58,10 @@ pub struct Job {
     pub reaped: bool,
     /// Wall-clock start, for comparing against GitHub review timestamps.
     pub started_epoch: i64,
+    /// How long this PR's session transcript was before the review started.
+    /// A resumed session already holds every earlier review, and reading from
+    /// the top would put all of them in this pass's review file.
+    pub transcript_from: u64,
     pub elapsed_secs: u64,
     /// The exit code, or None for signal-death ("no result").
     pub exit_code: Option<i32>,
@@ -86,6 +90,7 @@ impl Job {
             started: None,
             reaped: false,
             started_epoch: 0,
+            transcript_from: 0,
             elapsed_secs: 0,
             exit_code: None,
             guard_tripped: false,

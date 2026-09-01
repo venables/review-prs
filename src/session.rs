@@ -46,17 +46,26 @@ pub fn projects_dir() -> PathBuf {
 /// instead of rebuilding the name. Searching wider than the repo is safe
 /// because the id already encodes the checkout.
 pub fn session_exists(id: &str) -> bool {
+    transcript_path(id).is_some()
+}
+
+/// The transcript file for a session, wherever Claude Code put it.
+///
+/// Every assistant turn is in here, which is what makes it worth finding: a
+/// dash-p `answer` holds only the final message, so a reviewer that says
+/// anything after its review -- a sign-off, a note that the script exited --
+/// leaves the review itself with nowhere else to be read from.
+pub fn transcript_path(id: &str) -> Option<PathBuf> {
     let dir = projects_dir();
     if id.is_empty() || !dir.is_dir() {
-        return false;
+        return None;
     }
     let file = format!("{id}.jsonl");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return false;
-    };
-    entries
+    std::fs::read_dir(&dir)
+        .ok()?
         .flatten()
-        .any(|e| e.path().is_dir() && e.path().join(&file).is_file())
+        .map(|e| e.path().join(&file))
+        .find(|p| p.is_file())
 }
 
 /// True when another process still holds this session open. Claude Code
