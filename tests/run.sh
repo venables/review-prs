@@ -44,7 +44,7 @@ skill_scripts=()
 while IFS= read -r f; do
   skill_scripts+=("$f")
 done < <(find "$ROOT/skills" -name '*.sh' | sort)
-for f in "$TESTS_DIR"/*.sh "${skill_scripts[@]}"; do
+for f in "$TESTS_DIR"/*.sh ${skill_scripts[@]+"${skill_scripts[@]}"}; do
   if bash -n "$f"; then
     echo "  ok    ${f#"$ROOT"/} parses"
   else
@@ -66,8 +66,9 @@ if command -v shellcheck >/dev/null 2>&1; then
     failed=1
   fi
   # The skill scripts run under whatever shell a reviewer's machine has, so
-  # they are checked on their own terms: no suite-specific exclusions.
-  if shellcheck "${skill_scripts[@]}"; then
+  # they are checked on their own terms: no suite-specific exclusions. The
+  # guarded expansion is for bash 3.2, where an empty array trips `set -u`.
+  if shellcheck ${skill_scripts[@]+"${skill_scripts[@]}"}; then
     echo "  ok    skill scripts shellcheck clean"
   else
     echo "  FAIL  shellcheck reported problems in skills/"
