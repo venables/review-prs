@@ -641,6 +641,7 @@ if (( CHECKOUT_MODE )); then
   # `${WORKTREES[@]:-}` would expand to a single empty element on bash 3.2 (the
   # macOS default) and produce a confusing error under `set -u`. Guard the loop
   # with a count check so the trap is a no-op when nothing has been added yet.
+  # shellcheck disable=SC2154  # _wt is assigned by the for inside the trap string
   trap '
     if (( ${#WORKTREES[@]} > 0 )); then
       for _wt in "${WORKTREES[@]}"; do
