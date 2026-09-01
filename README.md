@@ -861,8 +861,9 @@ shapes), then runs the bash suites — the real binaries against fake `gh`,
 your repos, your Claude Code sessions, or GitHub. One file,
 `tests/board.test.sh`, runs autoreview on a pty rather than a pipe, through
 `tests/pty.py`: a driver that answers the board's cursor query, resizes the
-terminal mid-pass and presses `q`. It is the only time the live board is
-drawn under test. It finishes with `bash -n`
+terminal mid-pass and presses keys. It is the only time the live board is
+drawn under test, and it needs `python3`; without one it says so and skips.
+It finishes with `bash -n`
 and `shellcheck` over the suite itself and over the scripts in `skills/`, which
 is all the bash in the repo.
 
