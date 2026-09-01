@@ -22,6 +22,14 @@ assert_not_contains "draft PRs are hidden" "$out" "#2"
 # binary was built with ride in the command.
 assert_contains "tabs are handed the bundled skills" \
   "$(spawned_cmd 'pr-review-tab 9')" "--add-dir="
+assert_contains "...and the run says which skills it staged" "$out" "skills: bundled ("
+out="$(run_review_prs --auto --skills installed)"
+assert_contains "--skills installed says so" "$out" "skills: installed"
+assert_not_contains "...and hands the tab no directory" \
+  "$(spawned_cmd 'pr-review-tab 9')" "--add-dir"
+out="$(run_review_prs --auto --skills "$SANDBOX/nowhere")"
+assert_equals "a --skills value that names no skills exits nonzero" "$(last_status)" "1"
+assert_contains "...and says what was expected" "$out" "error: --skills expects a directory of skills"
 
 out="$(run_review_prs --auto --dependabot)"
 assert_contains "--dependabot includes bot PRs" "$out" "#3"

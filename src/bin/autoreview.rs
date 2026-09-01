@@ -166,10 +166,12 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // Written before the first pass so a failure is the run's, not one
     // review's. An override brings its own reviewer and never sees it.
     if cfg.review_cmd.is_none() {
-        skills::stage(&rundir.agent_dir())?;
-        let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
-        if let Some(note) = skills::shadow_note(&shadowing) {
-            eprintln!("{note}");
+        println!("skills: {}", cfg.skills.describe());
+        if rundir.stage_skills(&cfg.skills)?.is_some() {
+            let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
+            if let Some(note) = skills::shadow_note(&shadowing, &skills::staged_names(&cfg.skills)) {
+                eprintln!("{note}");
+            }
         }
     }
     let (tx, rx) = std::sync::mpsc::channel();

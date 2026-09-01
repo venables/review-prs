@@ -57,15 +57,21 @@ pub fn run(cfg: &Config) -> Result<i32> {
     // them. A tab outlives this process, so the directory is not cleaned up;
     // it is one small tree under the temp directory per run. An override
     // brings its own reviewer, so it is not made to depend on this.
-    let skills_dir = match &cfg.review_cmd {
-        Some(_) => None,
-        None => {
-            let dir = rundir::make_unique_dir(&std::env::temp_dir(), "review-prs-skills.")?;
-            let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
-            if let Some(note) = skills::shadow_note(&shadowing) {
-                eprintln!("{note}");
+    let skills_dir = match (&cfg.review_cmd, &cfg.skills) {
+        (Some(_), _) => None,
+        (None, source) => {
+            println!("skills: {}", source.describe());
+            if *source == skills::Source::Installed {
+                None
+            } else {
+                let dir = rundir::make_unique_dir(&std::env::temp_dir(), "review-prs-skills.")?;
+                let staged = skills::stage(source, &dir)?;
+                let shadowing = [session::user_skills_dir(), ctx.repo_root.join(".claude/skills")];
+                if let Some(note) = skills::shadow_note(&shadowing, &skills::staged_names(source)) {
+                    eprintln!("{note}");
+                }
+                staged
             }
-            Some(skills::stage(&dir)?)
         }
     };
 

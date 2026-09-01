@@ -56,6 +56,10 @@ pub fn make_unique_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
 pub struct RunDir {
     pub root: PathBuf,
     pub pass_dir: PathBuf,
+    /// Where this run's skills were staged, once `stage_skills` has run and
+    /// the source had something to stage. What every reviewer is handed
+    /// with --add-dir; None means it is handed nothing.
+    skills_dir: Option<PathBuf>,
 }
 
 impl RunDir {
@@ -71,21 +75,26 @@ impl RunDir {
             }
         };
         let root = make_unique_dir(&log_dir, "run-")?;
-        Ok(RunDir { pass_dir: root.clone(), root })
+        Ok(RunDir { pass_dir: root.clone(), root, skills_dir: None })
+    }
+
+    /// Stage the run's skills under `agent/`, once per run rather than per
+    /// pass: the skills do not change between passes, and a resumed session
+    /// is told the same directory it started with. Returns what was staged.
+    pub fn stage_skills(&mut self, source: &crate::skills::Source) -> Result<Option<&Path>> {
+        self.skills_dir = crate::skills::stage(source, &self.root.join("agent"))?;
+        Ok(self.skills_dir.as_deref())
+    }
+
+    /// The staged skills, or None when this run stages none.
+    pub fn skills_dir(&self) -> Option<&Path> {
+        self.skills_dir.as_deref()
     }
 
     pub fn start_pass(&mut self, pass: u32) -> Result<&Path> {
         self.pass_dir = self.root.join(format!("pass-{pass}"));
         std::fs::create_dir_all(&self.pass_dir)?;
         Ok(&self.pass_dir)
-    }
-
-    /// Where the bundled skills are written for this run, and what every
-    /// reviewer is handed with --add-dir. Once per run, not per pass: the
-    /// skills do not change between passes, and a resumed session is told
-    /// the same directory it started with.
-    pub fn agent_dir(&self) -> PathBuf {
-        self.root.join("agent")
     }
 
     pub fn stdout_path(&self, pr: u64) -> PathBuf {
@@ -187,6 +196,22 @@ mod tests {
         );
         rd.record_session(8, "not-a-session-id").unwrap();
         assert_eq!(rd.recorded_session(8), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_run_stages_its_skills_once_under_agent() {
+        use crate::skills::Source;
+        let base = tmp_base();
+        let mut rd = RunDir::new(Some(base.clone())).unwrap();
+        assert_eq!(rd.skills_dir(), None, "nothing staged until asked");
+        let staged = rd.stage_skills(&Source::Bundled).unwrap().unwrap().to_path_buf();
+        assert_eq!(staged, rd.root.join("agent"));
+        assert!(staged.join(".claude/skills/auto-review/SKILL.md").is_file());
+        assert_eq!(rd.skills_dir(), Some(staged.as_path()));
+        let mut none = RunDir::new(Some(base.clone())).unwrap();
+        assert_eq!(none.stage_skills(&Source::Installed).unwrap(), None);
+        assert!(!none.root.join("agent").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
