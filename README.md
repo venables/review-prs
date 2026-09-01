@@ -178,8 +178,11 @@ reviewing 2 PRs · logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 Each row says who opened the PR, and whether this is a first look
 (`reviewing`) or a second one against the findings already in that session
 (`rechecking`) — both questions you would otherwise open the PR to answer.
-Every `#N` is an OSC 8 hyperlink, so a terminal that supports them opens the
-PR on cmd-click.
+
+The board redraws itself when the terminal is resized. A narrower terminal
+clears the screen and starts the board again at the top; the rows that had
+finished are still in the summary and the logs. `q` (or ctrl-C) stops the
+pass, stops every running review, and prints the summary of what finished.
 
 The header only mentions concurrency when it actually holds reviews back: with
 five PRs and `--jobs 2` it reads `reviewing 5 PRs, 2 at a time`.
@@ -818,7 +821,8 @@ src/pool.rs        autoreview: the event-driven job pool
 src/job.rs         autoreview: one review, spawned and classified
 src/report.rs      autoreview: verdict readback and the agent's trailer
 src/rundir.rs      autoreview: what one run writes under --log-dir
-src/ui.rs          autoreview: the live board and the summary
+src/ui.rs          autoreview: what every board row and summary says
+src/board.rs       autoreview: the live area, an inline viewport in raw mode
 ```
 
 The two tools have to agree on what counts as an actionable PR and which
@@ -834,7 +838,11 @@ parsing, session goldens, ranking, CLI validation, argv and tab-command
 shapes), then runs the bash suites — the real binaries against fake `gh`,
 `gum`, `cmux` and `dash-p` on `PATH`, inside a throwaway git repo, with
 `$CLAUDE_CONFIG_DIR` pointed at a throwaway session store. They never touch
-your repos, your Claude Code sessions, or GitHub. It finishes with `bash -n`
+your repos, your Claude Code sessions, or GitHub. One file,
+`tests/board.test.sh`, runs autoreview on a pty rather than a pipe, through
+`tests/pty.py`: a driver that answers the board's cursor query, resizes the
+terminal mid-pass and presses `q`. It is the only time the live board is
+drawn under test. It finishes with `bash -n`
 and `shellcheck` over the suite itself and over the scripts in `skills/`, which
 is all the bash in the repo.
 

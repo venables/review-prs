@@ -27,5 +27,6 @@ freely. A unit test asserts that no board row contains an OSC 8 sequence.
   the title shrinks. A row too narrow for a title drops it rather than
   shaving it.
 - The same class of bug, a stale line count on redraw, is what a terminal
-  resize triggers. See the decision that replaces the board renderer when it
-  is recorded.
+  resize triggered. Decision 0015 replaced the renderer for that reason. The
+  rule here stays: the board says the number plain, and the summary is the
+  one place it links.

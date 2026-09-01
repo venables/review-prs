@@ -47,3 +47,4 @@ comments and the commit history, not written at the time of the decision.
 - [0012](0012-panel-is-a-program-and-the-judgment-is-one-model-call.md) Panel is a program, and the judgment is one model call
 - [0013](0013-skills-are-vendored-and-versioned-with-the-binaries.md) Skills are vendored and versioned with the binaries
 - [0014](0014-progress-goes-to-stderr-and-the-report-to-stdout.md) Progress goes to stderr and the report to stdout
+- [0015](0015-the-board-is-an-inline-ratatui-viewport.md) The board is an inline ratatui viewport

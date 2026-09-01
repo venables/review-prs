@@ -29,8 +29,9 @@ cargo clippy --all-targets      # clean today; keep it clean
 - `cargo fmt` is not applied to this tree. Clippy is clean.
 - The test suite is bash 3.2 compatible because macOS ships 3.2. An empty
   array under `set -u` needs the `${arr[@]+"${arr[@]}"}` guard.
-- The suite never has a TTY. The live board is covered only by unit tests in
-  `src/ui.rs` that pin rows at given widths.
+- The suite runs the binaries through pipes, where the board never draws.
+  `tests/board.test.sh` is the exception: it gives autoreview a pty through
+  `tests/pty.py`, which answers the cursor query that `script(1)` does not.
 - The skills under `skills/` are the reviewers the binaries invoke by slash
   name. They are versioned with the binaries.
 - Design decisions live in `docs/decisions/`, one file each, with an index in
@@ -45,8 +46,12 @@ cargo clippy --all-targets      # clean today; keep it clean
   the failure the flag exists to prevent.
 - Count in English through `ui::count`. "1 PR(s)" is the shape to avoid.
 - Board rows carry a plain `#N` label. OSC 8 hyperlinks belong in the summary
-  tables only: indicatif measures a link as its byte width, and a linked board
-  climbs the screen over the scrollback.
+  tables only: the board is measured and redrawn in place, and the summary is
+  the one place a number links.
+- While the board is open the terminal is in raw mode. Print through
+  `ui.note`; a bare `println!` lands inside the live area.
+- Read crossterm events on the main thread, through the board. A reader
+  thread holds the lock the cursor query needs on every resize.
 - Progress goes to stderr and the report to stdout. Off a TTY, progress is one
   plain line per step and a ticking message says nothing.
 - Doc comments state the failure the code prevents, in prose. Match that
