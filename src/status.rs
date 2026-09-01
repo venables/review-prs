@@ -141,6 +141,27 @@ pub mod step {
         format!("synthesizing with {backend}, {}", crate::ui::fmt_dur(elapsed))
     }
 
+    fn pr_list(prs: &[u64]) -> String {
+        prs.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The one-shot sweep's wait for checks still running, said once so a
+    /// log explains the silence that follows.
+    pub fn waiting_for_ci(prs: &[u64], limit: &str) -> String {
+        format!("waiting for CI on {} (up to {limit})", pr_list(prs))
+    }
+
+    /// The same wait, counted up on the spinner.
+    pub fn still_waiting_for_ci(prs: &[u64], waited: u64) -> String {
+        format!("waiting for CI on {}, {}", pr_list(prs), crate::ui::fmt_dur(waited))
+    }
+
+    /// The limit passed. What happens to the PR is the sweep's line to say,
+    /// so this one does not say it too.
+    pub fn gave_up_on_ci(prs: &[u64], limit: &str) -> String {
+        format!("CI on {} is still pending after {limit}", pr_list(prs))
+    }
+
     /// Both numbers when the filters removed something, because "found 3 open
     /// PRs" on a repo showing 40 in the browser reads as a broken query.
     ///
@@ -184,6 +205,10 @@ mod tests {
         assert_eq!(step::reviewing(3, 90), "3 panelists still reviewing, 1m30s");
         assert_eq!(step::reviewing(1, 5), "1 panelist still reviewing, 5s");
         assert_eq!(step::synthesizing("claude", 65), "synthesizing with claude, 1m05s");
+        // The CI wait: the permanent line, the spinner line, and the give-up.
+        assert_eq!(step::waiting_for_ci(&[9, 8], "30m"), "waiting for CI on #9 #8 (up to 30m)");
+        assert_eq!(step::still_waiting_for_ci(&[9], 90), "waiting for CI on #9, 1m30s");
+        assert_eq!(step::gave_up_on_ci(&[9, 8], "30m"), "CI on #9 #8 is still pending after 30m");
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! only in what they do with the numbers afterwards, and in how each names the
 //! flag that shows the rest, which is why the empty-sweep hint is passed in.
 
+use crate::ci;
+use crate::interval::Interval;
 use crate::picker;
 use crate::prlist;
 use crate::repo::RepoContext;
@@ -11,19 +13,42 @@ use crate::status::{Status, step};
 use anyhow::Result;
 use std::collections::HashMap;
 
+/// What the sweep does about a PR whose checks are not green.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CiPolicy {
+    /// --skip-wait-for-ci: the checks are not consulted.
+    Ignore,
+    /// Hold it. For a loop, which looks again on its next poll and picks
+    /// the PR up once its checks pass.
+    Hold,
+    /// Hold it, and first wait up to this long for pending checks to
+    /// settle: a one-shot run has no next poll.
+    Wait(Interval),
+}
+
+impl CiPolicy {
+    /// Are the checks consulted at all: Hold and Wait both gate on them.
+    pub fn gates(&self) -> bool {
+        *self != CiPolicy::Ignore
+    }
+}
+
 pub struct Opts<'a> {
     pub include_approved: bool,
     pub include_dependabot: bool,
     /// Show the picker instead of sweeping every NEW/UPDATED PR.
     pub pick: bool,
     pub continue_sessions: bool,
+    pub ci: CiPolicy,
     /// Appended to "no NEW or UPDATED PRs to review" when a sweep comes up
     /// empty: each tool names its own way to see the rest.
     pub sweep_empty_hint: &'a str,
 }
 
 /// The chosen PR numbers, plus what the board needs to say about every PR it
-/// saw -- the tab fan-out ignores the second half.
+/// saw -- the tab fan-out ignores the second half. No numbers means nothing
+/// to do; the second half still says what was seen, because a loop that
+/// held every PR for its checks needs to know which ones it is waiting on.
 pub type Selection = (Vec<u64>, HashMap<u64, prlist::PrInfo>);
 
 fn mark_resumable(rows: &mut [prlist::Row], ctx: &RepoContext) {
@@ -39,9 +64,9 @@ fn mark_resumable(rows: &mut [prlist::Row], ctx: &RepoContext) {
     }
 }
 
-/// None (after printing why) means there is nothing to do and the caller exits
-/// 0: an empty repo, a sweep with nothing actionable, or an empty pick.
-pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Option<Selection>> {
+/// An empty selection (after printing why) means there is nothing to review
+/// now: an empty repo, a sweep with nothing actionable, or an empty pick.
+pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Selection> {
     status.step(step::fetching(&ctx.owner, &ctx.name));
     let found = prlist::fetch(ctx, opts.include_approved, opts.include_dependabot, status)?;
     // Permanent, not a step: it is the line that keeps "3 PRs to review" from
@@ -56,7 +81,20 @@ pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Option<Sel
     }
     let Some(prs) = prlist::explain_if_empty(found.prs, opts.include_approved, opts.include_dependabot)
     else {
-        return Ok(None);
+        return Ok((Vec::new(), HashMap::new()));
+    };
+    // The sweep alone waits. A pick is a person choosing, and the picker
+    // shows the checks in a column so they choose knowing.
+    let prs = match &opts.ci {
+        CiPolicy::Wait(limit) if !opts.pick => ci::settle(
+            prs,
+            &ctx.me,
+            limit,
+            status,
+            || prlist::fetch(ctx, opts.include_approved, opts.include_dependabot, status).map(|f| f.prs),
+            std::thread::sleep,
+        )?,
+        _ => prs,
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -72,7 +110,7 @@ pub fn run(ctx: &RepoContext, opts: &Opts, status: &Status) -> Result<Option<Sel
         picker::run(&rows, opts.continue_sessions, opts.include_dependabot)?
     } else {
         status.clear();
-        prlist::select_auto(&rows, opts.sweep_empty_hint)
+        prlist::select_auto(&rows, opts.sweep_empty_hint, opts.ci.gates())
     };
-    Ok(numbers.map(|n| (n, info)))
+    Ok((numbers.unwrap_or_default(), info))
 }

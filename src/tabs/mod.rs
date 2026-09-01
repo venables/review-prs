@@ -8,6 +8,7 @@ pub mod command;
 pub mod spawner;
 
 use crate::repo::{self, AlreadyReported};
+use crate::select::CiPolicy;
 use crate::status::{Status, step};
 use crate::{select, session, ui};
 use anyhow::{Result, bail};
@@ -19,6 +20,14 @@ fn select_opts(cfg: &Config) -> select::Opts<'static> {
         include_dependabot: cfg.include_dependabot,
         pick: !cfg.auto,
         continue_sessions: cfg.continue_sessions,
+        // One selection, then tabs: there is no next poll here, so pending
+        // checks are waited for before the tabs open. The picker has no
+        // limit to wait with, and never waits.
+        ci: match (cfg.wait_for_ci, &cfg.ci_wait) {
+            (false, _) => CiPolicy::Ignore,
+            (true, Some(limit)) => CiPolicy::Wait(limit.clone()),
+            (true, None) => CiPolicy::Hold,
+        },
         sweep_empty_hint: "; run without --auto to choose from every open PR",
     }
 }
@@ -33,9 +42,10 @@ pub fn run(cfg: &Config) -> Result<i32> {
     let status = Status::new();
     status.step(step::reading_repo());
     let ctx = repo::load(&status)?;
-    let Some((numbers, _titles)) = select::run(&ctx, &select_opts(cfg), &status)? else {
+    let (numbers, _info) = select::run(&ctx, &select_opts(cfg), &status)?;
+    if numbers.is_empty() {
         return Ok(0);
-    };
+    }
 
     // After the selection, not before it. Detecting earlier would save the one
     // wasted pick you make in a terminal this tool cannot drive -- but it would

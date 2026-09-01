@@ -10,12 +10,13 @@ use crate::interval::{self, Interval};
 pub const HELP: &str = r#"review-prs: pick open non-draft, unapproved PRs and fan out a review per PR.
 
 Usage: review-prs [--auto] [--babysit[=MINUTES]] [--continue] [--all]
-                  [--dependabot] [--help]
+                  [--dependabot] [--skip-wait-for-ci] [--help]
 
   --auto, -A          Skip the picker; fan out every NEW/UPDATED PR, running
                       $REVIEW_PRS_AUTO_CMD (default: the pr-review-tab skill,
                       which auto-reviews and closes the tab on approval)
-                      instead of $REVIEW_PRS_CMD in each tab.
+                      instead of $REVIEW_PRS_CMD in each tab. A PR whose
+                      checks have not passed is held (see --skip-wait-for-ci).
   --babysit[=MIN], -b Re-check any PR that doesn't come back approvable every
                       MIN minutes (default 30, or $REVIEW_PRS_BABYSIT_INTERVAL)
                       until it can be approved, then close its tab. Uses the
@@ -26,6 +27,16 @@ Usage: review-prs [--auto] [--babysit[=MINUTES]] [--continue] [--all]
                       are marked RESUMABLE in the picker.
   --all, -a           Include PRs already marked APPROVED (default: exclude).
   --dependabot, -d    Include Dependabot PRs (default: hidden; shown dimmed).
+  --skip-wait-for-ci  Fan out a PR whatever its checks say. By default --auto
+                      holds a PR until the checks on its head commit pass:
+                      a PR opened a minute ago has its linter still running,
+                      and a review of code the author is about to fix is a
+                      review wasted. Pending checks are waited for, polled
+                      every 30s for up to 30m (or $REVIEW_PRS_CI_WAIT; 30m/1h
+                      forms), before the tabs open. Failing checks are held.
+                      A PR with no checks at all is never held. The picker
+                      shows the checks in a CI column and opens what you
+                      pick, whatever the column says.
   --help, -h          Show this help.
   --version, -V       Show the version.
 
@@ -59,6 +70,12 @@ pub struct Config {
     pub continue_sessions: bool,
     pub include_approved: bool,
     pub include_dependabot: bool,
+    /// Hold a PR whose checks have not passed; off with --skip-wait-for-ci.
+    pub wait_for_ci: bool,
+    /// How long an --auto sweep waits for pending checks before holding the
+    /// PR. Only an --auto run waits, so only that run validates the value:
+    /// a bad $REVIEW_PRS_CI_WAIT in a profile must not refuse the picker.
+    pub ci_wait: Option<Interval>,
     /// The override to run in each tab; None means the built-in claude
     /// invocation, which needs the PR number and the session state to pick its
     /// flags and prompt and so cannot be flattened into a template here.
@@ -90,11 +107,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     let mut continue_sessions = false;
     let mut include_approved = false;
     let mut include_dependabot = false;
+    let mut skip_wait_for_ci = false;
 
     // Kept raw until after arg parsing: validating here would make a bad
     // $REVIEW_PRS_BABYSIT_INTERVAL in a shell profile hard-fail every run,
     // including --help and ordinary picker runs that never babysit.
     let mut babysit_interval_raw = env("REVIEW_PRS_BABYSIT_INTERVAL")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "30".into());
+    let ci_wait_raw = env("REVIEW_PRS_CI_WAIT")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "30".into());
 
@@ -105,6 +126,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--continue" | "-C" => continue_sessions = true,
             "--all" | "-a" => include_approved = true,
             "--dependabot" | "-d" => include_dependabot = true,
+            "--skip-wait-for-ci" => skip_wait_for_ci = true,
             "--help" | "-h" => return Ok(Parsed::Help),
             "--version" | "-V" => return Ok(Parsed::Version),
             other => match other.strip_prefix("--babysit=") {
@@ -126,6 +148,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     // var never blocks a plain review run.
     let babysit_interval = if babysit {
         Some(interval::normalize(&babysit_interval_raw).map_err(|msg| CliError {
+            msg,
+            show_help: false,
+        })?)
+    } else {
+        None
+    };
+    // Validated only by the run that will use it, like the babysit interval.
+    let wait_for_ci = !skip_wait_for_ci;
+    let ci_wait = if wait_for_ci && auto {
+        Some(interval::normalize_named(&ci_wait_raw, "CI wait").map_err(|msg| CliError {
             msg,
             show_help: false,
         })?)
@@ -165,6 +197,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         continue_sessions,
         include_approved,
         include_dependabot,
+        wait_for_ci,
+        ci_wait,
         review_cmd,
         workspace,
         startup_notes,
@@ -289,6 +323,29 @@ mod tests {
         // No override, or no babysit: nothing to warn about.
         assert!(cfg(&["--babysit=15"]).startup_notes.is_empty());
         assert!(cfg_env(&["--auto"], &[("REVIEW_PRS_AUTO_CMD", "auto-r")]).startup_notes.is_empty());
+    }
+
+    #[test]
+    fn waiting_for_ci_is_on_unless_skipped() {
+        assert!(cfg(&[]).wait_for_ci);
+        assert!(!cfg(&["--skip-wait-for-ci"]).wait_for_ci);
+        // The limit is for the sweep, which is the run that waits.
+        assert_eq!(cfg(&["--auto"]).ci_wait.unwrap().normalized, "30m");
+        assert_eq!(cfg_env(&["--auto"], &[("REVIEW_PRS_CI_WAIT", "1h")]).ci_wait.unwrap().secs, 3600);
+        assert!(cfg(&[]).ci_wait.is_none(), "the picker never waits");
+        assert!(cfg(&["--auto", "--skip-wait-for-ci"]).ci_wait.is_none());
+    }
+
+    #[test]
+    fn a_bad_ci_wait_in_the_profile_only_bites_when_sweeping() {
+        let vars = &[("REVIEW_PRS_CI_WAIT", "soon")];
+        let e = run_env(&["--auto"], vars).err().unwrap();
+        assert!(e.msg.contains("invalid CI wait interval"), "got {}", e.msg);
+        assert!(!e.show_help);
+        // Runs that never wait never read it: the picker, and a sweep told
+        // not to wait.
+        assert!(run_env(&[], vars).is_ok());
+        assert!(run_env(&["--auto", "--skip-wait-for-ci"], vars).is_ok());
     }
 
     #[test]

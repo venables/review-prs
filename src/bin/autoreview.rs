@@ -12,12 +12,14 @@
 // opened", or when a dozen PRs would mean a dozen tabs. Pick review-prs when
 // you want to watch a review happen and steer it mid-flight.
 
+use autoreview::ci::Ci;
 use autoreview::cli::Config;
 use autoreview::queue::Queue;
 use autoreview::rundir::RunDir;
+use autoreview::select::CiPolicy;
 use autoreview::status::{Status, step};
-use autoreview::{cli, pool, prlist, queue, repo, select, signals, ui};
-use std::collections::HashMap;
+use autoreview::{ci, cli, pool, prlist, queue, repo, select, signals, ui};
+use std::collections::{HashMap, HashSet};
 
 fn select_prs(cfg: &Config) -> select::Opts<'static> {
     select::Opts {
@@ -25,37 +27,74 @@ fn select_prs(cfg: &Config) -> select::Opts<'static> {
         include_dependabot: cfg.include_dependabot,
         pick: cfg.pick,
         continue_sessions: cfg.continue_sessions,
+        // A watch run looks again in a minute or two, so it never waits on
+        // a check, and neither does the picker. The one-shot pass and a
+        // --babysit run wait: each has one selection to get right, and a
+        // limit to wait with (src/cli.rs sets one exactly when they do).
+        ci: match (cfg.wait_for_ci, &cfg.ci_wait) {
+            (false, _) => CiPolicy::Ignore,
+            (true, Some(limit)) => CiPolicy::Wait(limit.clone()),
+            (true, None) => CiPolicy::Hold,
+        },
         sweep_empty_hint: "; pass --pick to choose from every open PR",
     }
+}
+
+/// What a refresh saw: the PRs the sweep would review now, what the board
+/// needs to say about every PR it saw, and the PRs it is holding for their
+/// checks, so the loop can say so once.
+struct Looked {
+    ready: Vec<u64>,
+    info: HashMap<u64, prlist::PrInfo>,
+    held: Vec<(u64, Ci)>,
 }
 
 /// What the sweep would pick up right now, said quietly -- a babysit loop
 /// that re-announced the whole list on every interval would be noise. Also
 /// returns what the board needs, so a PR that joined mid-run is not a bare
 /// number on it.
-fn actionable_now(
-    cfg: &Config,
-    ctx: &repo::RepoContext,
-    status: &Status,
-) -> anyhow::Result<(Vec<u64>, HashMap<u64, prlist::PrInfo>)> {
+fn actionable_now(cfg: &Config, ctx: &repo::RepoContext, status: &Status) -> anyhow::Result<Looked> {
     let prs = prlist::fetch(ctx, cfg.include_approved, cfg.include_dependabot, status)?.prs;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let rows = prlist::build_rows(&prs, &ctx.me, now);
-    let info = rows.iter().map(|r| (r.number, r.info())).collect();
-    let numbers = rows
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.engage,
-                prlist::Engagement::New | prlist::Engagement::Updated
-            )
-        })
-        .map(|r| r.number)
-        .collect();
-    Ok((numbers, info))
+    let gate = cfg.wait_for_ci;
+    Ok(Looked {
+        ready: rows.iter().filter(|r| r.ready(gate)).map(|r| r.number).collect(),
+        info: rows.iter().map(|r| (r.number, r.info())).collect(),
+        held: rows.iter().filter(|r| r.held(gate)).map(|r| (r.number, r.ci)).collect(),
+    })
+}
+
+/// The PRs a refresh is holding that this run would otherwise review. One it
+/// would refuse anyway -- capped, finished, or outside a --pick -- is not
+/// worth waiting on, and must not keep the loop alive or be named as held.
+fn held_for_this_run(held: &[(u64, Ci)], tracker: &Queue) -> Vec<(u64, Ci)> {
+    held.iter().filter(|(pr, _)| tracker.could_review(*pr)).copied().collect()
+}
+
+/// Name each PR a refresh is holding for its checks, once per PR and state:
+/// a loop that said so on every poll would be noise, and one that never said
+/// so would leave a PR with red checks looking ignored for as long as it ran.
+fn report_held(held: &[(u64, Ci)], announced: &mut HashSet<(u64, Ci)>) {
+    let fresh: Vec<(u64, Ci)> =
+        held.iter().filter(|&&pair| announced.insert(pair)).copied().collect();
+    if !fresh.is_empty() {
+        println!("\n{}", ci::held_line(&fresh));
+    }
+}
+
+/// What a babysit run is still waiting on: the PRs it has reviewed and the
+/// ones it is holding for their checks. Both are reasons to look again.
+fn still_open(watching: &[u64], held: usize) -> String {
+    let open = ui::count(watching.len(), "PR");
+    match (watching.is_empty(), held) {
+        (_, 0) => format!("{open} still open"),
+        (true, n) => format!("{} held for CI", ui::count(n, "PR")),
+        (false, n) => format!("{open} still open, {n} held for CI"),
+    }
 }
 
 /// Say what changed since the last pass, so a queue that grew explains itself
@@ -148,19 +187,32 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // Keeping it out of the arm below also keeps the two apart: a failed fetch
     // must not leave by the same door as an empty pick, which exits 0.
     let sweeping = cfg.watch.is_some() && !cfg.pick;
-    let selected = match select::run(&ctx, &select_prs(cfg), &status) {
+    let (numbers, info) = match select::run(&ctx, &select_prs(cfg), &status) {
         Err(e) if sweeping => {
             eprintln!("warning: could not read the PR list ({e:#})");
             println!("watching anyway; the list will be read again on the next check");
-            None
+            (Vec::new(), HashMap::new())
         }
         other => other?,
     };
-    let (numbers, info) = match (selected, sweeping) {
-        (Some(found), _) => found,
-        (None, true) => (Vec::new(), Default::default()),
-        (None, false) => return Ok(0),
+    // What the sweep held for its checks. The picker holds nothing, so a
+    // --pick run has no held PRs whatever the column said.
+    let held_at_start: Vec<(u64, Ci)> = if cfg.pick {
+        Vec::new()
+    } else {
+        info.iter()
+            .filter(|(_, i)| i.held(cfg.wait_for_ci))
+            .map(|(&pr, i)| (pr, i.ci))
+            .collect()
     };
+    // A --babysit run that found only held PRs is not finished: it looks
+    // again on its interval, like it would for a PR that went quiet, and
+    // reviews them as their checks pass. Exiting here would leave every PR
+    // opened in the last half hour unreviewed until the next cron run.
+    let babysitting_held = cfg.babysit.is_some() && !held_at_start.is_empty();
+    if numbers.is_empty() && !sweeping && !babysitting_held {
+        return Ok(0);
+    }
     let mut rundir = RunDir::new(cfg.log_dir.clone())?;
     let (tx, rx) = std::sync::mpsc::channel();
     signals::install(tx.clone());
@@ -186,9 +238,9 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
     // the cooldown, and the loop guard below takes the same fallback.
     let mut tracker = match (&watch, &cfg.babysit) {
         (Some(w), cooldown) => {
-            Queue::watching(cfg.max_passes, picked, cooldown.as_ref().unwrap_or(w).secs)
+            Queue::watching(cfg.max_passes, picked.clone(), cooldown.as_ref().unwrap_or(w).secs)
         }
-        (None, _) => Queue::new(cfg.max_passes, picked),
+        (None, _) => Queue::new(cfg.max_passes, picked.clone()),
     };
     // Every PR this run is responsible for, which is not the same as the
     // queue: a PR that went quiet is still open, still ours, and still worth
@@ -197,10 +249,19 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
         tracker.note_head(pr, pr_info.head.clone());
     }
     let mut watching = queue.clone();
+    // The PRs held for their checks as of the last look. Kept across polls
+    // so a look that fails does not forget them: a run holding red PRs and
+    // nothing else is still waiting on something, whatever one bad API call
+    // says.
+    let mut held: Vec<(u64, Ci)> = held_at_start.clone();
     // Needed before the pass runs, where the loop's own `poll` is not yet in
     // scope. Only ever read on the watch path.
     let poll_secs = watch.as_ref().map_or(0, |w| w.secs);
     let mut refresh_failures = 0u32;
+    // The selection already named what it held; the first refresh must not
+    // name it again. Only what it named: a SEEN PR with red checks was not
+    // held, and must be named if it becomes UPDATED and is held then.
+    let mut held_announced: HashSet<(u64, Ci)> = held_at_start.iter().copied().collect();
     let mut pass = 1u32;
     let (failures, total) = loop {
         // A watch run reaches the loop with an empty queue whenever there is
@@ -271,17 +332,31 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             // run that believed its own report would babysit a PR it never
             // approved.
             watching = drop_finished(&watching, &mut tracker);
-            let exhausted = nothing_left(&watching, &tracker);
+            // A held PR is a PR this run is waiting on: its checks may pass
+            // on the next poll. So a watch list with nothing left is not
+            // finished while anything is held -- as of the last look, which
+            // is all a failed look below has to go on.
+            held = held_for_this_run(&held, &tracker);
+            let exhausted = nothing_left(&watching, &tracker) && held.is_empty();
 
             let refresh = Status::new();
             refresh.step(step::fetching(&ctx.owner, &ctx.name));
             let looked = actionable_now(&cfg, &ctx, &refresh);
             refresh.clear();
             let fresh = match looked {
-                Ok((numbers, fresh_info)) => {
+                Ok(seen) => {
                     refresh_failures = 0;
-                    info.extend(fresh_info);
-                    numbers
+                    // What the refresh saw, before it decides anything: the
+                    // cap reset compares this against the commit each PR had
+                    // when it was last reviewed, and whether a capped PR is
+                    // worth holding for depends on the same comparison.
+                    for (&pr, pr_info) in &seen.info {
+                        tracker.note_head(pr, pr_info.head.clone());
+                    }
+                    info.extend(seen.info);
+                    held = held_for_this_run(&seen.held, &tracker);
+                    report_held(&held, &mut held_announced);
+                    seen.ready
                 }
                 Err(e) => {
                     // A watch run has nowhere to be. The list will answer
@@ -327,21 +402,23 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
                 }
             };
 
-            // What the refresh saw, before it decides anything: the cap
-            // reset compares this against the commit each PR had when it was
-            // last reviewed.
-            for (&pr, pr_info) in &info {
-                tracker.note_head(pr, pr_info.head.clone());
-            }
             let intake = tracker.next(&watching, &fresh, now_secs());
             // A PR that joined is this run's responsibility from now on, so it
             // is watched until it is approved or closed -- not only while it
             // happens to be actionable.
             watching.extend(intake.joined.iter().copied());
+            // A PR about to be reviewed starts its holds over: if it is
+            // pushed to and held again afterwards, that is a new hold, and
+            // a new hold is named.
+            held_announced.retain(|(pr, _)| !intake.queue.contains(pr));
             report_intake(&intake, &cfg);
             if !intake.queue.is_empty() {
                 break Some(intake.queue);
             }
+            // The same question, asked again with what the look found: a
+            // held PR that was closed meanwhile is no longer a reason to
+            // stay.
+            let exhausted = nothing_left(&watching, &tracker) && held.is_empty();
             // Everything below this decides to stop. A watch run does not
             // stop: an empty repo is a quiet morning, not a finished job.
             if watch.is_some() {
@@ -382,16 +459,16 @@ fn run(cfg: &Config) -> anyhow::Result<i32> {
             }
             if idle_polls >= cfg.max_idle {
                 println!(
-                    "\nnothing has changed in {} since the last review; stopping with {} still open",
+                    "\nnothing has changed in {} since the last review; stopping with {}",
                     ui::count(idle_polls as usize, "idle check"),
-                    ui::count(watching.len(), "PR")
+                    still_open(&watching, held.len())
                 );
                 break None;
             }
             println!(
-                "\nnothing to review right now; next check in {} ({} still open)",
+                "\nnothing to review right now; next check in {} ({})",
                 babysit.normalized,
-                ui::count(watching.len(), "PR")
+                still_open(&watching, held.len())
             );
             interruptible_sleep(&rx, std::time::Duration::from_secs(babysit.secs), &ui);
             already_waited = true;

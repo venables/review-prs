@@ -1,6 +1,7 @@
 //! Fetching and ranking the PRs worth reviewing. Both front-ends read this
 //! one list, so they cannot disagree about what is actionable.
 
+use crate::ci::Ci;
 use crate::repo::RepoContext;
 use crate::status::Status;
 use anyhow::{Context, Result, bail};
@@ -20,7 +21,11 @@ pub fn is_bot(login: &str) -> bool {
 /// reported as "50+" rather than as fact.
 pub const QUERY_LIMIT: usize = 50;
 
-// One GraphQL call for the open PRs, and enough activity to rank engagement.
+// One GraphQL call for the open PRs, enough activity to rank engagement, and
+// the checks on the head commit. That last is its own aliased field rather
+// than a line in the commits list: the rollup is wanted for one commit, and
+// asking for it on a hundred would make the query pay for ninety-nine
+// answers it throws away.
 const QUERY: &str = "
       query($owner:String!, $name:String!) {
         repository(owner:$owner, name:$name) {
@@ -36,6 +41,7 @@ const QUERY: &str = "
               comments(last:100) { nodes { author { login } updatedAt } }
               reviews(last:100)  { nodes { author { login } submittedAt } }
               commits(last:100)  { nodes { commit { committedDate author { user { login } } } } }
+              headCommit: commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
             }
           }
         }
@@ -78,6 +84,23 @@ pub struct CommitNode {
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
+pub struct Rollup {
+    pub state: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct HeadCommit {
+    /// Null when the commit has no checks and no statuses at all.
+    #[serde(rename = "statusCheckRollup")]
+    pub status_check_rollup: Option<Rollup>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct HeadCommitNode {
+    pub commit: HeadCommit,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
 pub struct Nodes<T> {
     #[serde(default = "Vec::new")]
     pub nodes: Vec<T>,
@@ -108,11 +131,27 @@ pub struct PrNode {
     pub reviews: Nodes<ReviewNode>,
     #[serde(default = "empty_nodes")]
     pub commits: Nodes<CommitNode>,
+    /// The tip of the branch alone, for its checks. See `ci`.
+    #[serde(rename = "headCommit", default = "empty_nodes")]
+    pub head_commit: Nodes<HeadCommitNode>,
 }
 
 impl PrNode {
     pub fn author_login(&self) -> &str {
         self.author.as_ref().and_then(|a| a.login.as_deref()).unwrap_or("")
+    }
+
+    /// The checks on the head commit. A missing node, a null rollup and an
+    /// unknown state all read as "no checks": none of them is a reason to
+    /// hold a PR.
+    pub fn ci(&self) -> Ci {
+        let state = self
+            .head_commit
+            .nodes
+            .first()
+            .and_then(|n| n.commit.status_check_rollup.as_ref())
+            .and_then(|r| r.state.as_deref());
+        Ci::from_state(state)
     }
 }
 
@@ -124,6 +163,11 @@ pub enum Engagement {
 }
 
 impl Engagement {
+    /// NEW or UPDATED: something happened that the sweep has not answered.
+    pub fn engaged(self) -> bool {
+        matches!(self, Engagement::New | Engagement::Updated)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Engagement::New => "NEW",
@@ -151,6 +195,8 @@ pub struct PrInfo {
     pub engage: Engagement,
     /// See `Row::head`.
     pub head: Option<String>,
+    /// See `Row::ci`.
+    pub ci: Ci,
 }
 
 impl Row {
@@ -160,6 +206,7 @@ impl Row {
             author: self.author.clone(),
             engage: self.engage,
             head: self.head.clone(),
+            ci: self.ci,
         }
     }
 }
@@ -184,6 +231,33 @@ pub struct Row {
     /// unique: a force-push that keeps committer dates, or two pushes inside
     /// the same second, would read as no push at all and leave the PR capped.
     pub head: Option<String>,
+    /// The checks on that commit, which decide whether the sweep reviews
+    /// the PR now or holds it.
+    pub ci: Ci,
+}
+
+impl Row {
+    pub fn engaged(&self) -> bool {
+        self.engage.engaged()
+    }
+
+    /// What the sweep reviews now: engaged, and, when the checks gate it,
+    /// with its checks passing.
+    pub fn ready(&self, gate_ci: bool) -> bool {
+        self.engaged() && (!gate_ci || self.ci.ready())
+    }
+
+    /// Engaged, but the checks say not yet: what the sweep names as held.
+    pub fn held(&self, gate_ci: bool) -> bool {
+        self.engaged() && !self.ready(gate_ci)
+    }
+}
+
+impl PrInfo {
+    /// See `Row::held`.
+    pub fn held(&self, gate_ci: bool) -> bool {
+        self.engage.engaged() && gate_ci && !self.ci.ready()
+    }
 }
 
 /// What one fetch found: the PRs this run may act on, and how many were open
@@ -400,6 +474,7 @@ pub fn build_rows(prs: &[PrNode], me: &str, now_epoch: i64) -> Vec<Row> {
                 updated_at: pr.updated_at.clone(),
                 resumable: false,
                 head: pr.head_ref_oid.clone(),
+                ci: pr.ci(),
             }
         })
         .collect();
@@ -414,30 +489,32 @@ pub fn build_rows(prs: &[PrNode], me: &str, now_epoch: i64) -> Vec<Row> {
     rows
 }
 
-/// The sweep: every NEW/UPDATED PR. SEEN PRs are skipped on purpose --
-/// nothing has changed since you last engaged, so an unattended sweep has no
-/// reason to re-review them. Prints the selection; None (after printing)
-/// means nothing to do and the caller exits 0. The hint names the caller's own
-/// way to see the rest, which is a different flag in each front-end.
-pub fn select_auto(rows: &[Row], empty_hint: &str) -> Option<Vec<u64>> {
-    let numbers: Vec<u64> = rows
-        .iter()
-        .filter(|r| matches!(r.engage, Engagement::New | Engagement::Updated))
-        .map(|r| r.number)
-        .collect();
-    if numbers.is_empty() {
+/// The sweep: every NEW/UPDATED PR whose checks are not in the way. SEEN PRs
+/// are skipped on purpose -- nothing has changed since you last engaged, so
+/// an unattended sweep has no reason to re-review them. A PR whose checks
+/// are pending or failing is held, and named, unless `gate_ci` is off.
+/// Prints the selection; None (after printing) means nothing to do now. The
+/// hint names the caller's own way to see the rest, which is a different
+/// flag in each front-end.
+pub fn select_auto(rows: &[Row], empty_hint: &str, gate_ci: bool) -> Option<Vec<u64>> {
+    let held: Vec<(u64, Ci)> =
+        rows.iter().filter(|r| r.held(gate_ci)).map(|r| (r.number, r.ci)).collect();
+    if !held.is_empty() {
+        println!("{}", crate::ci::held_line(&held));
+    }
+    let ready: Vec<&Row> = rows.iter().filter(|r| r.ready(gate_ci)).collect();
+    if ready.is_empty() {
         println!("no NEW or UPDATED PRs to review{empty_hint}");
         return None;
     }
     // Each number carries the reason it is here. "4 PRs to review" answers
     // how many; the reader's next question is always which of them are new.
-    let list: Vec<String> = rows
+    let list: Vec<String> = ready
         .iter()
-        .filter(|r| matches!(r.engage, Engagement::New | Engagement::Updated))
         .map(|r| format!("#{} ({})", r.number, r.engage.label().to_lowercase()))
         .collect();
-    println!("{} to review: {}", crate::ui::count(numbers.len(), "PR"), list.join(" "));
-    Some(numbers)
+    println!("{} to review: {}", crate::ui::count(ready.len(), "PR"), list.join(" "));
+    Some(ready.iter().map(|r| r.number).collect())
 }
 
 /// Why a babysit loop should stop watching a PR, or None while it should keep
@@ -621,7 +698,86 @@ mod tests {
     fn select_auto_takes_new_and_updated_only() {
         let prs = filtered(false, false);
         let rows = build_rows(&prs, "me", parse_iso("2026-08-10T12:00:00Z").unwrap());
-        assert_eq!(select_auto(&rows, ""), Some(vec![9, 8]));
+        assert_eq!(select_auto(&rows, "", true), Some(vec![9, 8]));
+    }
+
+    /// The fixture with the head commit's checks set on the PRs named.
+    fn with_ci(states: &[(u64, &str)]) -> Vec<PrNode> {
+        let mut prs = filtered(false, false);
+        for pr in &mut prs {
+            if let Some((_, state)) = states.iter().find(|(n, _)| *n == pr.number) {
+                pr.head_commit = Nodes {
+                    nodes: vec![HeadCommitNode {
+                        commit: HeadCommit {
+                            status_check_rollup: Some(Rollup { state: Some((*state).to_string()) }),
+                        },
+                    }],
+                };
+            }
+        }
+        prs
+    }
+
+    #[test]
+    fn the_checks_reach_the_rows_from_the_query() {
+        // The whole hold is only as good as this wiring: the query asks for
+        // the rollup, PrNode reads it, and Row carries it to the sweep.
+        assert!(QUERY.contains("statusCheckRollup"), "the query must ask for it");
+        assert!(QUERY.contains("headCommit: commits(last:1)"), "...on the head commit alone");
+
+        let json = r#"[
+          {"number":9,"title":"t","isDraft":false,"updatedAt":"2026-08-10T10:00:00Z",
+           "reviewDecision":null,"author":{"login":"alice"},
+           "comments":{"nodes":[]},"reviews":{"nodes":[]},"commits":{"nodes":[]},
+           "headCommit":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING"}}}]}},
+          {"number":8,"title":"t","isDraft":false,"updatedAt":"2026-08-09T10:00:00Z",
+           "reviewDecision":null,"author":{"login":"bob"},
+           "comments":{"nodes":[]},"reviews":{"nodes":[]},"commits":{"nodes":[]},
+           "headCommit":{"nodes":[{"commit":{"statusCheckRollup":null}}]}},
+          {"number":7,"title":"t","isDraft":false,"updatedAt":"2026-08-08T10:00:00Z",
+           "reviewDecision":null,"author":{"login":"carol"},
+           "comments":{"nodes":[]},"reviews":{"nodes":[]},"commits":{"nodes":[]}}
+        ]"#;
+        let prs: Vec<PrNode> = serde_json::from_str(json).unwrap();
+        assert_eq!(prs[0].ci(), Ci::Pending);
+        assert_eq!(prs[1].ci(), Ci::None, "a null rollup is no checks");
+        assert_eq!(prs[2].ci(), Ci::None, "a missing field is no checks");
+        let rows = build_rows(&prs, "me", 0);
+        assert_eq!(rows[0].ci, Ci::Pending);
+    }
+
+    #[test]
+    fn the_sweep_holds_a_pr_whose_checks_are_not_green() {
+        let prs = with_ci(&[(9, "PENDING"), (8, "SUCCESS")]);
+        let rows = build_rows(&prs, "me", parse_iso("2026-08-10T12:00:00Z").unwrap());
+        assert_eq!(select_auto(&rows, "", true), Some(vec![8]), "9 is held");
+        assert_eq!(select_auto(&rows, "", false), Some(vec![9, 8]), "--skip-wait-for-ci");
+
+        // Failing is held the same way: the author is about to push.
+        let prs = with_ci(&[(9, "FAILURE"), (8, "ERROR")]);
+        let rows = build_rows(&prs, "me", 0);
+        assert_eq!(select_auto(&rows, "", true), None, "nothing left to review");
+        assert_eq!(select_auto(&rows, "", false), Some(vec![9, 8]));
+
+        // A PR with no checks at all is never held.
+        let rows = build_rows(&filtered(false, false), "me", 0);
+        assert_eq!(select_auto(&rows, "", true), Some(vec![9, 8]));
+    }
+
+    #[test]
+    fn readiness_is_engagement_and_then_checks() {
+        let prs = with_ci(&[(9, "PENDING"), (6, "PENDING")]);
+        let rows = build_rows(&prs, "me", 0);
+        let nine = rows.iter().find(|r| r.number == 9).unwrap();
+        let six = rows.iter().find(|r| r.number == 6).unwrap();
+        assert!(nine.engaged() && !nine.ready(true) && nine.ready(false));
+        assert!(nine.held(true) && !nine.held(false));
+        // SEEN is not ready whatever its checks say, and not held either:
+        // the hold is for PRs the sweep would otherwise review.
+        assert!(!six.engaged() && !six.ready(true) && !six.ready(false));
+        assert!(!six.held(true));
+        // PrInfo answers the same question for the loop.
+        assert!(nine.info().held(true) && !six.info().held(true));
     }
 
     #[test]

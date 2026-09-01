@@ -45,6 +45,7 @@ fn display_rows(rows: &[Row], show_resumable: bool) -> Vec<String> {
                 format!("#{}", r.number),
                 r.engage.label().to_string(),
                 r.review.to_string(),
+                r.ci.label().to_string(),
             ];
             if show_resumable {
                 row.push(if r.resumable { "RESUMABLE".into() } else { "-".into() });
@@ -71,7 +72,7 @@ fn display_rows(rows: &[Row], show_resumable: bool) -> Vec<String> {
 
 fn legend(show_resumable: bool, continue_sessions: bool, include_dependabot: bool) -> String {
     let mut text = String::from(
-        "NEW = unreviewed by you   UPDATED = activity since your last comment   SEEN = nothing new   CHANGES = changes requested",
+        "NEW = unreviewed by you   UPDATED = activity since your last comment   SEEN = nothing new   CHANGES = changes requested   PENDING/FAILING = CI on the head commit",
     );
     if show_resumable {
         if continue_sessions {
@@ -141,6 +142,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ci::Ci;
     use crate::prlist::Engagement;
 
     fn row(n: u64, bot: bool, resumable: bool) -> Row {
@@ -155,6 +157,7 @@ mod tests {
             updated_at: "2026-08-10T10:00:00Z".into(),
             resumable,
             head: None,
+            ci: Ci::None,
         }
     }
 
@@ -165,6 +168,17 @@ mod tests {
         assert!(display[0].starts_with("#9    NEW"));
         assert!(display[1].starts_with(DIM));
         assert!(display[1].contains("#123  NEW"));
+    }
+
+    #[test]
+    fn the_ci_column_says_what_the_sweep_would_wait_for() {
+        // The picker does not hold anything -- a pick is a pick -- so the
+        // column is how a person sees what the sweep would have held.
+        let pending = Row { ci: Ci::Pending, ..row(9, false, false) };
+        let display = display_rows(&[pending, row(8, false, false)], false);
+        assert!(display[0].contains("PENDING"), "{}", display[0]);
+        assert!(display[1].contains("  -  "), "no checks reads as a dash: {}", display[1]);
+        assert!(legend(false, false, false).contains("PENDING/FAILING = CI"));
     }
 
     #[test]
