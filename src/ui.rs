@@ -23,6 +23,7 @@ use console::style;
 use crossterm::event::Event;
 use ratatui::style::{Color as Ink, Stylize};
 use ratatui::text::{Line, Span};
+use std::collections::HashSet;
 use std::io::IsTerminal;
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
@@ -35,6 +36,11 @@ const TITLE_WIDTH: usize = 60;
 const TITLE_FLOOR: usize = 16;
 /// The columns the footer's gauge draws: a full bar is this many `━`.
 const GAUGE_WIDTH: usize = 24;
+/// The most lines an expanded row adds under itself: what is being followed,
+/// the counts, and the last few events.
+const DETAIL_LINES: usize = 6;
+/// The indent of a detail line, so it sits under the row's label.
+const DETAIL_INDENT: &str = "      ";
 
 pub fn fmt_dur(s: u64) -> String {
     if s >= 3600 {
@@ -182,6 +188,11 @@ pub struct Ui {
     /// The footer's counts: reviews finished, out of the pass.
     finished: usize,
     total: usize,
+    /// The PRs whose rows show their details.
+    expanded: HashSet<u64>,
+    /// The PRs on the board at the last draw, top to bottom: what a digit
+    /// key names.
+    live: Vec<u64>,
 }
 
 impl Ui {
@@ -191,7 +202,16 @@ impl Ui {
         // is on TERM=dumb) asked for text, not escape sequences -- which is
         // exactly what console::colors_enabled already answers.
         let linked = tty && console::colors_enabled();
-        Ui { tty, pr_url_base: linked.then_some(pr_url_base), board: None, frame: 0, finished: 0, total: 0 }
+        Ui {
+            tty,
+            pr_url_base: linked.then_some(pr_url_base),
+            board: None,
+            frame: 0,
+            finished: 0,
+            total: 0,
+            expanded: HashSet::new(),
+            live: Vec::new(),
+        }
     }
 
     /// The "#9" a summary shows, clickable where the terminal allows it.
@@ -299,10 +319,12 @@ impl Ui {
         let width = board.width();
         let spinner = SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()];
         self.frame += 1;
+        let now = epoch_now();
         let mut running = 0usize;
         let mut finishing = 0usize;
         let mut queued = 0usize;
         let mut lines: Vec<Line<'static>> = Vec::new();
+        self.live.clear();
         for job in jobs {
             match job.state {
                 JobState::Running => {
@@ -311,12 +333,20 @@ impl Ui {
                     } else {
                         running += 1;
                     }
+                    self.live.push(job.pr);
                     lines.push(running_line(board_label(job.pr), job, width, spinner));
+                    if self.expanded.contains(&job.pr) {
+                        lines.extend(detail_lines(job, width, now));
+                    }
                 }
                 JobState::Queued => queued += 1,
                 _ => {}
             }
         }
+        // A row that finished takes its details with it, so "any shown"
+        // keeps meaning what the space key thinks it means.
+        let live = &self.live;
+        self.expanded.retain(|pr| live.contains(pr));
         let mut msg = format!("{running} running");
         if finishing > 0 {
             msg.push_str(&format!(" · {finishing} finishing"));
@@ -324,18 +354,21 @@ impl Ui {
         if queued > 0 {
             msg.push_str(&format!(" · {queued} queued"));
         }
-        lines.push(footer_line(self.finished, self.total, &msg, width));
+        let hint = if self.expanded.is_empty() { "space details · q stop" } else { "space hide · q stop" };
+        lines.push(footer_line(self.finished, self.total, &msg, hint, width));
         let _ = board.ensure_height(lines.len() as u16);
         let _ = board.draw(&lines);
     }
 
-    /// What the keys pressed since the last tick ask for. Nothing off a TTY:
-    /// there is no board to press a key at.
+    /// What the keys pressed since the last tick ask for. The ones that only
+    /// change what the board shows are applied here; the rest are handed
+    /// back for the pass to act on. Nothing off a TTY: there is no board to
+    /// press a key at.
     pub fn poll_input(&mut self) -> Vec<Action> {
         let Some(board) = &self.board else {
             return Vec::new();
         };
-        board
+        let actions: Vec<Action> = board
             .events()
             .into_iter()
             .filter_map(|e| match e {
@@ -343,7 +376,33 @@ impl Ui {
                 // The next draw redraws at the new size; nothing to decide.
                 _ => None,
             })
-            .collect()
+            .collect();
+        for action in &actions {
+            self.apply(*action);
+        }
+        actions
+    }
+
+    /// One key's effect on what the board shows.
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::ToggleAll => {
+                if self.expanded.is_empty() {
+                    self.expanded = self.live.iter().copied().collect();
+                } else {
+                    self.expanded.clear();
+                }
+            }
+            Action::Toggle(n) => {
+                if let Some(&pr) = n.checked_sub(1).and_then(|i| self.live.get(i))
+                    && !self.expanded.remove(&pr)
+                {
+                    self.expanded.insert(pr);
+                }
+            }
+            Action::Collapse => self.expanded.clear(),
+            Action::Stop => {}
+        }
     }
 
     /// Tear the board down, leaving only the permanent result lines. Safe to
@@ -665,13 +724,76 @@ fn running_line(label: String, job: &Job, width: usize, spinner: &'static str) -
     // Two single spaces join the three parts; an absent title takes its space
     // with it, which join_spans handles.
     let fixed = reserve + cols(&label) + cols(&status) + 2;
+    // The tool the review is in, when the row can afford it and a title too.
+    // It is the least important part: it goes before the title shrinks to
+    // nothing, and long before the clock.
+    let tool = job
+        .activity
+        .current_tool()
+        .map(|t| format!("· {t}"))
+        .filter(|t| title_budget(width, fixed + cols(t) + 1) > 0)
+        .unwrap_or_default();
+    let fixed = if tool.is_empty() { fixed } else { fixed + cols(&tool) + 1 };
     let who = who_and_what(job, title_budget(width, fixed));
     let mut spans = lead;
     spans.extend(join_spans(vec![
         Span::from(label).cyan().bold(),
         Span::from(who).dim(),
         Span::from(status).magenta(),
+        Span::from(tool).dim(),
     ]));
+    fit(Line::from(spans), width)
+}
+
+/// Seconds since the epoch, for the ages in a details block.
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long ago an event was, in the clock's own words, or nothing when the
+/// event did not say.
+fn age(at: Option<i64>, now: i64) -> String {
+    match at {
+        Some(at) => format!("{} ago", fmt_dur(now.saturating_sub(at).max(0) as u64)),
+        None => String::new(),
+    }
+}
+
+/// The lines an expanded row shows under itself: what is being followed, how
+/// much has happened, and the last few things the reviewer did, oldest
+/// first, each cut to the width.
+fn detail_lines(job: &Job, width: usize, now: i64) -> Vec<Line<'static>> {
+    let tail = &job.activity;
+    let mut lines = vec![detail_line(vec![Span::from(tail.source_label()).dim()], width)];
+    let counts = if tail.turns == 0 {
+        "waiting for the first turn".to_string()
+    } else {
+        format!("{} · {}", count(tail.turns as usize, "turn"), count(tail.tool_calls as usize, "tool call"))
+    };
+    lines.push(detail_line(vec![Span::from(counts).dim()], width));
+    let shown = tail.events.len().min(DETAIL_LINES - lines.len());
+    for event in tail.events.iter().skip(tail.events.len() - shown) {
+        let when = format!("{:>9}", age(event.at, now));
+        let name = event.tool.clone().unwrap_or_else(|| "said".to_string());
+        lines.push(detail_line(
+            vec![
+                Span::from(when).dim(),
+                Span::raw("  "),
+                Span::from(format!("{name:<6}")).cyan(),
+                Span::raw(" "),
+                Span::from(event.what.clone()),
+            ],
+            width,
+        ));
+    }
+    lines
+}
+
+fn detail_line(mut spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    spans.insert(0, Span::raw(DETAIL_INDENT));
     fit(Line::from(spans), width)
 }
 
@@ -728,9 +850,9 @@ fn gauge(pos: usize, len: usize) -> Vec<Span<'static>> {
     ]
 }
 
-/// The line under the rows: the gauge, the counts, and what the rows are
-/// doing in words.
-fn footer_line(pos: usize, len: usize, msg: &str, width: usize) -> Line<'static> {
+/// The line under the rows: the gauge, the counts, what the rows are doing
+/// in words, and at the right edge, when there is room, the keys.
+fn footer_line(pos: usize, len: usize, msg: &str, hint: &str, width: usize) -> Line<'static> {
     let mut lead = vec![Span::raw("  ")];
     lead.extend(gauge(pos, len));
     lead.push(Span::raw(" "));
@@ -738,8 +860,14 @@ fn footer_line(pos: usize, len: usize, msg: &str, width: usize) -> Line<'static>
     lead.push(Span::raw(" "));
     let reserve: usize = lead.iter().map(Span::width).sum();
     let msg = fit_str(msg, width.saturating_sub(reserve));
+    let used = reserve + cols(&msg);
     let mut spans = lead;
     spans.push(Span::from(msg).dim());
+    // Two columns of air at least, or the hint is not worth the space.
+    if let Some(gap) = width.checked_sub(used + cols(hint) + 2) {
+        spans.push(Span::raw(" ".repeat(gap + 2)));
+        spans.push(Span::from(hint.to_string()).dim());
+    }
     fit(Line::from(spans), width)
 }
 
@@ -946,13 +1074,112 @@ mod tests {
             assert!(run.width() <= width, "running row at {width}: {} > {width}", run.width());
             let fin = finished_line(board_label(job.pr), &job, width);
             assert!(fin.width() <= width, "finished row at {width}: {} > {width}", fin.width());
-            let foot = footer_line(1, 2, "1 running · 3 queued", width);
+            let foot = footer_line(1, 2, "1 running · 3 queued", "space details · q stop", width);
             assert!(foot.width() <= width, "footer at {width}: {} > {width}", foot.width());
+            for line in detail_lines(&job, width, 0) {
+                assert!(line.width() <= width, "detail line at {width}: {} > {width}", line.width());
+            }
         }
         // Down to the width where the title stops fitting, the row keeps the
         // parts that say the review is alive.
         let run = text(&running_line(board_label(job.pr), &job, 45, "⠋"));
         assert!(run.contains("#1234567") && run.contains("rechecking"), "got {run:?}");
+    }
+
+    fn busy_job() -> Job {
+        let mut job = Job::new(9);
+        job.author = "alice".into();
+        job.title = "Add retry logic".into();
+        job.activity = crate::activity::Tail::transcript_at("/nonexistent".into(), 0);
+        let line = |block: serde_json::Value| {
+            serde_json::json!({"type": "assistant", "timestamp": "2026-09-01T11:00:05.000Z", "message": {"content": [block]}}).to_string()
+        };
+        let mut text = String::new();
+        text.push_str(&line(serde_json::json!({"type": "text", "text": "Reading the diff."})));
+        text.push('\n');
+        text.push_str(&line(serde_json::json!({"type": "tool_use", "name": "Bash", "input": {"command": "cargo test --quiet"}})));
+        text.push('\n');
+        job.activity.feed(&text);
+        job
+    }
+
+    #[test]
+    fn a_running_row_says_which_tool_it_is_in_when_there_is_room() {
+        let job = busy_job();
+        let wide = text(&running_line("#9".into(), &job, 120, "⠋"));
+        assert!(wide.ends_with("· Bash"), "got {wide:?}");
+        assert!(wide.contains("@alice Add retry logic"));
+        // The tool goes before the title would have to go, and the clock is
+        // never what pays for it.
+        let tight = text(&running_line("#9".into(), &job, 40, "⠋"));
+        assert!(!tight.contains("Bash"), "got {tight:?}");
+        assert!(tight.contains("reviewing"), "got {tight:?}");
+        // A review that just said something is not in a tool.
+        let mut job = job;
+        job.activity.feed(&format!(
+            "{}\n",
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Done."}]}})
+        ));
+        assert!(!text(&running_line("#9".into(), &job, 120, "⠋")).contains("Bash"));
+    }
+
+    #[test]
+    fn an_expanded_row_shows_what_the_review_is_doing() {
+        let job = busy_job();
+        let lines: Vec<String> = detail_lines(&job, 120, 1_788_260_417).iter().map(text).collect();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with(DETAIL_INDENT), "indented under the row: {:?}", lines[0]);
+        assert!(lines[0].contains("waiting for its transcript"), "{:?}", lines[0]);
+        assert_eq!(lines[1].trim(), "2 turns · 1 tool call");
+        assert!(lines[2].contains("12s ago") && lines[2].contains("said") && lines[2].contains("Reading the diff."), "{:?}", lines[2]);
+        assert!(lines[3].contains("Bash") && lines[3].contains("cargo test --quiet"), "{:?}", lines[3]);
+        // Nothing followed yet: the block says so and stays short.
+        let idle = detail_lines(&Job::new(8), 120, 0);
+        let idle: Vec<String> = idle.iter().map(text).collect();
+        assert_eq!(idle.len(), 2, "{idle:?}");
+        assert!(idle[0].contains("not started") && idle[1].contains("waiting for the first turn"), "{idle:?}");
+        // The block never grows past its cap, whatever the tail holds.
+        let mut job = busy_job();
+        for i in 0..20 {
+            job.activity.feed(&format!(
+                "{}\n",
+                serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": format!("f{i}.rs")}}]}})
+            ));
+        }
+        assert_eq!(detail_lines(&job, 120, 0).len(), DETAIL_LINES);
+    }
+
+    #[test]
+    fn the_footer_names_the_keys_when_there_is_room() {
+        let wide = text(&footer_line(0, 2, "2 running", "space details · q stop", 100));
+        assert!(wide.ends_with("space details · q stop"), "got {wide:?}");
+        assert_eq!(wide.len(), wide.trim_end().len(), "the hint sits at the right edge");
+        assert_eq!(console::measure_text_width(&wide), 100);
+        let narrow = text(&footer_line(0, 2, "2 running", "space details · q stop", 45));
+        assert!(!narrow.contains("space"), "got {narrow:?}");
+        assert!(narrow.contains("2 running"));
+    }
+
+    #[test]
+    fn keys_change_what_the_board_shows() {
+        let mut ui = self::ui(true, None);
+        ui.live = vec![9, 8];
+        ui.apply(Action::ToggleAll);
+        assert_eq!(ui.expanded.len(), 2);
+        ui.apply(Action::ToggleAll);
+        assert!(ui.expanded.is_empty());
+        ui.apply(Action::Toggle(2));
+        assert!(ui.expanded.contains(&8) && !ui.expanded.contains(&9));
+        ui.apply(Action::Toggle(2));
+        assert!(ui.expanded.is_empty());
+        // A digit past the last row names nothing, and zero is not a row.
+        ui.apply(Action::Toggle(3));
+        ui.apply(Action::Toggle(0));
+        assert!(ui.expanded.is_empty());
+        ui.apply(Action::Toggle(1));
+        ui.apply(Action::Collapse);
+        assert!(ui.expanded.is_empty());
+        ui.apply(Action::Stop);
     }
 
     #[test]
@@ -1048,6 +1275,8 @@ mod tests {
             frame: 0,
             finished: 0,
             total: 0,
+            expanded: HashSet::new(),
+            live: Vec::new(),
         }
     }
 

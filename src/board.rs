@@ -35,6 +35,12 @@ pub enum Action {
     /// Stop the reviews and print the summary, as ctrl-C did before raw
     /// mode turned it into a key.
     Stop,
+    /// Show every running row's details, or hide them all if any are shown.
+    ToggleAll,
+    /// Show or hide one row's details, by its position on the board from 1.
+    Toggle(usize),
+    /// Hide every row's details.
+    Collapse,
 }
 
 /// The keys the board answers to. A pure function, so the table is testable
@@ -45,9 +51,17 @@ pub fn key_to_action(key: KeyEvent) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
         return None;
     }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Action::Stop);
+    }
+    if !key.modifiers.is_empty() {
+        return None;
+    }
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Stop),
-        KeyCode::Char('q') if key.modifiers.is_empty() => Some(Action::Stop),
+        KeyCode::Char('q') => Some(Action::Stop),
+        KeyCode::Char(' ') | KeyCode::Enter => Some(Action::ToggleAll),
+        KeyCode::Char(d @ '1'..='9') => Some(Action::Toggle(d as usize - '0' as usize)),
+        KeyCode::Esc => Some(Action::Collapse),
         _ => None,
     }
 }
@@ -196,7 +210,19 @@ mod tests {
         // A plain c is not an interrupt, and a shifted q is not a quit.
         assert_eq!(key_to_action(press(KeyCode::Char('c'), KeyModifiers::NONE)), None);
         assert_eq!(key_to_action(press(KeyCode::Char('q'), KeyModifiers::SHIFT)), None);
-        assert_eq!(key_to_action(press(KeyCode::Enter, KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn the_keys_that_show_details() {
+        assert_eq!(key_to_action(press(KeyCode::Char(' '), KeyModifiers::NONE)), Some(Action::ToggleAll));
+        assert_eq!(key_to_action(press(KeyCode::Enter, KeyModifiers::NONE)), Some(Action::ToggleAll));
+        assert_eq!(key_to_action(press(KeyCode::Char('1'), KeyModifiers::NONE)), Some(Action::Toggle(1)));
+        assert_eq!(key_to_action(press(KeyCode::Char('9'), KeyModifiers::NONE)), Some(Action::Toggle(9)));
+        assert_eq!(key_to_action(press(KeyCode::Char('0'), KeyModifiers::NONE)), None);
+        assert_eq!(key_to_action(press(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::Collapse));
+        // A modifier on a letter is some other binding, not this one.
+        assert_eq!(key_to_action(press(KeyCode::Char(' '), KeyModifiers::ALT)), None);
+        assert_eq!(key_to_action(press(KeyCode::Char('x'), KeyModifiers::NONE)), None);
     }
 
     #[test]
