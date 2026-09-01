@@ -73,8 +73,12 @@ rm "$CLAUDE_CONFIG_DIR/skills/auto-review/SKILL.md"
 mkdir -p "$SANDBOX/repo/.claude/skills/recheck-pr"
 printf -- '---\nname: recheck-pr\n---\n' >"$SANDBOX/repo/.claude/skills/recheck-pr/SKILL.md"
 out="$(run_autoreview)"
+# The repo path is git's, resolved, so it can differ from $SANDBOX by a
+# /private prefix on macOS; the assertion holds the parts that cannot.
 assert_contains "a repo's own skill is reported as shadowing too" \
-  "$out" "note: recheck-pr under $SANDBOX/repo/.claude/skills shadow the bundled copies"
+  "$out" "note: recheck-pr under "
+assert_contains "...naming the repo's skills directory" \
+  "$out" "/repo/.claude/skills shadow the bundled copies"
 rm "$SANDBOX/repo/.claude/skills/recheck-pr/SKILL.md"
 out="$(run_autoreview)"
 assert_not_contains "...and nothing is said when nothing shadows" "$out" "shadow the bundled"
