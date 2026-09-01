@@ -46,8 +46,10 @@ fn files_under<'a>(dir: &'a Dir<'a>, out: &mut Vec<&'a Path>) {
 /// return `dir`, which is the value `--add-dir` wants.
 ///
 /// The embedded tree carries no file modes, and the skills run their helper
-/// scripts directly (`scripts/fetch_pr_threads.sh <pr>`), so every script
-/// gets the execute bit back after it is written.
+/// scripts directly (`scripts/fetch_pr_threads.sh <pr>`), so every `.sh`
+/// file gets the execute bit back after it is written. A test holds the
+/// repo to that spelling: an executable helper under skills/ must be a
+/// `.sh`, or it would stage without the bit.
 pub fn stage(dir: &Path) -> Result<PathBuf> {
     let target = dir.join(SKILLS_SUBDIR);
     std::fs::create_dir_all(&target)
@@ -105,17 +107,35 @@ mod tests {
     use super::*;
 
     fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "ar-skills-{}-{}",
-            std::process::id(),
-            crate::rundir::make_unique_dir(&std::env::temp_dir(), "ar-skills-seed.")
-                .unwrap()
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::rundir::make_unique_dir(&std::env::temp_dir(), "ar-skills.").unwrap()
+    }
+
+    #[test]
+    fn every_executable_helper_in_the_repo_is_a_sh_file() {
+        // stage() gives the bit back by extension. A helper with another
+        // extension would be checked in executable and staged without it,
+        // and fail in a review rather than here.
+        use std::os::unix::fs::PermissionsExt;
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if std::fs::metadata(&path).unwrap().permissions().mode() & 0o111 != 0 {
+                    out.push(path);
+                }
+            }
+        }
+        let mut executable = Vec::new();
+        walk(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/skills")), &mut executable);
+        assert!(!executable.is_empty(), "the skills carry helper scripts");
+        for path in executable {
+            assert!(
+                path.extension().is_some_and(|e| e == "sh"),
+                "{} is executable but stage() would not mark it: name it .sh",
+                path.display()
+            );
+        }
     }
 
     #[test]
