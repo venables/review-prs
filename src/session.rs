@@ -29,15 +29,26 @@ pub fn pr_session_id(repo_root: &Path, owner: &str, name: &str, n: u64) -> Strin
     )
 }
 
-/// Where Claude Code keeps its per-project session stores.
-pub fn projects_dir() -> PathBuf {
-    let base = std::env::var("CLAUDE_CONFIG_DIR")
+/// Claude Code's configuration directory: $CLAUDE_CONFIG_DIR, else ~/.claude.
+/// Sessions, and the user's own skills, live under it.
+pub fn config_dir() -> PathBuf {
+    std::env::var("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_default();
             PathBuf::from(home).join(".claude")
-        });
-    base.join("projects")
+        })
+}
+
+/// Where Claude Code keeps its per-project session stores.
+pub fn projects_dir() -> PathBuf {
+    config_dir().join("projects")
+}
+
+/// Where the user's own skills live. A name found here beats the same name
+/// in any directory the agent is handed with --add-dir.
+pub fn user_skills_dir() -> PathBuf {
+    config_dir().join("skills")
 }
 
 /// True when a session with this id already exists locally. Sessions live
