@@ -138,19 +138,34 @@ fn write_bundled(target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy a directory of skills under `target`. `fs::copy` carries the mode,
-/// so a script that is executable on disk stays executable.
+/// Copy one tree. Symlinks are followed, not recreated: a skills directory
+/// is often links into a checkout, and the agent needs the files. `fs::copy`
+/// carries the mode, so a script that is executable on disk stays so.
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
     for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
         let entry = entry?;
+        let path = entry.path();
         let dest = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &dest)?;
+        // is_dir follows a link; file_type() would report the link itself.
+        if path.is_dir() {
+            copy_tree(&path, &dest)?;
         } else {
-            std::fs::copy(entry.path(), &dest)
-                .with_context(|| format!("copying {} to {}", entry.path().display(), dest.display()))?;
+            std::fs::copy(&path, &dest)
+                .with_context(|| format!("copying {} to {}", path.display(), dest.display()))?;
         }
+    }
+    Ok(())
+}
+
+/// Copy the skills under `from` -- the `<name>/` directories parse accepted
+/// and nothing else beside them -- so the staged set is exactly what
+/// `staged_names` reports, and a `.git` or a log directory next to the
+/// skills is never copied along.
+fn copy_skills(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    for name in names_in(from) {
+        copy_tree(&from.join(&name), &to.join(&name))?;
     }
     Ok(())
 }
@@ -167,7 +182,7 @@ pub fn stage(source: &Source, dir: &Path) -> Result<Option<PathBuf>> {
                 .with_context(|| format!("creating {}", target.display()))?;
             write_bundled(&target)?;
         }
-        Source::Dir(from) => copy_tree(from, &target)?,
+        Source::Dir(from) => copy_skills(from, &target)?,
     }
     Ok(Some(dir.to_path_buf()))
 }
@@ -355,8 +370,14 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(dir.join("approve-pr")).unwrap();
         std::fs::write(dir.join("approve-pr/SKILL.md"), "").unwrap();
-        // Not a skill: no SKILL.md.
+        // Not a skill: no SKILL.md. Must not be staged either.
         std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/README.md"), "").unwrap();
+        // A skill that is a link into a checkout, which is how a skills
+        // directory is usually assembled.
+        std::fs::create_dir_all(base.join("checkout/linked-review")).unwrap();
+        std::fs::write(base.join("checkout/linked-review/SKILL.md"), "").unwrap();
+        std::os::unix::fs::symlink(base.join("checkout/linked-review"), dir.join("linked-review")).unwrap();
         dir
     }
 
@@ -383,13 +404,18 @@ mod tests {
         let base = tmp();
         let dir = skills_on_disk(&base);
         let source = Source::Dir(dir);
-        assert_eq!(staged_names(&source), vec!["approve-pr", "my-review"]);
+        assert_eq!(staged_names(&source), vec!["approve-pr", "linked-review", "my-review"]);
         let staged = stage(&source, &base.join("agent")).unwrap().unwrap();
         let skills = staged.join(".claude/skills");
         assert!(skills.join("my-review/SKILL.md").is_file());
         assert!(skills.join("approve-pr/SKILL.md").is_file());
-        // Nothing bundled comes along: this source replaces the bundle.
+        // A linked skill arrives as files, not as a link.
+        assert!(skills.join("linked-review/SKILL.md").is_file());
+        assert!(!skills.join("linked-review").is_symlink());
+        // Nothing bundled comes along: this source replaces the bundle. And
+        // nothing beside the skills comes along either.
         assert!(!skills.join("auto-review").exists());
+        assert!(!skills.join("notes").exists());
         let mode = std::fs::metadata(skills.join("my-review/scripts/helper.sh"))
             .unwrap()
             .permissions()
