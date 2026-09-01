@@ -45,8 +45,8 @@ and stay readable when a downstream skill posts them to a PR verbatim.
 
 Two exceptions. Quoted panelist text stays verbatim, and the fixed labels this
 skill defines (`Goal (clear):`, `Approach (questionable):`,
-`Purpose (unknown):`, `Proof (missing):`, `[HIGH]`, the section headings) stay
-exactly as written — the downstream skills match on them.
+`Purpose (unknown):`, `Proof (missing):`, `[HIGH]`, `DECISION:`, the section
+headings) stay exactly as written — the downstream skills match on them.
 
 ## What a review judges
 
@@ -320,6 +320,37 @@ When _not_ to use:
      a finding (one flags it, another examined the same code and said it's fine;
      or verification falsified a raised finding). Omit when there's nothing to
      surface — do NOT emit a "Disagreements: none." line.
+   - `DECISION: <verdict>` — always, and always the last line. See
+     **The decision line** below.
+
+   ### The decision line
+
+   The synthesis ends with one line, on its own. Nothing follows it except a
+   machine trailer the caller's system prompt asks for:
+
+   ```
+   DECISION: Approve
+   ```
+
+   The verdict is one of three fixed strings. It follows from the buckets
+   above, not from a fresh judgment, and it agrees with the gate
+   `auto-review` applies to the same synthesis. Apply the rules in order. The
+   first rule that matches wins, so every synthesis has exactly one verdict:
+   1. `DECISION: Request changes` — `### must-fix` has an entry. A promoted
+      `Approach`, `Purpose`, or `Proof` flag already sits in a bucket, so it
+      needs no rule of its own.
+   2. `DECISION: Comment` — `### should-fix` has an entry.
+   3. `DECISION: Approve` — everything else: no finding, or polish only.
+
+   This skill posts nothing, so the line says what the review recommends, not
+   what happened on the PR. Put no reason on the line; the sections above are
+   the reason. A reader who scrolls to the end gets the answer. A caller that
+   reads only the last line gets the same one.
+
+   When another skill drives this one (`auto-review`, `recheck-pr`), that
+   skill's own `DECISION:` line ends the reply. This line then ends the
+   synthesis only, and the two may differ: the panel recommends, the driver
+   reports what it did.
 
    ### Overview
 

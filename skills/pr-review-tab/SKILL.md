@@ -66,6 +66,12 @@ still do the review and the babysit loop, but there is no tab to close:
 report the decision instead and, in babysit mode, say the loop won't
 self-terminate (press Esc to stop it). Never guess a tab id.
 
+End your report with the `DECISION:` line of the skill that ran,
+`auto-review` or `recheck-pr`. Put it last, on its own. Only a machine
+trailer the caller asks for may follow it. On approval, the close command
+ends the tab, so write the report and its `DECISION:` line before you run
+the close. A reader of the tab gets one answer at the bottom.
+
 ## Arguments
 
 `pr-review-tab <PR> [--babysit <interval>]`
@@ -135,8 +141,8 @@ esac
 ```
 
 Closing the tab kills this process — that is intended, and it is the last
-thing you do. Report the approval first (one line) so the outcome is in the
-transcript before the pane goes away.
+thing you do. Report the approval first (one line, then the `DECISION:`
+line) so the outcome is in the transcript before the pane goes away.
 
 ### 4b. Not approved, no `--babysit`
 
@@ -158,8 +164,8 @@ closes the tab on approval:
 ```
 /loop <interval> Re-check PR <N> with the recheck-pr skill against the
 auto-review already in this session's context. recheck-pr's fast path makes
-a no-change cycle cheap: if nothing was pushed, it reports one line and
-waits for the next wakeup. If the author has pushed and recheck-pr's gate
+a no-change cycle cheap: if nothing was pushed, it reports a status line
+and its `DECISION:` line, then waits for the next wakeup. If the author has pushed and recheck-pr's gate
 passes so you approve the PR, close this review tab — `herdr tab close
 "$HERDR_TAB_ID"` under Herdr, else `cmux close-surface --surface
 "$CMUX_SURFACE_ID"` — which ends the loop.
@@ -193,7 +199,7 @@ Then stop and let the wakeups run. Notes that matter:
   worst possible trade.
 - **Report before you close.** The close kills the pane; if the only record
   of the decision was going to be on screen, it's gone. Emit the one-line
-  outcome first.
+  outcome and the `DECISION:` line first.
 - **Babysit loops in-session for a reason.** `recheck-pr` needs the prior
   review in context. Don't restructure this to spawn a fresh review each
   cycle — you'd lose the baseline and turn every wakeup into a full

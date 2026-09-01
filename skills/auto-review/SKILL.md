@@ -50,8 +50,9 @@ finding-based blocker (see step 2):
   metaphors, and figures of speech.
 - Do not make a noun out of a verb.
 
-The two canonical approval bodies under "Approval body" are fixed
-strings. Use them exactly as written; do not restyle them.
+The two canonical approval bodies under "Approval body" and the
+`DECISION:` line that ends the report are fixed strings. Use them exactly
+as written; do not restyle them.
 
 ## Prerequisite
 
@@ -80,8 +81,9 @@ needed (this is gate condition #7 below).
 
 If the review ends up running against a non-PR target (`--uncommitted`,
 `--base`, a bare `--commit` with no PR), there's nothing to post to or
-approve: run the review, report its synthesis, and stop — note that
-posting/approval were skipped because the target isn't a PR.
+approve: run the review, report its synthesis, note that posting and
+approval were skipped because the target isn't a PR, write
+`DECISION: No action`, and stop.
 
 Pass the user's `panel-review` options through (panelist selection,
 `--focus`, deep mode if they asked for a "deep auto-review"). Default to
@@ -195,6 +197,32 @@ auto-post did (posted / `+1`'d / filed to Linear / dropped / needs
 attention), and the **approval decision** — approved (with the body used
 and the PR URL) or not approved (with the specific gate condition that
 failed).
+
+Then end with one line, on its own. Nothing follows it except a machine
+trailer the caller's system prompt asks for:
+
+```
+DECISION: Approve
+```
+
+The verdict is what you did to the PR, one of four fixed strings. Apply the
+rules in order. The first rule that matches wins:
+1. `DECISION: Approve` — you submitted an approving review.
+2. `DECISION: Request changes` — you submitted a blocking review (only when
+   the user asked for one; see Gotchas).
+3. `DECISION: Comment` — you posted something and did not approve: a
+   comment, a `+1`, or a reply. A failed coverage gate or a moved head ends
+   here when step 2 posted something. When step 2 posted nothing, rule 4
+   applies.
+4. `DECISION: No action` — you posted nothing: a dry run, a target that is
+   not a PR, a clean panel that failed the coverage gate, or a pass in which
+   every post failed.
+
+Put no reason on the line; the report above is the reason. A reader who
+scrolls to the end gets the answer. A caller that reads only the last line
+gets the same one. The line is fixed text, like the approval bodies. When
+`pr-review-tab` drives this skill, the tab's one-line outcome goes above
+the line, and the line stays last.
 
 ## The approval gate
 

@@ -131,16 +131,19 @@ Exit immediately when **both** hold:
 
 There is nothing to adjudicate: no new code, no new argument. Don't rebuild
 the ledger, don't diff, don't re-read the PR, don't reply, don't resolve,
-don't approve. Say it in one line and stop:
+don't approve. Say it in one line, add the decision line, and stop:
 
 ```
 PR #61 — nothing changed since aaaa1111. 2 findings still open.
+
+DECISION: No action
 ```
 
 Name the open count so the user knows the state without asking. If the PR
-was already fully satisfied at `OLD` but you never approved it, say that
-instead (`nothing changed; 0 open — rerun with approval intent to stamp it`)
-rather than silently approving off a stale read.
+was already fully satisfied at `OLD` but you never approved it, put that
+on the first line instead (`nothing changed; 0 open — rerun with approval
+intent to stamp it`) rather than silently approving off a stale read. The
+`DECISION: No action` line stays.
 
 Anything else — a push (`NEW != OLD`), or a reply you haven't adjudicated —
 means there's real work, so fall through to the full pass below.
@@ -355,13 +358,34 @@ New (n):
 
 Panel re-review: skipped (<why>) | ran (<risk>, <bucket counts>)
 Threads: <n> resolved, <n> replied, <n> left open, <n> skipped (already resolved)
-Decision: approved <url> with "<body>" | not approved — <the gate condition that failed>
+Approval: approved <url> with "<body>" | not approved — <the gate condition that failed>
+
+DECISION: <verdict>
 ```
 
 Keep **Explained** honest — record what you _checked_, not just what the
 author _said_. That line is how the user audits whether your second look
 was real. Same for **Outstanding**: name the specific gap, because the
 author is going to read it and needs to act on it.
+
+The `DECISION:` line is the last line of the reply, on its own. Nothing
+follows it except a machine trailer the caller's system prompt asks for.
+The verdict is what you did to the PR, one of three fixed strings. Apply the
+rules in order. The first rule that matches wins:
+1. `DECISION: Approve` — you submitted an approving review.
+2. `DECISION: Comment` — you posted something and did not approve: a
+   reply, a resolved thread, or a new inline comment. A head that moved at
+   approval time ends here when step 5 had already replied or resolved a
+   thread.
+3. `DECISION: No action` — you posted nothing: the fast path found nothing
+   changed, a stop before step 5 (no prior review in context, a merged or
+   closed PR, a dirty working tree), or a dry run.
+
+Put no reason on the line; the **Approval** line and the ledger above are
+the reason. A reader who scrolls to the end gets the answer. A caller that
+reads only the last line gets the same one. When `pr-review-tab` drives
+this skill, the tab's one-line outcome goes above the line, and the line
+stays last.
 
 ## The approval gate
 
