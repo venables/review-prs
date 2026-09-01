@@ -8,6 +8,7 @@
 //! failure it has already reported. An override is judged by its exit status
 //! alone; prose on stdout is its normal shape, not a failure.
 
+use crate::activity::Tail;
 use crate::cli::Config;
 use crate::report::Trailer;
 use crate::repo::RepoContext;
@@ -70,6 +71,9 @@ pub struct Job {
     pub verdict: Option<String>,
     /// The agent's self-reported trailer (risk, findings, panel).
     pub trailer: Option<Trailer>,
+    /// What the review is doing right now, for the board. Silent until the
+    /// pool decides what there is to follow.
+    pub activity: Tail,
 }
 
 impl Job {
@@ -93,6 +97,7 @@ impl Job {
             model: None,
             verdict: None,
             trailer: None,
+            activity: Tail::silent("not started"),
         }
     }
 

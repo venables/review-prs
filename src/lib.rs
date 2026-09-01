@@ -8,6 +8,7 @@
 //! which session a PR belongs to (`session`) because they are two binaries over
 //! one library -- not two implementations kept in step by hand.
 
+pub mod activity;
 pub mod board;
 pub mod ci;
 pub mod cli;

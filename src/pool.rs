@@ -10,6 +10,7 @@ use crate::report;
 use crate::repo::RepoContext;
 use crate::rundir::RunDir;
 use crate::session::{self, SessionFlag};
+use crate::activity::Tail;
 use crate::board::Action;
 use crate::ui::Ui;
 use nix::sys::signal::{Signal, killpg};
@@ -129,6 +130,21 @@ fn plan_job(job: &mut Job, cfg: &Config, ctx: &RepoContext, rundir: &RunDir, ui:
     }
 }
 
+/// Where a review's live activity can be read from, if anywhere. The
+/// built-in reviewer runs in a session whose transcript claude writes as it
+/// goes -- when this run chose the session id. A session claude named itself
+/// is only found when the review ends, and an override reviewer has no
+/// transcript at all; both leave the stderr log, which is what they write.
+fn follow(job: &Job, is_override: bool, rundir: &RunDir) -> Tail {
+    if is_override {
+        return Tail::plain(rundir.log_path(job.pr));
+    }
+    match &job.sid {
+        Some(sid) => Tail::transcript(sid.clone(), job.started_epoch),
+        None => Tail::silent("claude named this session itself; its transcript is found when the review ends"),
+    }
+}
+
 fn deadline_for(cfg: &Config, is_override: bool) -> Option<Duration> {
     if cfg.timeout_secs == 0 {
         return None;
@@ -191,6 +207,7 @@ pub fn run_pass(
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
                     jobs[idx].state = JobState::Running;
+                    jobs[idx].activity = follow(&jobs[idx], is_override, rundir);
                     deadlines[idx] =
                         deadline_for(cfg, is_override).map(|d| Deadline { at: Instant::now() + d });
                     ui.note_transition(&jobs[idx]);
@@ -386,6 +403,15 @@ pub fn run_pass(
         // the board must never own a reader thread (see src/board.rs).
         if ui.poll_input().contains(&Action::Stop) {
             interrupt(&jobs, ui, rundir);
+        }
+
+        // What each running review is doing, for the board. One stat per
+        // running job per tick; nothing at all off a terminal, where no row
+        // would show it.
+        if ui.tty {
+            for job in jobs.iter_mut().filter(|j| j.state == JobState::Running && !j.reaped) {
+                job.activity.poll();
+            }
         }
 
         // Trip the guard on anything past its deadline. The job stays Running

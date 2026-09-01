@@ -117,7 +117,7 @@ fn read_answer(stdout_path: &std::path::Path) -> Option<String> {
 /// exactly twenty bytes, so the fraction is dropped first. Without this every
 /// timestamp fails to parse, every entry is kept, and the filter below is a
 /// no-op that nothing would have noticed.
-fn transcript_epoch(ts: &str) -> Option<i64> {
+pub(crate) fn transcript_epoch(ts: &str) -> Option<i64> {
     match ts.split_once('.') {
         Some((whole, _)) => crate::prlist::parse_iso(&format!("{whole}Z")),
         None => crate::prlist::parse_iso(ts),
