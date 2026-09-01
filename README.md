@@ -83,9 +83,21 @@ works.
 ### Skills
 
 The reviewer each agent runs is a set of skills, and they live in this repo
-under [`skills/`](skills). The binaries invoke them by name, so the agent has
-to be able to find them. Install them once, for every agent that supports
-the [Agent Skills](https://agentskills.io) layout:
+under [`skills/`](skills). **The binaries carry them**: each build compiles
+the tree in, writes it out for a run, and hands every reviewer the directory
+with `--add-dir`. Nothing is installed, and the skill a review ran is the one
+the binary was built with.
+
+Skills you install yourself still win. Claude Code resolves a name from your
+own skills directory before any directory a run adds, so a copy you put in
+`~/.claude/skills` is the override. Both binaries say when that is happening:
+
+```
+note: auto-review, panel-review under /Users/you/.claude/skills shadow the bundled copies; the installed skills run
+```
+
+To use the skills interactively, outside a run, install them for every agent
+that supports the [Agent Skills](https://agentskills.io) layout:
 
 ```sh
 npx skills add venabots/autoreview --skill '*' --global
@@ -371,6 +383,10 @@ most intervals — without reading each other's results:
 - `pr-N.meta.json` — the metadata envelope (session id, cost, exit status);
   written even when a timeout or interrupt leaves stdout empty
 - `pr-N.log` — stderr, which is where a failure explains itself
+
+Beside the passes, `run-<random>/agent/` holds the bundled skills as the
+reviewers saw them, so a review can be read against the exact instructions it
+ran under.
 
 `--log-dir` pins the location; the default is a fresh temp directory per run.
 
@@ -749,6 +765,7 @@ src/prlist.rs      the GraphQL query, engagement ranking, the sweep
 src/picker.rs      the gum picker
 src/select.rs      fetch, rank, then sweep or pick
 src/session.rs     derived session ids, and how a PR attaches to one
+src/skills.rs      the review skills, compiled in and staged for each run
 src/repo.rs        dependency checks, repo and user context
 src/interval.rs    babysit-interval parsing
 src/cli.rs         autoreview's flags
