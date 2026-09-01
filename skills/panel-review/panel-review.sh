@@ -1076,6 +1076,7 @@ while (( DONE_COUNT < TOTAL )); do
         # That makes the synthetic 124 the single, deterministic writer — the only
         # way .rc is non-empty here is a real code the wrapper wrote just before
         # the kill, which we keep.
+        # shellcheck disable=SC2015  # `|| true` swallows a failed kill on purpose
         [[ -n "$apid" ]] && kill -TERM "$apid" 2>/dev/null || true
         kill -KILL "$ppid" 2>/dev/null || true
         [[ -s "$OUT_DIR/$p.rc" ]] || echo "124" >"$OUT_DIR/$p.rc"   # orchestrator wall-clock exceeded
@@ -1091,6 +1092,7 @@ while (( DONE_COUNT < TOTAL )); do
 done
 
 # Reap any background PIDs that already exited; harmless if all are gone.
+# shellcheck disable=SC2015  # `|| true` swallows a failed wait on purpose
 [[ ${#PIDS[@]} -gt 0 ]] && wait "${PIDS[@]}" 2>/dev/null || true
 
 exit $(( ANY_FAIL ? 2 : 0 ))
