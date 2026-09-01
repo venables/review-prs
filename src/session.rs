@@ -215,6 +215,13 @@ mod tests {
         assert!(!session_exists(id));
         std::fs::write(store.join(format!("{id}.jsonl")), "{}").unwrap();
         assert!(session_exists(id));
+        // The same lookup hands the path to the review reader, which is the
+        // only way it can find what a reviewer said before its last message.
+        // Asserted here rather than in report.rs so that the one test setting
+        // CLAUDE_CONFIG_DIR stays the one test setting it.
+        assert_eq!(transcript_path(id).unwrap(), store.join(format!("{id}.jsonl")));
+        assert_eq!(transcript_path("00000000-0000-5000-a000-000000000002"), None);
+        assert_eq!(transcript_path(""), None);
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&tmp);
     }
