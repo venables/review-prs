@@ -32,8 +32,22 @@ pub fn names() -> Vec<&'static str> {
     names
 }
 
+/// Every file under `dir`, at any depth, as a path relative to the root.
+fn files_under<'a>(dir: &'a Dir<'a>, out: &mut Vec<&'a Path>) {
+    for file in dir.files() {
+        out.push(file.path());
+    }
+    for sub in dir.dirs() {
+        files_under(sub, out);
+    }
+}
+
 /// Write the skills under `dir` as `<dir>/.claude/skills/<name>/...` and
 /// return `dir`, which is the value `--add-dir` wants.
+///
+/// The embedded tree carries no file modes, and the skills run their helper
+/// scripts directly (`scripts/fetch_pr_threads.sh <pr>`), so every script
+/// gets the execute bit back after it is written.
 pub fn stage(dir: &Path) -> Result<PathBuf> {
     let target = dir.join(SKILLS_SUBDIR);
     std::fs::create_dir_all(&target)
@@ -41,6 +55,14 @@ pub fn stage(dir: &Path) -> Result<PathBuf> {
     SKILLS
         .extract(&target)
         .with_context(|| format!("writing the bundled skills under {}", target.display()))?;
+    let mut files = Vec::new();
+    files_under(&SKILLS, &mut files);
+    for path in files.into_iter().filter(|p| p.extension().is_some_and(|e| e == "sh")) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = target.join(path);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("marking {} executable", script.display()))?;
+    }
     Ok(dir.to_path_buf())
 }
 
@@ -49,26 +71,32 @@ pub fn add_dir_flag(dir: &Path) -> String {
     format!("--add-dir={}", dir.display())
 }
 
-/// The bundled names that an installed skill shadows. A skill is installed
-/// when its `SKILL.md` exists under the user's skills directory, symlink or
-/// not, which is how the agent finds it too.
-pub fn shadowed(user_skills_dir: &Path) -> Vec<&'static str> {
+/// The bundled names that a skill under `skills_dir` shadows. A skill counts
+/// when its `SKILL.md` exists there, symlink or not, which is how the agent
+/// finds it too. Both the user's own directory and the reviewed repo's
+/// `.claude/skills` win over a directory a run adds.
+pub fn shadowed(skills_dir: &Path) -> Vec<&'static str> {
     names()
         .into_iter()
-        .filter(|name| user_skills_dir.join(name).join("SKILL.md").is_file())
+        .filter(|name| skills_dir.join(name).join("SKILL.md").is_file())
         .collect()
 }
 
-/// What to say when installed skills shadow bundled ones, or nothing.
-pub fn shadow_note(user_skills_dir: &Path) -> Option<String> {
-    let shadowed = shadowed(user_skills_dir);
-    if shadowed.is_empty() {
+/// What to say when skills under any of `skills_dirs` shadow bundled ones,
+/// or nothing.
+pub fn shadow_note(skills_dirs: &[PathBuf]) -> Option<String> {
+    let found: Vec<String> = skills_dirs
+        .iter()
+        .map(|dir| (dir, shadowed(dir)))
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(dir, names)| format!("{} under {}", names.join(", "), dir.display()))
+        .collect();
+    if found.is_empty() {
         return None;
     }
-    let dir = user_skills_dir.display();
     Some(format!(
-        "note: {} under {dir} shadow the bundled copies; the installed skills run",
-        shadowed.join(", ")
+        "note: {} shadow the bundled copies; the installed skills run",
+        found.join(" and ")
     ))
 }
 
@@ -113,8 +141,19 @@ mod tests {
             let skill = dir.join(".claude/skills").join(name).join("SKILL.md");
             assert!(skill.is_file(), "{} was not written", skill.display());
         }
-        // A skill's helpers travel with it: the instructions name them.
-        assert!(dir.join(".claude/skills/panel-review/panel-review.sh").is_file());
+        // A skill's helpers travel with it, and run as the instructions
+        // run them: directly, so the execute bit the embed dropped is back.
+        use std::os::unix::fs::PermissionsExt;
+        for script in [
+            "panel-review/panel-review.sh",
+            "panel-review/pr-line-url.sh",
+            "recheck-pr/scripts/fetch_pr_threads.sh",
+            "auto-post-panel-review-comments/scripts/pr-line-url.sh",
+        ] {
+            let path = dir.join(".claude/skills").join(script);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "{script} has mode {mode:o}");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -129,20 +168,45 @@ mod tests {
     fn shadowing_is_reported_by_name_and_only_when_real() {
         let base = tmp();
         let user = base.join("skills");
-        assert_eq!(shadow_note(&user), None, "no directory, nothing shadows");
+        let dirs = vec![user.clone()];
+        assert_eq!(shadow_note(&dirs), None, "no directory, nothing shadows");
         // A directory without a SKILL.md is not a skill the agent would load.
         std::fs::create_dir_all(user.join("auto-review")).unwrap();
-        assert_eq!(shadow_note(&user), None);
+        assert_eq!(shadow_note(&dirs), None);
         std::fs::write(user.join("auto-review/SKILL.md"), "---\nname: auto-review\n---\n").unwrap();
         std::fs::create_dir_all(user.join("recheck-pr")).unwrap();
         std::fs::write(user.join("recheck-pr/SKILL.md"), "").unwrap();
         // An unrelated installed skill is not a shadow.
         std::fs::create_dir_all(user.join("something-else")).unwrap();
         std::fs::write(user.join("something-else/SKILL.md"), "").unwrap();
-        let note = shadow_note(&user).unwrap();
+        let note = shadow_note(&dirs).unwrap();
         assert!(note.starts_with("note: auto-review, recheck-pr under "), "{note}");
         assert!(note.ends_with("shadow the bundled copies; the installed skills run"), "{note}");
         assert!(!note.contains("something-else"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_repo_s_own_skills_are_reported_beside_the_user_s() {
+        let base = tmp();
+        let user = base.join("user-skills");
+        let repo = base.join("repo/.claude/skills");
+        std::fs::create_dir_all(user.join("auto-review")).unwrap();
+        std::fs::write(user.join("auto-review/SKILL.md"), "").unwrap();
+        std::fs::create_dir_all(repo.join("panel-review")).unwrap();
+        std::fs::write(repo.join("panel-review/SKILL.md"), "").unwrap();
+        let note = shadow_note(&[user.clone(), repo.clone()]).unwrap();
+        assert_eq!(
+            note,
+            format!(
+                "note: auto-review under {} and panel-review under {} shadow the bundled copies; the installed skills run",
+                user.display(),
+                repo.display()
+            )
+        );
+        // A directory with nothing in it is left out of the sentence.
+        let note = shadow_note(&[base.join("nothing"), repo.clone()]).unwrap();
+        assert!(note.starts_with("note: panel-review under "), "{note}");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
