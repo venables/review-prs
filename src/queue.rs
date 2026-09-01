@@ -148,6 +148,17 @@ impl Queue {
         !self.done.contains(&pr) && self.only.as_ref().is_none_or(|only| only.contains(&pr))
     }
 
+    /// Could this run still review the PR if the sweep offered it: not
+    /// finished, not outside a --pick, and not capped. What decides whether
+    /// a PR held for its checks is worth waiting on -- a capped PR that goes
+    /// green would only be left alone again. Under --watch a push resets
+    /// the cap (see `next`), so a capped PR that was pushed to is still
+    /// worth waiting on; the same rule, asked before the PR is actionable.
+    pub fn could_review(&self, pr: u64) -> bool {
+        let reset_pending = self.cooldown.is_some() && self.pushed_since_review(pr);
+        self.eligible(pr) && (!self.is_capped(pr) || reset_pending)
+    }
+
     /// The next queue: everything the sweep now ranks actionable that this run
     /// is still allowed to review.
     ///
@@ -421,6 +432,41 @@ mod tests {
         let intake = q.next(&[], &[12, 9, 8], 0);
         assert_eq!(intake.queue, vec![12, 9, 8]);
         assert_eq!(intake.joined, vec![12, 9, 8]);
+    }
+
+    #[test]
+    fn a_held_pr_is_worth_waiting_on_only_while_it_could_be_reviewed() {
+        // The loop keeps running for a PR held on its checks. It must not
+        // keep running for one it would refuse anyway: capped, finished, or
+        // outside the pick.
+        let mut q = Queue::new(1, Some(vec![9, 8]));
+        assert!(q.could_review(9));
+        assert!(!q.could_review(12), "not picked");
+        q.record_pass(&[9], 0);
+        assert!(!q.could_review(9), "capped");
+        q.mark_done(8);
+        assert!(!q.could_review(8), "finished");
+    }
+
+    #[test]
+    fn a_capped_pr_that_was_pushed_to_is_worth_waiting_on_under_watch() {
+        // The cap reset in `next` only runs once the PR is actionable. A
+        // capped PR whose author pushed a fix that is still red is not
+        // actionable yet, but the push will reset its cap the moment it is
+        // -- so it is held, not ignored, and the loop names it as held.
+        let mut q = watcher(1, 0);
+        heads(&mut q, &[(9, "c1")]);
+        q.record_pass(&[9], 0);
+        assert!(!q.could_review(9), "capped, no push");
+        heads(&mut q, &[(9, "c2")]);
+        assert!(q.could_review(9), "a push will reset the cap");
+
+        // --babysit never resets a cap, so a push changes nothing there.
+        let mut b = sweep(1);
+        heads(&mut b, &[(9, "c1")]);
+        b.record_pass(&[9], 0);
+        heads(&mut b, &[(9, "c2")]);
+        assert!(!b.could_review(9));
     }
 
     #[test]

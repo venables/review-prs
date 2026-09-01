@@ -11,12 +11,15 @@ pub const HELP: &str = r#"autoreview: review open PRs headlessly, with progress 
 Usage: autoreview [--pick] [--watch[=MINUTES]] [--babysit[=MINUTES]]
                   [--focus TEXT] [--no-post] [--continue] [--jobs N]
                   [--timeout SECONDS] [--budget USD] [--log-dir DIR]
-                  [--all] [--dependabot] [--help]
+                  [--all] [--dependabot] [--skip-wait-for-ci] [--help]
 
 Every NEW or UPDATED PR is reviewed by default -- the actionable ones. SEEN
-PRs (nothing has changed since you last engaged) are left alone.
+PRs (nothing has changed since you last engaged) are left alone, and so is a
+PR whose checks have not passed yet (see --skip-wait-for-ci).
 
   --pick, -p          Choose from a list instead of reviewing every one.
+                      The picker shows each PR's checks in a CI column and
+                      reviews what you pick, whatever the column says.
   --auto, -A          Accepted and ignored: it is the default now.
   --watch[=MIN], -w   Stay on: poll every MIN minutes for new PRs and never
                       stop (default 2, or $AUTOREVIEW_WATCH_INTERVAL). Only
@@ -72,6 +75,17 @@ PRs (nothing has changed since you last engaged) are left alone.
                       printed on every run).
   --all, -a           Include PRs already marked APPROVED (default: exclude).
   --dependabot, -d    Include Dependabot PRs (default: hidden; shown dimmed).
+  --skip-wait-for-ci  Review a PR whatever its checks say. By default the
+                      sweep holds a PR until the checks on its head commit
+                      pass: a PR opened a minute ago has its linter still
+                      running, and a review of code the author is about to
+                      fix is a review wasted. Pending checks are waited for,
+                      polled every 30s for up to 30m (or $AUTOREVIEW_CI_WAIT;
+                      30m/1h forms). Failing checks are held until a push
+                      turns them green. A --watch run never waits: it looks
+                      again on its next poll, and so does the refresh between
+                      --babysit passes. A PR with no checks at all is never
+                      held.
   --help, -h          Show this help.
   --version, -V       Show the version.
 
@@ -136,6 +150,14 @@ pub struct Config {
     pub log_dir: Option<PathBuf>,
     pub include_approved: bool,
     pub include_dependabot: bool,
+    /// Hold a PR whose checks have not passed; off with --skip-wait-for-ci,
+    /// which reviews whatever the checks say.
+    pub wait_for_ci: bool,
+    /// How long a one-shot sweep waits for pending checks before holding
+    /// the PR. Only that run waits, so only that run validates the value: a
+    /// bad $AUTOREVIEW_CI_WAIT in a profile must not refuse a --watch run
+    /// or the picker, neither of which reads it.
+    pub ci_wait: Option<Interval>,
     /// The override to run instead of dash-p; None means the built-in
     /// reviewer. Resolved from $AUTOREVIEW_CMD / $AUTOREVIEW_AUTO_CMD by mode.
     pub review_cmd: Option<String>,
@@ -311,8 +333,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     let mut continue_sessions = false;
     let mut include_approved = false;
     let mut include_dependabot = false;
+    let mut skip_wait_for_ci = false;
 
     let mut jobs_raw = env_nonempty(env, "AUTOREVIEW_JOBS").unwrap_or_else(|| "2".into());
+    let ci_wait_raw = env_nonempty(env, "AUTOREVIEW_CI_WAIT").unwrap_or_else(|| "30".into());
     let mut max_passes_raw =
         env_nonempty(env, "AUTOREVIEW_MAX_PASSES").unwrap_or_else(|| "3".into());
     let mut max_idle_raw = env_nonempty(env, "AUTOREVIEW_MAX_IDLE").unwrap_or_else(|| "3".into());
@@ -341,6 +365,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
             "--no-post" | "-n" => no_post = true,
             "--all" | "-a" => include_approved = true,
             "--dependabot" | "-d" => include_dependabot = true,
+            "--skip-wait-for-ci" => skip_wait_for_ci = true,
             "--help" | "-h" => return Ok(Parsed::Help),
             "--version" | "-V" => return Ok(Parsed::Version),
             "--focus" => {
@@ -428,6 +453,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
     } else {
         None
     };
+    // Validated only by the run that will wait, like the babysit interval:
+    // a --watch run holds and looks again, and a --pick run never waits, so
+    // neither reads the value and neither should refuse on it.
+    let wait_for_ci = !skip_wait_for_ci;
+    let ci_wait = if wait_for_ci && !watch && !pick {
+        Some(interval::normalize_named(&ci_wait_raw, "CI wait").map_err(err)?)
+    } else {
+        None
+    };
 
     // The reviewer to run, and its unattended twin. An unattended run takes
     // the unattended override; falling silently back to the built-in reviewer
@@ -474,6 +508,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I, env: EnvFn) -> Result<Pars
         log_dir: log_dir_raw.map(PathBuf::from),
         include_approved,
         include_dependabot,
+        wait_for_ci,
+        ci_wait,
         review_cmd,
         startup_notes,
     })))
@@ -684,6 +720,42 @@ mod tests {
         assert_eq!(c.max_idle, 3);
         assert_eq!(c.timeout_secs, 3600);
         assert!(c.budget.is_none() && c.log_dir.is_none());
+        assert!(c.wait_for_ci, "waiting for CI is the default");
+        assert_eq!(c.ci_wait.unwrap().normalized, "30m");
+    }
+
+    #[test]
+    fn waiting_for_ci_is_on_unless_skipped() {
+        assert!(cfg(&[]).wait_for_ci);
+        assert!(!cfg(&["--skip-wait-for-ci"]).wait_for_ci);
+        assert!(cfg(&["--skip-wait-for-ci"]).ci_wait.is_none());
+        // The limit comes from the environment, in the babysit shapes.
+        let c = match run_env(&[], &[("AUTOREVIEW_CI_WAIT", "1h")]) {
+            Ok(Parsed::Run(c)) => *c,
+            _ => panic!("expected a run"),
+        };
+        assert_eq!(c.ci_wait.unwrap().secs, 3600);
+        // A babysit run waits on its first selection; a watch run and a
+        // picker never wait, and carry no limit.
+        assert!(cfg(&["--babysit"]).ci_wait.is_some());
+        assert!(cfg(&["--watch"]).wait_for_ci && cfg(&["--watch"]).ci_wait.is_none());
+        assert!(cfg(&["--pick"]).wait_for_ci && cfg(&["--pick"]).ci_wait.is_none());
+    }
+
+    #[test]
+    fn a_bad_ci_wait_names_itself_and_only_bites_when_waiting() {
+        let vars = &[("AUTOREVIEW_CI_WAIT", "soon")];
+        let e = run_env(&[], vars).err().unwrap();
+        assert_eq!(
+            e.msg,
+            "error: invalid CI wait interval: \"soon\" (expected a positive duration, e.g. 30, 30m, 1h)"
+        );
+        assert!(run_env(&["--babysit"], vars).is_err(), "a babysit run waits too");
+        // Runs that never read the value never refuse on it: the same rule
+        // the babysit interval follows.
+        assert!(run_env(&["--skip-wait-for-ci"], vars).is_ok());
+        assert!(run_env(&["--watch"], vars).is_ok());
+        assert!(run_env(&["--pick"], vars).is_ok());
     }
 
     #[test]

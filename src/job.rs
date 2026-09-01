@@ -301,6 +301,8 @@ mod tests {
             log_dir: None,
             include_approved: false,
             include_dependabot: false,
+            wait_for_ci: true,
+            ci_wait: None,
             review_cmd: None,
             startup_notes: vec![],
         }
