@@ -9,9 +9,9 @@ use crate::session::{PlannedSession, SessionFlag};
 use crate::tabs::cli::Config;
 use std::path::Path;
 
-/// POSIX-safe quoting for the two strings that ride into the tab's shell: the
-/// repo path and the session id. A path with a space or a quote in it has to
-/// reach the tab as one word.
+/// POSIX-safe quoting for the strings that ride into the tab's shell: the
+/// repo path, the staged skills path, and the session id. A path with a
+/// space or a quote in it has to reach the tab as one word.
 pub fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()
         && s.bytes()
