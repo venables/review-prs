@@ -17,7 +17,7 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{cursor, execute, terminal};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -98,6 +98,9 @@ fn open_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<Stdout>>> 
 pub struct Board {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     height: u16,
+    /// The terminal as it was at the last draw. A change means the live area
+    /// has to be rebuilt before anything is drawn into it.
+    size: Size,
 }
 
 impl Board {
@@ -110,9 +113,14 @@ impl Board {
         // Raw mode is on from here. Whatever fails next, the caller falls
         // back to plain lines and never touches the terminal again, so this
         // is the last chance to give it back.
-        let terminal = execute!(io::stdout(), cursor::Hide).and_then(|()| open_terminal(height.max(1)));
-        match terminal {
-            Ok(terminal) => Ok(Board { terminal, height: height.max(1) }),
+        let opened = execute!(io::stdout(), cursor::Hide)
+            .and_then(|()| open_terminal(height.max(1)))
+            .and_then(|t| {
+                let size = t.size()?;
+                Ok((t, size))
+            });
+        match opened {
+            Ok((terminal, size)) => Ok(Board { terminal, height: height.max(1), size }),
             Err(e) => {
                 restore_terminal();
                 Err(e)
@@ -125,24 +133,44 @@ impl Board {
         self.terminal.size().map_or(ASSUMED_WIDTH, |s| s.width as usize)
     }
 
+    /// Put the live area back on the screen at `height` rows.
+    ///
+    /// The inline height is fixed when the viewport is made, so this is how
+    /// both a taller area and a resized terminal are handled: clear from the
+    /// live area's top row down, which is the live area and nothing else,
+    /// put the cursor back on that row, and open a new viewport there. What
+    /// is above that row is finished output and survives untouched.
+    ///
+    /// `shift` is how many rows the screen scrolled out from under us, which
+    /// is how many rows the terminal lost in height. A terminal that gets
+    /// shorter drops rows off the top and carries everything else up with
+    /// them, so the live area is no longer where it was last drawn, and
+    /// clearing from the old row would leave a copy of it stranded above.
+    fn rebuild(&mut self, height: u16, shift: u16) -> io::Result<()> {
+        let top = self.terminal.get_frame().area().y.saturating_sub(shift);
+        // Cleared from the row this works out for itself, not through
+        // ratatui, whose own idea of where the live area starts is the one
+        // the shift exists to correct.
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, top),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        )?;
+        self.terminal = open_terminal(height)?;
+        self.height = height;
+        self.size = self.terminal.size()?;
+        Ok(())
+    }
+
     /// Grow the live area to `height` rows. It never shrinks: a row that
     /// finishes leaves a blank row under the footer until the pass ends,
     /// which costs nothing to look at, where rebuilding the viewport on every
     /// finish would cost a cursor query and a clear each time.
-    ///
-    /// Growing rebuilds the terminal. The inline height is fixed when the
-    /// viewport is made, so the old area is cleared, the cursor put back on
-    /// its top row, and a new viewport opened there at the new height.
     pub fn ensure_height(&mut self, height: u16) -> io::Result<()> {
         if height <= self.height {
             return Ok(());
         }
-        let top = self.terminal.get_frame().area().y;
-        self.terminal.clear()?;
-        execute!(io::stdout(), cursor::MoveTo(0, top))?;
-        self.terminal = open_terminal(height)?;
-        self.height = height;
-        Ok(())
+        self.rebuild(height, 0)
     }
 
     /// A permanent line above the live area. It scrolls away with the rest
@@ -154,7 +182,22 @@ impl Board {
     /// Draw the live area: one line per row, top to bottom, the rest blank.
     /// Ratatui diffs against the last frame, so a tick that changed one
     /// spinner cell writes one spinner cell.
+    ///
+    /// A terminal that changed size is rebuilt here first, rather than left
+    /// to ratatui's own resize. Ratatui clears the whole screen whenever the
+    /// terminal gets narrower and starts the viewport again at the top row,
+    /// which takes the header, the finished reviews and everything else on
+    /// screen with it. Rebuilding first leaves ratatui nothing to notice.
     pub fn draw(&mut self, lines: &[Line<'static>]) -> io::Result<()> {
+        let size = self.terminal.size()?;
+        if size != self.size {
+            // A shorter terminal takes rows off the top and carries the live
+            // area up with them; a narrower one leaves it where it was.
+            let shift = self.size.height.saturating_sub(size.height);
+            // Never ask for more rows than the terminal has left.
+            let height = self.height.min(size.height.max(1));
+            self.rebuild(height, shift)?;
+        }
         self.terminal.draw(|frame| {
             let area = frame.area();
             for (i, line) in lines.iter().enumerate().take(area.height as usize) {
