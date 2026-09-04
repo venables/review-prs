@@ -179,10 +179,10 @@ Each row says who opened the PR, and whether this is a first look
 (`reviewing`) or a second one against the findings already in that session
 (`rechecking`) — both questions you would otherwise open the PR to answer.
 
-The board redraws itself when the terminal is resized. A narrower terminal
-clears the screen and starts the board again at the top; the rows that had
-finished are still in the summary and the logs. `q` (or ctrl-C) stops the
-pass, stops every running review, and prints the summary of what finished.
+The board redraws itself when the terminal is resized, in place: the rows
+refit to the new width, and the header and the reviews that already finished
+stay where they are. `q` (or ctrl-C) stops the pass, stops every running
+review, and prints the summary of what finished.
 
 A running row is not the whole story, so `space` (or `enter`) opens every
 running row: the session the review runs in, how many turns and tool calls

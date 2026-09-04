@@ -20,11 +20,15 @@ The live area is a ratatui `Viewport::Inline` over crossterm, in
 it may be; the board decides where it goes.
 
 - Inline, not full screen. Finished rows go above the live area with
-  `insert_before` and scroll away like ordinary output. The `scrolling-regions`
-  feature makes that a scroll instead of a redraw.
-- On a resize ratatui asks the terminal where the cursor is, recomputes the
-  area from the answer, and clears it before the next draw. A narrower
-  terminal clears the whole screen and the board starts again at the top.
+  `insert_before` and scroll away like ordinary output.
+- The board rebuilds itself on a resize, before ratatui can notice one: it
+  clears from the live area's top row down and opens a new viewport there,
+  so everything above survives. Left to itself, ratatui clears the entire
+  screen whenever the terminal gets narrower and starts the viewport again
+  at the top row, which takes the header and every finished review with it.
+- A terminal that loses height carries the live area up with the rows it
+  drops, so the rebuild starts that many rows higher. Clearing from where
+  the area used to be would strand a copy of it above.
 - Raw mode is on only while a board is open. `end_pass` turns it off before
   anything else prints, and a panic hook turns it off before a panic prints.
 - Events are polled on the main thread after every wake of the pass loop.
@@ -39,14 +43,23 @@ it may be; the board decides where it goes.
 - `q` and ctrl-C both take the interrupt path. In raw mode ctrl-C is a key,
   not a signal; TERM and HUP still arrive as signals.
 
+Ratatui's `scrolling-regions` feature is not enabled. It turns the insert
+above the live area into a terminal scroll rather than a redraw, which is
+faster and needs `DECSTBM` plus scroll-up and scroll-down. A terminal
+missing any of those draws each finished row over the row above it instead.
+A handful of inserts per pass is not worth a class of terminal bug.
+
 ## Consequences
 
 - Nothing prints with `println!` while a board is open. Mid-pass lines go
   through `ui.note`, which inserts them above the live area.
 - The suite tests the board through `tests/pty.py`, a driver that answers
-  the cursor query, resizes the pty mid-pass and presses `q`. Whether the
+  the cursor query, resizes the pty mid-pass and presses keys. Whether the
   terminal came back cooked is read from a `stty -a` run inside the session,
-  because macOS revokes the pty when its session leader exits.
+  because macOS revokes the pty when its session leader exits. Its answer to
+  the cursor query is an estimate, so the suite pins what the board writes
+  rather than where a row lands: chiefly that a run never emits a
+  full-screen clear, which is what a resize used to cost.
 - Board rows still carry a plain `#N`. The summary tables are the one place a
   number links.
 - The startup `Status` spinner stays on indicatif: one line on stderr, no
