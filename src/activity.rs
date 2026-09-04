@@ -25,6 +25,10 @@ pub const KEEP: usize = 8;
 /// The most columns a summary of one event may take. The details line has
 /// an age and a tool name to fit as well.
 const WHAT_WIDTH: usize = 48;
+/// The most columns a tool's name may take. An MCP tool is named for its
+/// server and its method both, which runs to fifty columns and leaves the
+/// detail line no room for what the tool was given.
+const NAME_WIDTH: usize = 20;
 /// How often to look for a transcript that has not appeared yet. The lookup
 /// walks every Claude Code project directory, which is not a per-tick cost.
 const LOOKUP_EVERY: Duration = Duration::from_secs(1);
@@ -32,7 +36,9 @@ const LOOKUP_EVERY: Duration = Duration::from_secs(1);
 /// One thing the reviewer did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
-    /// The tool called, or None for something the reviewer said.
+    /// What to call the tool on a row, or None for something the reviewer
+    /// said. It is a name to draw, not a name to match on: it is cleaned of
+    /// anything a terminal would act on and cut to `NAME_WIDTH`.
     pub tool: Option<String>,
     /// A one-line summary: the command, the file, the first line of text.
     pub what: String,
@@ -152,7 +158,8 @@ impl Tail {
     }
 
     /// The tool the reviewer is in right now: the last event, when it was a
-    /// tool call. Text after a tool call means the call is over.
+    /// tool call. Text after a tool call means the call is over. The name is
+    /// the one a row draws, cut to `NAME_WIDTH`, not one to compare against.
     pub fn current_tool(&self) -> Option<&str> {
         self.events.back().and_then(|e| e.tool.as_deref())
     }
@@ -345,9 +352,24 @@ pub fn parse_transcript_line(line: &str, since: i64) -> Vec<Event> {
             let kind = block.get("type").and_then(|t| t.as_str())?;
             match kind {
                 "tool_use" => {
-                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                     let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
-                    Some(Event { tool: Some(name.to_string()), what: summarize(name, &input), at })
+                    // The name is a model's word for the tool it called, and
+                    // it reaches a terminal in raw mode like every other part
+                    // of a row. Sanitized here, once, rather than at each
+                    // place a row draws it -- and before `summarize` reads
+                    // it, or a name carrying a mark would match no tool and
+                    // lose the summary that goes beside it. A name that is
+                    // nothing but marks still has to leave a word behind.
+                    let clean = sanitize_for_display(
+                        block.get("name").and_then(|n| n.as_str()).unwrap_or("tool"),
+                    );
+                    let clean = clean.trim();
+                    let name = if clean.is_empty() { "tool" } else { clean };
+                    let what = summarize(name, &input);
+                    // Shortened only after the summary is chosen: the match
+                    // is on the whole name, and what a row can hold is a
+                    // question for the row.
+                    Some(Event { tool: Some(cut(display_name(name), NAME_WIDTH)), what, at })
                 }
                 "text" => {
                     let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -385,6 +407,26 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// What to call a tool on a row.
+///
+/// An MCP tool is named for its server and its method both, as in
+/// `mcp__plugin_slack_slack__slack_send_message`. The server half is the same
+/// for every tool that server offers and it is the half that arrives first,
+/// so a name cut to fit would draw every one of them alike. Only that half is
+/// dropped: what is left is the method, whatever it holds. One method name
+/// offered by two servers then draws the same on both, which is the trade:
+/// telling two tools apart matters on every row, and telling two servers
+/// apart matters on almost none.
+fn display_name(name: &str) -> &str {
+    let Some(rest) = name.strip_prefix("mcp__") else { return name };
+    match rest.split_once("__") {
+        // A name with nothing after the server half names no method, so
+        // there is nothing to shorten it to.
+        Some((_, method)) if !method.trim().is_empty() => method,
+        _ => name,
+    }
+}
+
 fn cut(s: &str, width: usize) -> String {
     console::truncate_str(s, width, "…").to_string()
 }
@@ -419,7 +461,10 @@ mod tests {
             (tool("Grep", serde_json::json!({"pattern": "fn spawn", "path": "src"})), "Grep", "fn spawn"),
             (tool("Skill", serde_json::json!({"skill": "panel-review", "args": "9"})), "Skill", "panel-review"),
             (tool("Agent", serde_json::json!({"description": "Verify the retry path", "prompt": "..."})), "Agent", "Verify the retry path"),
-            (tool("mcp__slack__send", serde_json::json!({"channel": "c"})), "mcp__slack__send", ""),
+            // A tool this does not know is named and nothing more, and an
+            // MCP tool is named by its method half (see `display_name`).
+            (tool("mcp__slack__send", serde_json::json!({"channel": "c"})), "send", ""),
+            (tool("Bewildering", serde_json::json!({"x": 1})), "Bewildering", ""),
         ];
         for (block, name, what) in cases {
             let events = parse_transcript_line(&assistant(AT, block), 0);
@@ -531,6 +576,49 @@ mod tests {
         assert_eq!(tail.events.len(), 2);
         assert_eq!(tail.current_tool(), Some("Grep"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tool_name_loses_its_control_bytes() {
+        // The name reaches a terminal in raw mode, like the summary beside it.
+        let block = serde_json::json!({"type": "tool_use", "name": "Ba\u{202E}sh", "input": {"command": "ls"}});
+        let events = parse_transcript_line(&assistant(AT, block), 0);
+        assert_eq!(events[0].tool.as_deref(), Some("Bash"));
+        // Cleaned before the summary is built, or the name would match no
+        // tool and the command beside it would be dropped.
+        assert_eq!(events[0].what, "ls");
+        // A name that is nothing but marks still leaves a word on the row.
+        let bare = serde_json::json!({"type": "tool_use", "name": "\u{202E}\u{200B}", "input": {}});
+        let events = parse_transcript_line(&assistant(AT, bare), 0);
+        assert_eq!(events[0].tool.as_deref(), Some("tool"));
+        // Space around a name is not part of it, and a name matched with the
+        // space still attached would lose the summary beside it.
+        let padded = serde_json::json!({"type": "tool_use", "name": " Read ", "input": {"file_path": "/x/a.rs"}});
+        let events = parse_transcript_line(&assistant(AT, padded), 0);
+        assert_eq!(events[0].tool.as_deref(), Some("Read"));
+        assert_eq!(events[0].what, "a.rs");
+        // An MCP name is its server and its method together, and the server
+        // half comes first. Two tools on one server must not draw alike.
+        let name_of = |n: &str| {
+            let block = serde_json::json!({"type": "tool_use", "name": n, "input": {}});
+            parse_transcript_line(&assistant(AT, block), 0)[0].tool.clone().unwrap()
+        };
+        let send = name_of("mcp__plugin_slack_slack__slack_send_message");
+        let update = name_of("mcp__plugin_slack_slack__slack_update_list_record");
+        assert_eq!(send, "slack_send_message");
+        assert_ne!(send, update, "two tools on one server draw differently");
+        for name in [&send, &update] {
+            assert!(console::measure_text_width(name) <= NAME_WIDTH, "got {name:?}");
+        }
+        // A name that is not an MCP one keeps every part of itself.
+        assert_eq!(name_of("Bash"), "Bash");
+        // Only the server half goes. A method that holds the separator keeps
+        // all of itself.
+        assert_eq!(name_of("mcp__github__list__issues"), "list__issues");
+        // A name with no method to fall back to keeps what it has, rather
+        // than drawing a row with a blank where a name goes.
+        assert_eq!(name_of("mcp__"), "mcp__");
+        assert_eq!(name_of("mcp__server__"), "mcp__server__");
     }
 
     #[test]
