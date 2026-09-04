@@ -147,7 +147,7 @@ impl Board {
     /// them, so the live area is no longer where it was last drawn, and
     /// clearing from the old row would leave a copy of it stranded above.
     fn rebuild(&mut self, height: u16, shift: u16) -> io::Result<()> {
-        let top = self.terminal.get_frame().area().y.saturating_sub(shift);
+        let top = self.live_top(shift);
         // Cleared from the row this works out for itself, not through
         // ratatui, whose own idea of where the live area starts is the one
         // the shift exists to correct.
@@ -160,6 +160,27 @@ impl Board {
         self.height = height;
         self.size = self.terminal.size()?;
         Ok(())
+    }
+
+    /// Which row the live area starts on now, which after a resize is not
+    /// the row it was drawn on.
+    ///
+    /// A terminal that rewraps its lines when it changes width moves
+    /// everything below the rewrapped ones. Widen a terminal and the header
+    /// above the board takes fewer rows, so the board rides up; narrow it
+    /// and the board rides down. Nothing announces that. What can be asked
+    /// is where the cursor is: it is parked on the area's first row after
+    /// every draw, and a terminal carries the cursor with its line through a
+    /// resize, which is what keeps a shell prompt under your hands.
+    ///
+    /// The lower of the two answers wins. `shift` -- the rows the terminal
+    /// lost in height -- is what a screen that only scrolled has moved by,
+    /// and a terminal that rewraps without moving the cursor would otherwise
+    /// have its old rows left behind, which is the one outcome worth paying
+    /// a clipped header line to avoid.
+    fn live_top(&mut self, shift: u16) -> u16 {
+        let believed = self.terminal.get_frame().area().y.saturating_sub(shift);
+        cursor::position().map_or(believed, |(_, row)| row.min(believed))
     }
 
     /// Grow the live area to `height` rows. It never shrinks: a row that
@@ -205,6 +226,11 @@ impl Board {
                 frame.render_widget(line, row);
             }
         })?;
+        // Park the cursor on the live area's first row, so that whatever the
+        // terminal does to its lines next, `live_top` can ask where they
+        // went. It is hidden, so it shows nothing wherever it rests.
+        let top = self.terminal.get_frame().area().y;
+        execute!(io::stdout(), cursor::MoveTo(0, top))?;
         Ok(())
     }
 

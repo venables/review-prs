@@ -22,13 +22,22 @@ it may be; the board decides where it goes.
 - Inline, not full screen. Finished rows go above the live area with
   `insert_before` and scroll away like ordinary output.
 - The board rebuilds itself on a resize, before ratatui can notice one: it
-  clears from the live area's top row down and opens a new viewport there,
+  clears from the live area's first row down and opens a new viewport there,
   so everything above survives. Left to itself, ratatui clears the entire
   screen whenever the terminal gets narrower and starts the viewport again
   at the top row, which takes the header and every finished review with it.
-- A terminal that loses height carries the live area up with the rows it
-  drops, so the rebuild starts that many rows higher. Clearing from where
-  the area used to be would strand a copy of it above.
+- Which row the live area starts on is asked, not remembered. A terminal
+  that rewraps its lines when it changes width moves everything below the
+  rewrapped ones: widen one and the header takes fewer rows, so the area
+  rides up. Clearing the row it was drawn on then leaves the real rows
+  stranded above the new ones, with their clocks stopped. The cursor is
+  parked on the area's first row after every draw and the terminal carries
+  it along, which is what makes it answerable.
+- The lower of that answer and the remembered row wins, the remembered one
+  adjusted by any height the terminal lost, which is how far a screen that
+  only scrolled has moved. A terminal that rewraps without carrying the
+  cursor would stand its old rows behind otherwise, and that is worth a
+  clipped header line to avoid.
 - Raw mode is on only while a board is open. `end_pass` turns it off before
   anything else prints, and a panic hook turns it off before a panic prints.
 - Events are polled on the main thread after every wake of the pass loop.
