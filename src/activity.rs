@@ -157,8 +157,11 @@ impl Tail {
         self.events.back().and_then(|e| e.tool.as_deref())
     }
 
-    /// Read what was written since the last poll. Cheap when nothing was: one
-    /// stat, no open.
+    /// Read what was written since the last poll. Cheap when nothing was
+    /// written: one stat and no open. A file left ending in a character the
+    /// writer has not finished is the exception -- it looks longer than what
+    /// has been read until those last bytes land, so it is opened each tick
+    /// for as long as that takes, which is as long as one write.
     pub fn poll(&mut self) {
         let path = match &mut self.source {
             Source::None(_) => return,
@@ -197,8 +200,13 @@ impl Tail {
         if len == self.offset {
             return;
         }
-        let Some(text) = read_from(&path, self.offset) else { return };
-        self.offset = len;
+        // Advanced by what was read, not by the length that was measured: the
+        // read runs to the end of the file as it is by then, which is past
+        // the length sampled a moment earlier if the reviewer wrote another
+        // line in between. Trusting the sample would hand those bytes to the
+        // next poll a second time, as duplicate events and doubled counts.
+        let Some((text, read)) = read_from(&path, self.offset) else { return };
+        self.offset += read;
         self.feed(&text);
     }
 
@@ -242,12 +250,58 @@ impl Tail {
     }
 }
 
-fn read_from(path: &Path, offset: u64) -> Option<String> {
+/// How much of `bytes` the writer has finished writing: its length, less any
+/// character started at the end and not completed.
+///
+/// A character is at most four bytes, so only the last three can begin one.
+/// Walking back from the end finds either a byte that starts a character,
+/// which says how many bytes that character needs, or one that starts none.
+///
+/// A byte that starts nothing needs one byte: itself. That covers plain ascii
+/// and it covers the bytes no character may begin with -- `C0`, `C1` and `F5`
+/// upwards. Waiting for those to be completed would wait for ever, and the
+/// tail would stop following the file at the first one.
+fn complete_len(bytes: &[u8]) -> usize {
+    let first = bytes.len().saturating_sub(3);
+    for (i, &b) in bytes.iter().enumerate().skip(first).rev() {
+        // A continuation byte is the middle of a character, not its start.
+        if (0x80..=0xBF).contains(&b) {
+            continue;
+        }
+        let needs = match b {
+            0xF0..=0xF4 => 4,
+            0xE0..=0xEF => 3,
+            0xC2..=0xDF => 2,
+            _ => 1,
+        };
+        return if bytes.len() - i < needs { i } else { bytes.len() };
+    }
+    bytes.len()
+}
+
+/// What the file holds past `offset`, and how many bytes that was.
+///
+/// A read can land in the middle of a character the reviewer is still
+/// writing. Those trailing bytes are left where they are and read again next
+/// time, rather than turned into a replacement character: the rest of the
+/// character arrives a moment later with nowhere to belong, and the row draws
+/// the mark instead of what the reviewer wrote. A byte that is invalid rather
+/// than unfinished is taken as a replacement character, because nothing will
+/// ever complete it and a tail that waited would stop following the file.
+fn read_from(path: &Path, offset: u64) -> Option<(String, u64)> {
     let mut file = std::fs::File::open(path).ok()?;
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    let whole = complete_len(&bytes);
+    // `complete_len` reads the first byte of the trailing character and
+    // trusts it. Some starts can never be finished whatever follows -- `E0`
+    // then `80` is one -- and waiting for those would wait for ever too, so
+    // ask whether what is there could still become a character.
+    let unfinishable = whole < bytes.len()
+        && std::str::from_utf8(&bytes[whole..]).err().and_then(|e| e.error_len()).is_some();
+    let whole = if unfinishable { bytes.len() } else { whole };
+    Some((String::from_utf8_lossy(&bytes[..whole]).into_owned(), whole as u64))
 }
 
 /// The slice of a transcript line the tail reads. Everything else on the
@@ -476,6 +530,90 @@ mod tests {
         tail.poll();
         assert_eq!(tail.events.len(), 2);
         assert_eq!(tail.current_tool(), Some("Grep"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unfinished_character_is_not_read_until_it_is_written() {
+        let whole = "ok…".as_bytes();
+        assert_eq!(complete_len(whole), whole.len());
+        // Every prefix that cuts the last character short stops before it.
+        for short in 1..3 {
+            let bytes = &whole[..whole.len() - short];
+            assert_eq!(complete_len(bytes), 2, "prefix missing {short} bytes");
+        }
+        // Plain ascii is never pending, and neither is an empty read.
+        assert_eq!(complete_len(b"line\n"), 5);
+        assert_eq!(complete_len(b""), 0);
+        // A byte that is invalid rather than unfinished is taken: nothing
+        // will ever complete it, and a tail that waited would stop here.
+        assert_eq!(complete_len(&[b'a', 0xFF, b'b']), 3);
+        // The same byte at the very end. No character starts with it, so
+        // there is nothing to wait for.
+        for last in [0xFFu8, 0xF5, 0xC0, 0xC1] {
+            assert_eq!(complete_len(&[b'a', last]), 2, "trailing {last:#x} waits for nothing");
+        }
+        // Invalid bytes and an unfinished character in one read: the
+        // unfinished one still waits.
+        let mixed = [b'a', 0xFF, b'b', 0xE2, 0x80];
+        assert_eq!(complete_len(&mixed), 3);
+    }
+
+    #[test]
+    fn the_offset_follows_what_was_read() {
+        // The read runs to the end of the file as it is by then, which is
+        // past any length measured before it. An offset taken from that
+        // earlier measurement hands the same bytes over twice.
+        let dir = std::env::temp_dir().join(format!("ar-activity-offset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let line = format!("{}\n", assistant(AT, tool("Read", serde_json::json!({"file_path": "a.rs"}))));
+        std::fs::write(&path, &line).unwrap();
+        let mut tail = Tail::transcript_at(path.clone(), 0);
+        tail.poll();
+        assert_eq!(tail.offset, line.len() as u64, "the whole file was consumed");
+        assert_eq!(tail.events.len(), 1);
+
+        // What a poll reads is what the file holds past the offset, counted
+        // in bytes rather than in characters.
+        let (text, read) = read_from(&path, 0).unwrap();
+        assert_eq!(read, line.len() as u64);
+        assert_eq!(text.len(), line.len());
+
+        // A start that no following byte could finish is taken now. Waiting
+        // for it would leave the tail stuck on this file for the whole run.
+        let stuck = dir.join("stuck.jsonl");
+        std::fs::write(&stuck, [b'a', 0xE0, 0x80]).unwrap();
+        assert_eq!(read_from(&stuck, 0).unwrap().1, 3);
+        // A start that could still be finished waits.
+        std::fs::write(&stuck, [b'a', 0xE2, 0x80]).unwrap();
+        assert_eq!(read_from(&stuck, 0).unwrap().1, 1);
+
+        // The case the fix exists for, and the one a length sampled before
+        // the read cannot survive: the reviewer is halfway through writing a
+        // character. What was read is then shorter than what the file holds,
+        // and those bytes have to wait for the writer to finish them.
+        let more = format!("{}\n", assistant(AT, tool("Grep", serde_json::json!({"pattern": "…x"}))));
+        let split = more.find('…').unwrap() + 1;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, &more.as_bytes()[..split]).unwrap();
+        let full = std::fs::metadata(&path).unwrap().len();
+        tail.poll();
+        assert_eq!(
+            tail.offset,
+            (line.len() + split - 1) as u64,
+            "the half-written character is left where it is"
+        );
+        assert!(tail.offset < full, "and the file is longer than what was read");
+        assert_eq!(tail.events.len(), 1, "nothing was invented from half a line");
+
+        // The writer finishes. The line is read once, whole.
+        std::io::Write::write_all(&mut f, &more.as_bytes()[split..]).unwrap();
+        tail.poll();
+        assert_eq!(tail.offset, (line.len() + more.len()) as u64);
+        assert_eq!(tail.events.len(), 2, "no line is counted twice");
+        assert_eq!(tail.turns, 2);
+        assert_eq!(tail.events.back().unwrap().what, "…x");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
