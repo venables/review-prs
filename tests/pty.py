@@ -14,10 +14,15 @@ Usage:
   pty.py [--cols N] [--rows N] [--resize AT:COLSxROWS]... [--key AT:TEXT]...
          --out FILE -- command args...
 
-AT is seconds after start. Everything the command drew goes to FILE, raw.
-The exit status is the command's. To learn whether the command gave the
+AT is seconds after start. Everything the command drew goes to FILE, raw, and
+the exit status is the command's. To learn whether the command gave the
 terminal back, run it through a shell that prints `stty -a` afterwards: the
 slave is gone from this side once the session ends.
+
+The cursor row it reports back is an estimate from the newlines it has seen.
+That is enough for a board to anchor itself and redraw, and not enough to say
+which screen row a given part landed on, so assert on what the board writes
+rather than on where it went.
 """
 
 import argparse

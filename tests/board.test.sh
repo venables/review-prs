@@ -55,6 +55,12 @@ assert_contains "a finished review leaves a result line" "$out" "✓"
 assert_contains "...that names the PR" "$out" "#9"
 assert_contains "a resize refits the rows to the new width" "$out" "…"
 assert_contains "the summary follows the board" "$out" "╭"
+# The bug this pins: ratatui clears the entire screen and re-anchors at the
+# top row whenever the terminal gets narrower, which takes the header, the
+# finished reviews and everything else on screen with it. The board rebuilds
+# itself on a resize so ratatui never sees one, and nothing in a run has any
+# other reason to wipe the screen.
+assert_not_contains "a resize never wipes the screen" "$out" "$(printf '\033[2J')"
 if tty_is_cooked; then
   ok "the terminal is given back cooked"
 else
