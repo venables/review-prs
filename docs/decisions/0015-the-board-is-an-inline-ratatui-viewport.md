@@ -48,7 +48,10 @@ it may be; the board decides where it goes.
   on the same top row; a row that finishes leaves a blank row under the
   footer until the pass ends.
 - A terminal that does not answer the cursor query within two seconds gets
-  the pass as plain lines, with a note. `script(1)` is such a terminal.
+  the pass as plain lines, with a note. `script(1)` is such a terminal. That
+  is decided when the board opens. A query that fails later, on a resize,
+  falls back to the remembered row instead: a board that is already up is
+  worth more than an exact row, and the terminal answered once to get here.
 - `q` and ctrl-C both take the interrupt path. In raw mode ctrl-C is a key,
   not a signal; TERM and HUP still arrive as signals.
 
