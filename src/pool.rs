@@ -10,6 +10,8 @@ use crate::report;
 use crate::repo::RepoContext;
 use crate::rundir::RunDir;
 use crate::session::{self, SessionFlag};
+use crate::activity::Tail;
+use crate::board::Action;
 use crate::ui::Ui;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -52,8 +54,8 @@ pub fn stop_group(pgid: i32) {
 /// reviews that already finished are still worth reopening -- so hand back
 /// their session ids on the way out rather than dropping them.
 fn interrupt(jobs: &[Job], ui: &mut Ui, rundir: &RunDir) -> ! {
-    // The board first: its tick threads keep repainting until it is torn
-    // down, and would overdraw the interrupt message below.
+    // The board first: it holds the terminal in raw mode, and the message
+    // below must land on a terminal that has been given back.
     ui.end_pass();
     println!();
     eprintln!("interrupted; stopping running reviews");
@@ -128,6 +130,24 @@ fn plan_job(job: &mut Job, cfg: &Config, ctx: &RepoContext, rundir: &RunDir, ui:
     }
 }
 
+/// Where a review's live activity can be read from, if anywhere. The
+/// built-in reviewer runs in a session whose transcript claude writes as it
+/// goes -- when this run chose the session id. A session claude named itself
+/// is only found when the review ends, and an override reviewer has no
+/// transcript at all; both leave the stderr log, which is what they write.
+fn follow(job: &Job, is_override: bool, rundir: &RunDir) -> Tail {
+    if is_override {
+        return Tail::plain(rundir.log_path(job.pr));
+    }
+    match &job.sid {
+        // A resumed session's transcript already holds every earlier pass;
+        // this run's activity starts at its end.
+        Some(sid) if job.resume => Tail::transcript(sid.clone(), job.started_epoch).from_end(),
+        Some(sid) => Tail::transcript(sid.clone(), job.started_epoch),
+        None => Tail::silent("claude named this session itself; its transcript is found when the review ends"),
+    }
+}
+
 fn deadline_for(cfg: &Config, is_override: bool) -> Option<Duration> {
     if cfg.timeout_secs == 0 {
         return None;
@@ -190,6 +210,7 @@ pub fn run_pass(
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
                     jobs[idx].state = JobState::Running;
+                    jobs[idx].activity = follow(&jobs[idx], is_override, rundir);
                     deadlines[idx] =
                         deadline_for(cfg, is_override).map(|d| Deadline { at: Instant::now() + d });
                     ui.note_transition(&jobs[idx]);
@@ -244,8 +265,10 @@ pub fn run_pass(
             break;
         }
 
+        // Ten frames a second on a terminal: the tick is what turns the
+        // spinner now, and one turn a second is what a spinner looks like.
         let wait = if ui.tty {
-            Duration::from_millis(200)
+            Duration::from_millis(100)
         } else {
             // Event-driven: sleep to the nearest deadline, or just wait for
             // an exit. The cap keeps a wrong deadline from wedging the loop.
@@ -376,6 +399,22 @@ pub fn run_pass(
             Ok(Event::Signal) => interrupt(&jobs, ui, rundir),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        // With the board up the terminal is in raw mode, so ctrl-C is a key
+        // rather than a signal. Read here, on this thread, after every wake:
+        // the board must never own a reader thread (see src/board.rs).
+        if ui.poll_input().contains(&Action::Stop) {
+            interrupt(&jobs, ui, rundir);
+        }
+
+        // What each running review is doing, for the board. One stat per
+        // running job per tick; nothing at all off a terminal, where no row
+        // would show it.
+        if ui.tty {
+            for job in jobs.iter_mut().filter(|j| j.state == JobState::Running && !j.reaped) {
+                job.activity.poll();
+            }
         }
 
         // Trip the guard on anything past its deadline. The job stays Running

@@ -9,16 +9,22 @@
 //!
 //! The plain strings are a contract: the test suite greps for them verbatim,
 //! and so do people's eyes -- keep them byte-identical across refactors.
+//!
+//! The board is drawn by `crate::board`, an inline viewport that redraws
+//! itself at the terminal's current size. This module decides what each row
+//! says and how wide it may be; the board decides where it goes.
 
+use crate::board::{self, Action, Board};
 use crate::job::{Job, JobState};
 use crate::report::{Panelist, Trailer};
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use console::style;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::collections::HashMap;
+use crossterm::event::Event;
+use ratatui::style::{Color as Ink, Stylize};
+use ratatui::text::{Line, Span};
+use std::collections::HashSet;
 use std::io::IsTerminal;
-use std::time::Duration;
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
 /// The most title any board row will show, on a terminal wide enough for it.
@@ -28,21 +34,13 @@ const TITLE_WIDTH: usize = 60;
 /// the PR number, the verb and the clock -- is the part that tells you the
 /// review is alive.
 const TITLE_FLOOR: usize = 16;
-/// The columns SPINNER_TEMPLATE draws ahead of `{msg}`: two spaces, the
-/// spinner, one space. They never appear in the string the row builder
-/// returns, so the builder has to pay for them itself -- otherwise a row cut
-/// to the terminal width is drawn four columns wider than the terminal.
-const SPINNER_RESERVE: usize = 4;
-const SPINNER_TEMPLATE: &str = "  {spinner:.magenta} {msg}";
-const FOOTER_TEMPLATE: &str = "  {bar:24.cyan/238} {pos}/{len} {msg}";
-/// The width to assume when the terminal will not say. Matches what console
-/// falls back to, so the two never disagree.
-const ASSUMED_WIDTH: usize = 80;
-/// The columns FOOTER_TEMPLATE draws around `{pos}/{len}` and ahead of
-/// `{msg}`: two spaces, a 24-column bar, the space before the counts, and the
-/// space after them. The counts themselves vary with the PR count, so the
-/// caller measures those.
-const FOOTER_RESERVE: usize = 28;
+/// The columns the footer's gauge draws: a full bar is this many `━`.
+const GAUGE_WIDTH: usize = 24;
+/// The most lines an expanded row adds under itself: what is being followed,
+/// the counts, and the last few events.
+const DETAIL_LINES: usize = 6;
+/// The indent of a detail line, so it sits under the row's label.
+const DETAIL_INDENT: &str = "      ";
 
 pub fn fmt_dur(s: u64) -> String {
     if s >= 3600 {
@@ -183,18 +181,18 @@ pub struct Ui {
     /// Where a "#9" links to, or None when hyperlinks are off (no terminal,
     /// or a terminal that asked for plain output).
     pr_url_base: Option<String>,
+    /// The live area, open for the length of a pass on a TTY.
     board: Option<Board>,
-}
-
-/// The live TTY board: spinners for running reviews, a progress bar for the
-/// pass. Finished reviews are printed once, above the bars, and scroll away
-/// naturally -- so the board holds at most --jobs running rows, plus the
-/// transient "finishing" rows of reaped reviews whose verdict readback is
-/// still in flight.
-struct Board {
-    mp: MultiProgress,
-    bars: HashMap<u64, ProgressBar>,
-    footer: ProgressBar,
+    /// Which spinner frame the next draw shows.
+    frame: usize,
+    /// The footer's counts: reviews finished, out of the pass.
+    finished: usize,
+    total: usize,
+    /// The PRs whose rows show their details.
+    expanded: HashSet<u64>,
+    /// The PRs on the board at the last draw, top to bottom: what a digit
+    /// key names.
+    live: Vec<u64>,
 }
 
 impl Ui {
@@ -204,7 +202,16 @@ impl Ui {
         // is on TERM=dumb) asked for text, not escape sequences -- which is
         // exactly what console::colors_enabled already answers.
         let linked = tty && console::colors_enabled();
-        Ui { tty, pr_url_base: linked.then_some(pr_url_base), board: None }
+        Ui {
+            tty,
+            pr_url_base: linked.then_some(pr_url_base),
+            board: None,
+            frame: 0,
+            finished: 0,
+            total: 0,
+            expanded: HashSet::new(),
+            live: Vec::new(),
+        }
     }
 
     /// The "#9" a summary shows, clickable where the terminal allows it.
@@ -217,20 +224,20 @@ impl Ui {
     }
 
     /// A note the user should see now: spawn failures, session fallbacks.
-    /// On the board it prints above the bars; elsewhere it goes to stderr.
+    /// On the board it prints above the rows; elsewhere it goes to stderr.
     pub fn note(&mut self, note: String) {
-        match &self.board {
+        match &mut self.board {
             Some(b) => {
-                let note = fit(&note, board_width().saturating_sub(2));
-                let _ = b.mp.println(format!("  {}", style(&note).yellow()));
+                let note = fit_str(&note, b.width().saturating_sub(2));
+                let _ = b.println(Line::from(vec![Span::raw("  "), Span::from(note).yellow()]));
             }
             None => eprintln!("{note}"),
         }
     }
 
     /// Without a TTY the in-place board is replaced by one line per state
-    /// change. On a TTY this drives the board instead: a start adds a
-    /// spinner, a finish prints a permanent result line and drops it.
+    /// change. On a TTY this drives the board instead: a finish prints a
+    /// permanent result line, and the next draw picks up a start.
     pub fn note_transition(&mut self, job: &Job) {
         if self.tty {
             self.board_transition(job);
@@ -257,6 +264,8 @@ impl Ui {
 
     /// Print the pass header and stand up the live board.
     pub fn begin_pass(&mut self, total: usize, jobs_max: u32, pass_dir: &std::path::Path) {
+        self.finished = 0;
+        self.total = total;
         if !self.tty {
             println!("{}", pass_headline(total, jobs_max));
             println!("logs: {}\n", pass_dir.display());
@@ -268,18 +277,19 @@ impl Ui {
             style(format!("· logs: {}", pass_dir.display())).dim()
         );
         println!();
-        let total_width = board_width();
-        let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stdout());
-        let footer = mp.add(ProgressBar::new(total as u64));
-        footer.set_style(
-            ProgressStyle::with_template(FOOTER_TEMPLATE)
-                .expect("footer template")
-                .progress_chars("━╸─"),
-        );
-        let counts = format!("0/{total}");
-        let first = fit("reviewed", total_width.saturating_sub(FOOTER_RESERVE + cols(&counts)));
-        footer.set_message(style(first).dim().to_string());
-        self.board = Some(Board { mp, bars: HashMap::new(), footer });
+        // As many rows as can run at once, plus the footer. A reaped review
+        // waiting on its readback keeps its row while the next one starts,
+        // so the board may still have to grow; it does that on its own.
+        let rows = total.min(jobs_max as usize) as u16;
+        match Board::open(rows + 1) {
+            Ok(board) => self.board = Some(board),
+            Err(e) => {
+                // A terminal that will not take raw mode still gets the pass,
+                // one plain line per change, like a pipe would.
+                eprintln!("note: could not draw the board ({e}); printing plain lines");
+                self.tty = false;
+            }
+        }
     }
 
     fn board_transition(&mut self, job: &Job) {
@@ -288,42 +298,33 @@ impl Ui {
             return;
         };
         match job.state {
-            JobState::Running => {
-                let bar = board.mp.insert_before(&board.footer, ProgressBar::new_spinner());
-                bar.set_style(
-                    ProgressStyle::with_template(SPINNER_TEMPLATE)
-                        .expect("spinner template")
-                        .tick_strings(SPINNER_FRAMES),
-                );
-                bar.set_message(running_line(label, job, board_width()));
-                bar.enable_steady_tick(Duration::from_millis(80));
-                board.bars.insert(job.pr, bar);
-            }
+            // The next draw adds the row; nothing to insert.
+            JobState::Running | JobState::Queued => {}
             JobState::Done | JobState::Failed | JobState::Timeout => {
-                if let Some(bar) = board.bars.remove(&job.pr) {
-                    bar.finish_and_clear();
-                    board.mp.remove(&bar);
-                }
-                let _ = board.mp.println(finished_line(label, job, board_width()));
-                board.footer.inc(1);
+                let width = board.width();
+                let _ = board.println(finished_line(label, job, width));
+                self.finished += 1;
             }
-            JobState::Queued => {}
         }
     }
 
-    /// Refresh the running spinners' elapsed time and the footer counts.
-    /// Called on the pool's tick; the spinner animation itself runs on
-    /// indicatif's own steady tick.
+    /// Redraw the live area: one row per running review, the footer under
+    /// them. Called on the pool's tick, which is also what turns the spinner.
     pub fn render(&mut self, jobs: &[Job]) {
-        let Some(board) = &self.board else {
+        let Some(board) = &mut self.board else {
             return;
         };
         // Read once, not once per row: every row of a tick is drawn in the
         // same terminal, and each read is a size ioctl.
-        let width = board_width();
+        let width = board.width();
+        let spinner = SPINNER_FRAMES[self.frame % SPINNER_FRAMES.len()];
+        self.frame += 1;
+        let now = epoch_now();
         let mut running = 0usize;
         let mut finishing = 0usize;
         let mut queued = 0usize;
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        self.live.clear();
         for job in jobs {
             match job.state {
                 JobState::Running => {
@@ -332,14 +333,20 @@ impl Ui {
                     } else {
                         running += 1;
                     }
-                    if let Some(bar) = board.bars.get(&job.pr) {
-                        bar.set_message(running_line(board_label(job.pr), job, width));
+                    self.live.push(job.pr);
+                    lines.push(running_line(board_label(job.pr), job, width, spinner));
+                    if self.expanded.contains(&job.pr) {
+                        lines.extend(detail_lines(job, width, now));
                     }
                 }
                 JobState::Queued => queued += 1,
                 _ => {}
             }
         }
+        // A row that finished takes its details with it, so "any shown"
+        // keeps meaning what the space key thinks it means.
+        let live = &self.live;
+        self.expanded.retain(|pr| live.contains(pr));
         let mut msg = format!("{running} running");
         if finishing > 0 {
             msg.push_str(&format!(" · {finishing} finishing"));
@@ -347,24 +354,64 @@ impl Ui {
         if queued > 0 {
             msg.push_str(&format!(" · {queued} queued"));
         }
-        // Same reserve problem as the spinner rows: the footer template draws
-        // "  ", a 24-column bar, a space, "{pos}/{len}", and a space before
-        // {msg}.
-        let reserve = FOOTER_RESERVE
-            + cols(&format!("{}/{}", board.footer.position(), board.footer.length().unwrap_or(0)));
-        let msg = fit(&msg, width.saturating_sub(reserve));
-        board.footer.set_message(style(msg).dim().to_string());
+        let hint = if self.expanded.is_empty() { "space details · q stop" } else { "space hide · q stop" };
+        lines.push(footer_line(self.finished, self.total, &msg, hint, width));
+        let _ = board.ensure_height(lines.len() as u16);
+        let _ = board.draw(&lines);
+    }
+
+    /// What the keys pressed since the last tick ask for. The ones that only
+    /// change what the board shows are applied here; the rest are handed
+    /// back for the pass to act on. Nothing off a TTY: there is no board to
+    /// press a key at.
+    pub fn poll_input(&mut self) -> Vec<Action> {
+        let Some(board) = &self.board else {
+            return Vec::new();
+        };
+        let actions: Vec<Action> = board
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Key(key) => board::key_to_action(key),
+                // The next draw redraws at the new size; nothing to decide.
+                _ => None,
+            })
+            .collect();
+        for action in &actions {
+            self.apply(*action);
+        }
+        actions
+    }
+
+    /// One key's effect on what the board shows.
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::ToggleAll => {
+                if self.expanded.is_empty() {
+                    self.expanded = self.live.iter().copied().collect();
+                } else {
+                    self.expanded.clear();
+                }
+            }
+            Action::Toggle(n) => {
+                if let Some(&pr) = n.checked_sub(1).and_then(|i| self.live.get(i))
+                    && !self.expanded.remove(&pr)
+                {
+                    self.expanded.insert(pr);
+                }
+            }
+            Action::Collapse => self.expanded.clear(),
+            Action::Stop => {}
+        }
     }
 
     /// Tear the board down, leaving only the permanent result lines. Safe to
     /// call twice: the interrupt path and the normal end both come through.
+    /// This is also where raw mode ends, so it runs before anything else
+    /// prints.
     pub fn end_pass(&mut self) {
         if let Some(board) = self.board.take() {
-            for (_, bar) in board.bars {
-                bar.finish_and_clear();
-            }
-            board.footer.finish_and_clear();
-            let _ = board.mp.clear();
+            board.close();
         }
     }
 
@@ -549,23 +596,15 @@ fn short_title(title: &str, width: usize) -> String {
 /// What a board row calls a PR: plain text, never the hyperlinked label the
 /// summary uses.
 ///
-/// indicatif measures each row it redraws with console::measure_text_width to
-/// work out how many terminal lines the row occupies, and that function strips
-/// SGR colour but not OSC 8 hyperlinks -- it reports a linked "#1711" as 54
-/// columns where it renders as 5. Every linked row is then believed to wrap,
-/// the move-up-N-lines redraw is computed against the wrong count, and the
-/// board climbs the screen overwriting scrollback.
-///
-/// Every board call site goes through here so the links cannot come back one
-/// site at a time. The summary table is a plain println! that indicatif never
-/// measures, so it links freely.
+/// The board is the one place a row is measured and redrawn in place, and a
+/// hyperlink is forty-odd bytes that draw five columns. The first board
+/// measured them as bytes, believed every linked row wrapped, and climbed the
+/// screen overwriting scrollback. The current one measures spans correctly,
+/// but the rule stays: the summary is where a `#N` links, and the board says
+/// the number plain. Every board call site goes through here so the links
+/// cannot come back one site at a time.
 fn board_label(pr: u64) -> String {
     format!("#{pr}")
-}
-
-/// The terminal the board is drawn on, or what to assume when it will not say.
-fn board_width() -> usize {
-    console::Term::stdout().size_checked().map_or(ASSUMED_WIDTH, |(_, w)| w as usize)
 }
 
 /// What is left for the title once the parts that must survive have been paid
@@ -580,16 +619,9 @@ fn title_budget(width: usize, fixed: usize) -> usize {
     if left < TITLE_FLOOR { 0 } else { TITLE_WIDTH.min(left) }
 }
 
-/// Cut a rendered line to the width it is drawn in. This is a backstop, not
-/// the mechanism: the row builders size the title so it never fires. It exists
-/// for the row too narrow to hold even its fixed parts, where something has to
-/// give and there is nothing left to choose.
-///
-/// Note this is legibility rather than correctness. indicatif counts a wrapped
-/// line correctly (`LineType::wrapped_metrics` walks the string and counts the
-/// wraps), so a row that overruns looks misaligned but does not corrupt the
-/// redraw the way an unmeasurable one does -- see `board_transition`.
-fn fit(line: &str, width: usize) -> String {
+/// Cut a plain string to the width it is drawn in. For the parts of the
+/// board that are not rows: a note, the footer's message.
+fn fit_str(line: &str, width: usize) -> String {
     // console::truncate_str returns the ellipsis itself at width 0, which is
     // one column and so still overruns. A width this small has nothing to say
     // anyway.
@@ -597,6 +629,41 @@ fn fit(line: &str, width: usize) -> String {
         return String::new();
     }
     console::truncate_str(line, width, "…").to_string()
+}
+
+/// Cut a rendered row to the width it is drawn in. This is a backstop, not
+/// the mechanism: the row builders size the title so it never fires. It exists
+/// for the row too narrow to hold even its fixed parts, where something has to
+/// give and there is nothing left to choose.
+///
+/// The cut keeps every span's style up to the column it stops at, and ends
+/// in an ellipsis styled like the span it cut.
+fn fit(line: Line<'static>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    if line.width() <= width {
+        return line;
+    }
+    // Measured on the plain text, so a wide character at the boundary is
+    // counted the way the terminal draws it; then the same number of
+    // characters is taken back out of the spans.
+    let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let cut = console::truncate_str(&plain, width, "…");
+    let mut keep = cut.chars().count().saturating_sub(1);
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let chars = span.content.chars().count();
+        if chars <= keep {
+            keep -= chars;
+            spans.push(span);
+            continue;
+        }
+        let head: String = span.content.chars().take(keep).collect();
+        spans.push(Span::styled(format!("{head}…"), span.style));
+        break;
+    }
+    Line::from(spans)
 }
 
 /// Who opened it and what it is called, in the width the board has. A row
@@ -614,14 +681,15 @@ fn who_and_what(job: &Job, width: usize) -> String {
 
 /// A row's parts joined with single spaces, skipping any that draws nothing --
 /// a row that could not afford a title must not show where it would have been.
-///
-/// Measured rather than tested with `is_empty`, because the parts arrive
-/// styled: on a terminal `style("").dim()` is eight bytes of SGR that draw
-/// zero columns, so an empty title would survive an `is_empty` filter and take
-/// a joining space with it. Off a terminal console emits no bytes and the two
-/// tests agree, which is why only a real terminal ever showed the gap.
-fn join_parts(parts: &[String]) -> String {
-    parts.iter().filter(|p| cols(p) > 0).cloned().collect::<Vec<_>>().join(" ")
+fn join_spans(parts: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for part in parts.into_iter().filter(|p| p.width() > 0) {
+        if !out.is_empty() {
+            out.push(Span::raw(" "));
+        }
+        out.push(part);
+    }
+    out
 }
 
 /// The width of a string as the terminal will draw it.
@@ -629,9 +697,16 @@ fn cols(s: &str) -> usize {
     console::measure_text_width(s)
 }
 
+/// What a running row draws ahead of its text: two spaces, the spinner, one
+/// space. Built as spans and measured, never restated as a constant, so a
+/// row cut to the terminal width is never drawn wider than the terminal.
+fn spinner_lead(spinner: &'static str) -> Vec<Span<'static>> {
+    vec![Span::raw("  "), Span::raw(spinner).magenta(), Span::raw(" ")]
+}
+
 /// `label` is the PR number as the caller wants it rendered. The board passes
-/// plain text; see `board_transition` for why it may not pass a hyperlink.
-fn running_line(label: String, job: &Job, width: usize) -> String {
+/// plain text; see `board_label` for why it may not pass a hyperlink.
+fn running_line(label: String, job: &Job, width: usize, spinner: &'static str) -> Line<'static> {
     // A reaped review already exited and only the verdict readback remains:
     // freeze the clock at the real duration rather than letting it climb
     // past what the summary will report.
@@ -644,38 +719,101 @@ fn running_line(label: String, job: &Job, width: usize) -> String {
         )
     };
     let status = format!("· {verb} {}", fmt_dur(secs));
-    // The row is drawn inside the spinner template, so the width it has is the
-    // terminal less what that template draws in front of it.
-    let width = width.saturating_sub(SPINNER_RESERVE);
+    let lead = spinner_lead(spinner);
+    let reserve: usize = lead.iter().map(Span::width).sum();
     // Two single spaces join the three parts; an absent title takes its space
-    // with it, which join_parts handles.
-    let fixed = cols(&label) + cols(&status) + 2;
+    // with it, which join_spans handles.
+    let fixed = reserve + cols(&label) + cols(&status) + 2;
+    // The tool the review is in, when the row can afford it and a title too.
+    // It is the least important part: it goes before the title shrinks to
+    // nothing, and long before the clock.
+    let tool = job
+        .activity
+        .current_tool()
+        .map(|t| format!("· {t}"))
+        .filter(|t| title_budget(width, fixed + cols(t) + 1) > 0)
+        .unwrap_or_default();
+    let fixed = if tool.is_empty() { fixed } else { fixed + cols(&tool) + 1 };
     let who = who_and_what(job, title_budget(width, fixed));
-    let line = join_parts(&[
-        style(&label).cyan().bold().to_string(),
-        style(&who).dim().to_string(),
-        style(&status).magenta().to_string(),
-    ]);
-    fit(&line, width)
+    let mut spans = lead;
+    spans.extend(join_spans(vec![
+        Span::from(label).cyan().bold(),
+        Span::from(who).dim(),
+        Span::from(status).magenta(),
+        Span::from(tool).dim(),
+    ]));
+    fit(Line::from(spans), width)
+}
+
+/// Seconds since the epoch, for the ages in a details block.
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long ago an event was, in the clock's own words, or nothing when the
+/// event did not say.
+fn age(at: Option<i64>, now: i64) -> String {
+    match at {
+        Some(at) => format!("{} ago", fmt_dur(now.saturating_sub(at).max(0) as u64)),
+        None => String::new(),
+    }
+}
+
+/// The lines an expanded row shows under itself: what is being followed, how
+/// much has happened, and the last few things the reviewer did, oldest
+/// first, each cut to the width.
+fn detail_lines(job: &Job, width: usize, now: i64) -> Vec<Line<'static>> {
+    let tail = &job.activity;
+    let mut lines = vec![detail_line(vec![Span::from(tail.source_label()).dim()], width)];
+    let counts = if tail.turns == 0 {
+        "waiting for the first turn".to_string()
+    } else {
+        format!("{} · {}", count(tail.turns as usize, "turn"), count(tail.tool_calls as usize, "tool call"))
+    };
+    lines.push(detail_line(vec![Span::from(counts).dim()], width));
+    let shown = tail.events.len().min(DETAIL_LINES - lines.len());
+    for event in tail.events.iter().skip(tail.events.len() - shown) {
+        let when = format!("{:>9}", age(event.at, now));
+        let name = event.tool.clone().unwrap_or_else(|| "said".to_string());
+        lines.push(detail_line(
+            vec![
+                Span::from(when).dim(),
+                Span::raw("  "),
+                Span::from(format!("{name:<6}")).cyan(),
+                Span::raw(" "),
+                Span::from(event.what.clone()),
+            ],
+            width,
+        ));
+    }
+    lines
+}
+
+fn detail_line(mut spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    spans.insert(0, Span::raw(DETAIL_INDENT));
+    fit(Line::from(spans), width)
 }
 
 /// The permanent line a finished review leaves on the board.
-fn finished_line(label: String, job: &Job, width: usize) -> String {
+fn finished_line(label: String, job: &Job, width: usize) -> Line<'static> {
     let (mark, headline) = match job.state {
         JobState::Done => {
             let word = match job.verdict.as_deref() {
-                Some("approved") => style("approved").green().bold().to_string(),
-                Some("changes requested") => style("changes requested").yellow().to_string(),
-                Some("commented") => style("commented").cyan().to_string(),
-                Some(other) => other.to_string(),
-                None => style("done").green().to_string(),
+                Some("approved") => Span::raw("approved").green().bold(),
+                Some("changes requested") => Span::raw("changes requested").yellow(),
+                Some("commented") => Span::raw("commented").cyan(),
+                Some(other) => Span::from(other.to_string()),
+                None => Span::raw("done").green(),
             };
-            (style("✓").green().bold().to_string(), word)
+            (Span::raw("✓").green().bold(), word)
         }
-        JobState::Timeout => (style("✗").yellow().bold().to_string(), style("timed out").yellow().to_string()),
+        JobState::Timeout => (Span::raw("✗").yellow().bold(), Span::raw("timed out").yellow()),
         _ => (
-            style("✗").red().bold().to_string(),
-            style(format!("failed ({})", job.outcome())).red().to_string(),
+            Span::raw("✗").red().bold(),
+            Span::from(format!("failed ({})", job.outcome())).red(),
         ),
     };
     let mut extras = Vec::new();
@@ -688,18 +826,49 @@ fn finished_line(label: String, job: &Job, width: usize) -> String {
     }
     let extras = format!("· {}", extras.join(" · "));
     // "  " + mark + the three joining spaces, plus the parts themselves.
-    let fixed = 2 + cols(&mark) + cols(&label) + cols(&headline) + cols(&extras) + 4;
+    let fixed = 2 + mark.width() + cols(&label) + headline.width() + cols(&extras) + 4;
     let who = who_and_what(job, title_budget(width, fixed));
-    let line = format!(
-        "  {mark} {}",
-        join_parts(&[
-            style(&label).cyan().bold().to_string(),
-            headline.to_string(),
-            style(&extras).dim().to_string(),
-            style(&who).dim().to_string(),
-        ])
-    );
-    fit(&line, width)
+    let mut spans = vec![Span::raw("  "), mark, Span::raw(" ")];
+    spans.extend(join_spans(vec![
+        Span::from(label).cyan().bold(),
+        headline,
+        Span::from(extras).dim(),
+        Span::from(who).dim(),
+    ]));
+    fit(Line::from(spans), width)
+}
+
+/// The footer's gauge: GAUGE_WIDTH columns, the done part solid, a tip on
+/// the boundary while the pass is unfinished, the rest a faint line.
+fn gauge(pos: usize, len: usize) -> Vec<Span<'static>> {
+    let full = (pos * GAUGE_WIDTH).checked_div(len).unwrap_or(GAUGE_WIDTH).min(GAUGE_WIDTH);
+    let tip = usize::from(full < GAUGE_WIDTH);
+    vec![
+        Span::from("━".repeat(full)).cyan(),
+        Span::from("╸".repeat(tip)).cyan(),
+        Span::from("─".repeat(GAUGE_WIDTH - full - tip)).fg(Ink::Indexed(238)),
+    ]
+}
+
+/// The line under the rows: the gauge, the counts, what the rows are doing
+/// in words, and at the right edge, when there is room, the keys.
+fn footer_line(pos: usize, len: usize, msg: &str, hint: &str, width: usize) -> Line<'static> {
+    let mut lead = vec![Span::raw("  ")];
+    lead.extend(gauge(pos, len));
+    lead.push(Span::raw(" "));
+    lead.push(Span::from(format!("{pos}/{len}")));
+    lead.push(Span::raw(" "));
+    let reserve: usize = lead.iter().map(Span::width).sum();
+    let msg = fit_str(msg, width.saturating_sub(reserve));
+    let used = reserve + cols(&msg);
+    let mut spans = lead;
+    spans.push(Span::from(msg).dim());
+    // Two columns of air at least, or the hint is not worth the space.
+    if let Some(gap) = width.checked_sub(used + cols(hint) + 2) {
+        spans.push(Span::raw(" ".repeat(gap + 2)));
+        spans.push(Span::from(hint.to_string()).dim());
+    }
+    fit(Line::from(spans), width)
 }
 
 /// A panic must not leave the terminal without its cursor.
@@ -743,8 +912,14 @@ pub fn align(rows: &[Vec<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::ASSUMED_WIDTH;
     use crate::job::Job;
     use crate::report::parse_trailer;
+
+    /// The text of a line, styles dropped: what the row says.
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
 
     #[test]
     fn durations_read_as_written() {
@@ -828,15 +1003,15 @@ mod tests {
         job.title = "t".into();
         job.reaped = true;
         job.elapsed_secs = 252;
-        let line = running_line("#9".into(), &job, ASSUMED_WIDTH);
+        let line = text(&running_line("#9".into(), &job, ASSUMED_WIDTH, "⠋"));
         assert!(line.contains("finishing"));
         assert!(line.contains("4m12s"));
         job.reaped = false;
-        assert!(running_line("#9".into(), &job, ASSUMED_WIDTH).contains("reviewing"));
+        assert!(text(&running_line("#9".into(), &job, ASSUMED_WIDTH, "⠋")).contains("reviewing"));
         // A resumed review says so: it is the difference between paying for a
         // first look and paying for a second one.
         job.resume = true;
-        assert!(running_line("#9".into(), &job, ASSUMED_WIDTH).contains("rechecking"));
+        assert!(text(&running_line("#9".into(), &job, ASSUMED_WIDTH, "⠋")).contains("rechecking"));
     }
 
     #[test]
@@ -860,9 +1035,10 @@ mod tests {
         assert_eq!(board_label(9), "#9");
         assert!(!board_label(9).contains('\x1b'));
         let job = Job::new(9);
-        for line in [running_line(board_label(9), &job, ASSUMED_WIDTH), finished_line(board_label(9), &job, ASSUMED_WIDTH)] {
-            assert!(line.contains("#9"), "the row still names the PR: {line:?}");
-            assert!(!line.contains("\x1b]8;;"), "no OSC 8 on the board: {line:?}");
+        for line in [running_line(board_label(9), &job, ASSUMED_WIDTH, "⠋"), finished_line(board_label(9), &job, ASSUMED_WIDTH)] {
+            let plain = text(&line);
+            assert!(plain.contains("#9"), "the row still names the PR: {plain:?}");
+            assert!(!plain.contains('\x1b'), "no escapes on the board: {plain:?}");
         }
     }
 
@@ -884,8 +1060,6 @@ mod tests {
 
     #[test]
     fn a_row_fits_the_width_it_is_given() {
-        // The width the row builders read is the test process's terminal, so
-        // this pins the arithmetic they use rather than the number they read.
         let mut job = Job::new(1234567);
         job.author = "domleboss97".into();
         job.title = "ENG-2304: add a protocol-neutral payment credential format".into();
@@ -893,64 +1067,172 @@ mod tests {
 
         // Widths are given, not read, so this pins the arithmetic at every
         // shape of terminal rather than at whichever one cargo test ran in --
-        // including the degenerate ones, where truncate_str would otherwise
-        // hand back a one-column ellipsis for a zero-column budget.
+        // including the degenerate ones, where a naive cut would hand back a
+        // one-column ellipsis for a zero-column budget.
         for width in [200, 120, 80, 60, 45, 30, 20, 6, 4, 1, 0] {
-            let run = running_line(board_label(job.pr), &job, width);
-            // A running row is drawn inside "  {spinner} ", which is not part
-            // of the string -- so the string gets what the template leaves.
-            // Below SPINNER_RESERVE the template alone is wider than the
-            // terminal, which is indicatif's floor and not something a row can
-            // fix; the row's job is to claim none of what is left.
-            assert!(
-                cols(&run) <= width.saturating_sub(SPINNER_RESERVE),
-                "running row at {width}: {} > {}",
-                cols(&run),
-                width.saturating_sub(SPINNER_RESERVE)
-            );
+            let run = running_line(board_label(job.pr), &job, width, "⠋");
+            assert!(run.width() <= width, "running row at {width}: {} > {width}", run.width());
             let fin = finished_line(board_label(job.pr), &job, width);
-            assert!(cols(&fin) <= width, "finished row at {width}: {} > {width}", cols(&fin));
+            assert!(fin.width() <= width, "finished row at {width}: {} > {width}", fin.width());
+            let foot = footer_line(1, 2, "1 running · 3 queued", "space details · q stop", width);
+            assert!(foot.width() <= width, "footer at {width}: {} > {width}", foot.width());
+            for line in detail_lines(&job, width, 0) {
+                assert!(line.width() <= width, "detail line at {width}: {} > {width}", line.width());
+            }
         }
         // Down to the width where the title stops fitting, the row keeps the
         // parts that say the review is alive.
-        let run = running_line(board_label(job.pr), &job, 45);
+        let run = text(&running_line(board_label(job.pr), &job, 45, "⠋"));
         assert!(run.contains("#1234567") && run.contains("rechecking"), "got {run:?}");
     }
 
-    #[test]
-    fn the_reserves_match_the_templates_they_pay_for() {
-        // Derived from the template text rather than restated, because the
-        // row test pays the reserve on both sides and so cannot notice a wrong
-        // value. A template edit that moves a space fails here instead of on
-        // somebody's terminal.
-        let lead = |t: &str, upto: &str| t.split(upto).next().unwrap().to_string();
-        let spinner = lead(SPINNER_TEMPLATE, "{msg}").replace("{spinner:.magenta}", "*");
-        assert_eq!(cols(&spinner), SPINNER_RESERVE);
+    fn busy_job() -> Job {
+        let mut job = Job::new(9);
+        job.author = "alice".into();
+        job.title = "Add retry logic".into();
+        job.activity = crate::activity::Tail::transcript_at("/nonexistent".into(), 0);
+        let line = |block: serde_json::Value| {
+            serde_json::json!({"type": "assistant", "timestamp": "2026-09-01T11:00:05.000Z", "message": {"content": [block]}}).to_string()
+        };
+        let mut text = String::new();
+        text.push_str(&line(serde_json::json!({"type": "text", "text": "Reading the diff."})));
+        text.push('\n');
+        text.push_str(&line(serde_json::json!({"type": "tool_use", "name": "Bash", "input": {"command": "cargo test --quiet"}})));
+        text.push('\n');
+        job.activity.feed(&text);
+        job
+    }
 
-        let before = lead(FOOTER_TEMPLATE, "{pos}/{len}").replace("{bar:24.cyan/238}", &"*".repeat(24));
-        let after = lead(FOOTER_TEMPLATE.split("{pos}/{len}").nth(1).unwrap(), "{msg}");
-        assert_eq!(cols(&before) + cols(&after), FOOTER_RESERVE);
+    #[test]
+    fn a_running_row_says_which_tool_it_is_in_when_there_is_room() {
+        let job = busy_job();
+        let wide = text(&running_line("#9".into(), &job, 120, "⠋"));
+        assert!(wide.ends_with("· Bash"), "got {wide:?}");
+        assert!(wide.contains("@alice Add retry logic"));
+        // The tool goes before the title would have to go, and the clock is
+        // never what pays for it.
+        let tight = text(&running_line("#9".into(), &job, 40, "⠋"));
+        assert!(!tight.contains("Bash"), "got {tight:?}");
+        assert!(tight.contains("reviewing"), "got {tight:?}");
+        // A review that just said something is not in a tool.
+        let mut job = job;
+        job.activity.feed(&format!(
+            "{}\n",
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Done."}]}})
+        ));
+        assert!(!text(&running_line("#9".into(), &job, 120, "⠋")).contains("Bash"));
+    }
+
+    #[test]
+    fn an_expanded_row_shows_what_the_review_is_doing() {
+        let job = busy_job();
+        let lines: Vec<String> = detail_lines(&job, 120, 1_788_260_417).iter().map(text).collect();
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with(DETAIL_INDENT), "indented under the row: {:?}", lines[0]);
+        assert!(lines[0].contains("waiting for its transcript"), "{:?}", lines[0]);
+        assert_eq!(lines[1].trim(), "2 turns · 1 tool call");
+        assert!(lines[2].contains("12s ago") && lines[2].contains("said") && lines[2].contains("Reading the diff."), "{:?}", lines[2]);
+        assert!(lines[3].contains("Bash") && lines[3].contains("cargo test --quiet"), "{:?}", lines[3]);
+        // Nothing followed yet: the block says so and stays short.
+        let idle = detail_lines(&Job::new(8), 120, 0);
+        let idle: Vec<String> = idle.iter().map(text).collect();
+        assert_eq!(idle.len(), 2, "{idle:?}");
+        assert!(idle[0].contains("not started") && idle[1].contains("waiting for the first turn"), "{idle:?}");
+        // The block never grows past its cap, whatever the tail holds.
+        let mut job = busy_job();
+        for i in 0..20 {
+            job.activity.feed(&format!(
+                "{}\n",
+                serde_json::json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": format!("f{i}.rs")}}]}})
+            ));
+        }
+        assert_eq!(detail_lines(&job, 120, 0).len(), DETAIL_LINES);
+    }
+
+    #[test]
+    fn the_footer_names_the_keys_when_there_is_room() {
+        let wide = text(&footer_line(0, 2, "2 running", "space details · q stop", 100));
+        assert!(wide.ends_with("space details · q stop"), "got {wide:?}");
+        assert_eq!(wide.len(), wide.trim_end().len(), "the hint sits at the right edge");
+        assert_eq!(console::measure_text_width(&wide), 100);
+        let narrow = text(&footer_line(0, 2, "2 running", "space details · q stop", 45));
+        assert!(!narrow.contains("space"), "got {narrow:?}");
+        assert!(narrow.contains("2 running"));
+    }
+
+    #[test]
+    fn keys_change_what_the_board_shows() {
+        let mut ui = self::ui(true, None);
+        ui.live = vec![9, 8];
+        ui.apply(Action::ToggleAll);
+        assert_eq!(ui.expanded.len(), 2);
+        ui.apply(Action::ToggleAll);
+        assert!(ui.expanded.is_empty());
+        ui.apply(Action::Toggle(2));
+        assert!(ui.expanded.contains(&8) && !ui.expanded.contains(&9));
+        ui.apply(Action::Toggle(2));
+        assert!(ui.expanded.is_empty());
+        // A digit past the last row names nothing, and zero is not a row.
+        ui.apply(Action::Toggle(3));
+        ui.apply(Action::Toggle(0));
+        assert!(ui.expanded.is_empty());
+        ui.apply(Action::Toggle(1));
+        ui.apply(Action::Collapse);
+        assert!(ui.expanded.is_empty());
+        ui.apply(Action::Stop);
+    }
+
+    #[test]
+    fn a_running_row_starts_with_the_spinner() {
+        // The row builder pays for its own lead. If the lead ever changed
+        // shape, the width arithmetic in running_line would be paying for the
+        // wrong thing, so the lead is pinned here.
+        let lead = spinner_lead("⠋");
+        assert_eq!(lead.iter().map(Span::width).sum::<usize>(), 4);
+        let mut job = Job::new(9);
+        job.title = "t".into();
+        assert!(text(&running_line("#9".into(), &job, ASSUMED_WIDTH, "⠋")).starts_with("  ⠋ #9"));
+    }
+
+    #[test]
+    fn the_gauge_is_always_the_same_width() {
+        for (pos, len) in [(0, 2), (1, 2), (2, 2), (0, 0), (3, 7)] {
+            let width: usize = gauge(pos, len).iter().map(Span::width).sum();
+            assert_eq!(width, GAUGE_WIDTH, "gauge at {pos}/{len}");
+        }
+        // A finished pass is a solid bar with no tip.
+        let full: String = gauge(2, 2).iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(full, "━".repeat(GAUGE_WIDTH));
+        let half: String = gauge(1, 2).iter().map(|s| s.content.as_ref()).collect();
+        assert!(half.starts_with("━━━━━━━━━━━━╸"), "got {half:?}");
     }
 
     #[test]
     fn a_row_with_no_room_for_a_title_leaves_no_gap() {
-        // Colour on, because that is the only condition under which the bug
-        // this pins exists: a styled empty title is eight bytes of SGR that
-        // draw nothing, and an is_empty filter keeps it plus its joining space.
-        // force_styling on the one value, never the process-wide flag: cargo
-        // test runs these in parallel threads, and a global flip would race.
-        let styled_empty = style("").dim().force_styling(true).to_string();
-        assert!(!styled_empty.is_empty() && cols(&styled_empty) == 0);
-        assert_eq!(join_parts(&["#9".into(), styled_empty, "· reviewing 3s".into()]), "#9 · reviewing 3s");
+        // An empty title is a span that draws nothing; it must take its
+        // joining space with it.
+        let joined = join_spans(vec![Span::raw("#9"), Span::raw("").dim(), Span::raw("· reviewing 3s")]);
+        let plain: String = joined.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(plain, "#9 · reviewing 3s");
     }
 
     #[test]
     fn fit_cuts_to_the_width_it_is_given() {
-        assert_eq!(fit("hello", 80), "hello");
-        assert_eq!(cols(&fit("hello world, this is long", 10)), 10);
-        // Colour is not width: a styled string is cut by what it draws.
-        let styled = style("hello world").green().to_string();
-        assert_eq!(cols(&fit(&styled, 5)), 5);
+        assert_eq!(fit(Line::from("hello"), 80).width(), 5);
+        let cut = fit(Line::from("hello world, this is long"), 10);
+        assert_eq!(cut.width(), 10);
+        assert!(text(&cut).ends_with('…'));
+        // Colour is not width: a styled line is cut by what it draws, and the
+        // cut keeps the style of the span it fell in.
+        let styled = Line::from(vec![Span::raw("hello ").green(), Span::raw("world").red()]);
+        let cut = fit(styled, 8);
+        assert_eq!(cut.width(), 8);
+        assert_eq!(text(&cut), "hello w…");
+        assert_eq!(cut.spans.len(), 2);
+        assert_eq!(cut.spans[1].style, Span::raw("").red().style);
+        // Nothing fits in nothing, and not an ellipsis either.
+        assert_eq!(fit(Line::from("hello"), 0).width(), 0);
+        assert_eq!(fit_str("hello", 0), "");
     }
 
     #[test]
@@ -985,12 +1267,21 @@ mod tests {
         assert_eq!(verdict_label(Some("approved")), "approved");
     }
 
-    fn linked_ui() -> Ui {
+    fn ui(tty: bool, pr_url_base: Option<&str>) -> Ui {
         Ui {
-            tty: true,
-            pr_url_base: Some("https://github.com/acme/widgets/pull".into()),
+            tty,
+            pr_url_base: pr_url_base.map(String::from),
             board: None,
+            frame: 0,
+            finished: 0,
+            total: 0,
+            expanded: HashSet::new(),
+            live: Vec::new(),
         }
+    }
+
+    fn linked_ui() -> Ui {
+        ui(true, Some("https://github.com/acme/widgets/pull"))
     }
 
     fn done_job(pr: u64) -> Job {
@@ -1008,7 +1299,7 @@ mod tests {
         );
         // Off the terminal there is nothing to click and escapes would only
         // break grep.
-        let plain = Ui { tty: false, pr_url_base: None, board: None };
+        let plain = self::ui(false, None);
         assert_eq!(plain.pr_label(9), "#9");
     }
 
@@ -1019,7 +1310,7 @@ mod tests {
         let out = linked_ui().results_table(&[done_job(9), done_job(123)]).to_string();
         let widths: Vec<usize> =
             out.lines().map(console::measure_text_width).collect();
-        let plain: Vec<usize> = Ui { tty: false, pr_url_base: None, board: None }
+        let plain: Vec<usize> = ui(false, None)
             .results_table(&[done_job(9), done_job(123)])
             .to_string()
             .lines()
@@ -1043,7 +1334,7 @@ mod tests {
             );
             j
         };
-        let out = Ui { tty: false, pr_url_base: None, board: None }
+        let out = ui(false, None)
             .panel_table(&[job])
             .unwrap()
             .to_string();

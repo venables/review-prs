@@ -178,8 +178,31 @@ reviewing 2 PRs · logs: /tmp/autoreview.k3Xq8p/run-Qszknc/pass-1
 Each row says who opened the PR, and whether this is a first look
 (`reviewing`) or a second one against the findings already in that session
 (`rechecking`) — both questions you would otherwise open the PR to answer.
-Every `#N` is an OSC 8 hyperlink, so a terminal that supports them opens the
-PR on cmd-click.
+
+The board redraws itself when the terminal is resized, in place: the rows
+refit to the new width, and the header and the reviews that already finished
+stay where they are. `q` (or ctrl-C) stops the pass, stops every running
+review, and prints the summary of what finished.
+
+A running row is not the whole story, so `space` (or `enter`) opens every
+running row: the session the review runs in, how many turns and tool calls
+it has made, and the last few things it did -- read from the transcript
+Claude Code writes as it works. `1` to `9` open one row by its position,
+`esc` closes them all. When the terminal is wide enough the row itself ends
+with the tool the review is in right now:
+
+```
+  ⠹ #8 @bob Fix flaky test · reviewing 1m47s · Bash
+      session fa5ced7b-32dd-578b-a3b9-d4d23195dce1
+      14 turns · 9 tool calls
+        40s ago  Read    pool.rs
+        12s ago  said    The retry path never re-arms the deadline.
+         3s ago  Bash    cargo test --quiet
+```
+
+Only the built-in reviewer in a session this run named has a transcript to
+follow. A session claude named itself is found when the review ends, and a
+command override has no transcript at all; its row follows its stderr.
 
 The header only mentions concurrency when it actually holds reviews back: with
 five PRs and `--jobs 2` it reads `reviewing 5 PRs, 2 at a time`.
@@ -788,6 +811,11 @@ paid for by the time it starts.
 bash tests/run.sh
 ```
 
+`AGENTS.md` holds the rules for working in this repo, for people and for
+coding agents alike (`CLAUDE.md` points at it). The design decisions behind
+the code, and what each one rules out, are one file each under
+[`docs/decisions/`](docs/decisions). A PR that decides something adds one.
+
 ### Layout
 
 One crate, one library, two binaries:
@@ -813,7 +841,8 @@ src/pool.rs        autoreview: the event-driven job pool
 src/job.rs         autoreview: one review, spawned and classified
 src/report.rs      autoreview: verdict readback and the agent's trailer
 src/rundir.rs      autoreview: what one run writes under --log-dir
-src/ui.rs          autoreview: the live board and the summary
+src/ui.rs          autoreview: what every board row and summary says
+src/board.rs       autoreview: the live area, an inline viewport in raw mode
 ```
 
 The two tools have to agree on what counts as an actionable PR and which
@@ -829,7 +858,12 @@ parsing, session goldens, ranking, CLI validation, argv and tab-command
 shapes), then runs the bash suites — the real binaries against fake `gh`,
 `gum`, `cmux` and `dash-p` on `PATH`, inside a throwaway git repo, with
 `$CLAUDE_CONFIG_DIR` pointed at a throwaway session store. They never touch
-your repos, your Claude Code sessions, or GitHub. It finishes with `bash -n`
+your repos, your Claude Code sessions, or GitHub. One file,
+`tests/board.test.sh`, runs autoreview on a pty rather than a pipe, through
+`tests/pty.py`: a driver that answers the board's cursor query, resizes the
+terminal mid-pass and presses keys. It is the only time the live board is
+drawn under test, and it needs `python3`; without one it says so and skips.
+It finishes with `bash -n`
 and `shellcheck` over the suite itself and over the scripts in `skills/`, which
 is all the bash in the repo.
 

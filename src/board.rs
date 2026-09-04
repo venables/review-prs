@@ -1,0 +1,305 @@
+//! The live area of a pass on a terminal: the rows that change, drawn in
+//! place, with the terminal in raw mode for as long as they are up.
+//!
+//! An inline viewport, not a full screen. Finished rows are inserted above
+//! the live area and scroll away like ordinary output; the live area is the
+//! last few rows and nothing else. On a resize ratatui asks the terminal
+//! where the cursor is, recomputes the area from that, and clears it -- which
+//! is the one thing a line-counting redraw cannot do, since the count it
+//! remembers was taken at a width the terminal no longer has.
+//!
+//! Events are read on the caller's thread, never on a reader thread of their
+//! own. crossterm's cursor query shares a lock with its event reader and
+//! waits at most two seconds for it; a thread parked in `read()` holds that
+//! lock, and the query is what re-anchors the viewport on every resize. A
+//! reader thread would break the path this module exists for.
+
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::{cursor, execute, terminal};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Rect, Size};
+use ratatui::text::Line;
+use ratatui::widgets::Widget;
+use ratatui::{Terminal, TerminalOptions, Viewport};
+use std::io::{self, Stdout};
+use std::sync::Once;
+use std::time::Duration;
+
+/// The width to assume when the terminal will not say. Matches what console
+/// falls back to, so the two never disagree.
+pub const ASSUMED_WIDTH: usize = 80;
+
+/// What a key asks the pass to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Stop the reviews and print the summary, as ctrl-C did before raw
+    /// mode turned it into a key.
+    Stop,
+    /// Show every running row's details, or hide them all if any are shown.
+    ToggleAll,
+    /// Show or hide one row's details, by its position on the board from 1.
+    Toggle(usize),
+    /// Hide every row's details.
+    Collapse,
+}
+
+/// The keys the board answers to. A pure function, so the table is testable
+/// without a terminal.
+pub fn key_to_action(key: KeyEvent) -> Option<Action> {
+    // Release and repeat events only arrive from terminals that report them;
+    // a key held down must not stop the pass twice.
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Action::Stop);
+    }
+    if !key.modifiers.is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('q') => Some(Action::Stop),
+        KeyCode::Char(' ') | KeyCode::Enter => Some(Action::ToggleAll),
+        KeyCode::Char(d @ '1'..='9') => Some(Action::Toggle(d as usize - '0' as usize)),
+        KeyCode::Esc => Some(Action::Collapse),
+        _ => None,
+    }
+}
+
+/// Put the terminal back the way a shell expects it. Safe to call when raw
+/// mode was never turned on: crossterm only restores a mode it saved.
+fn restore_terminal() {
+    let _ = terminal::disable_raw_mode();
+    let _ = execute!(io::stdout(), cursor::Show);
+}
+
+/// A panic while the board is up would print its message in raw mode, over
+/// the rows, and leave the shell without echo. The hook restores the terminal
+/// first and then lets the default hook say what happened. Installed once per
+/// process and left in place: it is harmless when no board is open.
+fn install_panic_hook() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            previous(info);
+        }));
+    });
+}
+
+fn open_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions { viewport: Viewport::Inline(height) },
+    )
+}
+
+pub struct Board {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+    height: u16,
+    /// The terminal as it was at the last draw. A change means the live area
+    /// has to be rebuilt before anything is drawn into it.
+    size: Size,
+}
+
+impl Board {
+    /// Take the terminal: raw mode on, cursor hidden, a viewport of `height`
+    /// rows anchored at the cursor. Ratatui scrolls the screen up if the
+    /// cursor is too close to the bottom for that many rows.
+    pub fn open(height: u16) -> io::Result<Board> {
+        install_panic_hook();
+        terminal::enable_raw_mode()?;
+        // Raw mode is on from here. Whatever fails next, the caller falls
+        // back to plain lines and never touches the terminal again, so this
+        // is the last chance to give it back.
+        let opened = execute!(io::stdout(), cursor::Hide)
+            .and_then(|()| open_terminal(height.max(1)))
+            .and_then(|t| {
+                let size = t.size()?;
+                Ok((t, size))
+            });
+        match opened {
+            Ok((terminal, size)) => Ok(Board { terminal, height: height.max(1), size }),
+            Err(e) => {
+                restore_terminal();
+                Err(e)
+            }
+        }
+    }
+
+    /// The terminal's width, or what to assume when it will not say.
+    pub fn width(&self) -> usize {
+        self.terminal.size().map_or(ASSUMED_WIDTH, |s| s.width as usize)
+    }
+
+    /// Put the live area back on the screen at `height` rows.
+    ///
+    /// The inline height is fixed when the viewport is made, so this is how
+    /// both a taller area and a resized terminal are handled: clear from the
+    /// live area's top row down, which is the live area and nothing else,
+    /// put the cursor back on that row, and open a new viewport there. What
+    /// is above that row is finished output and survives untouched.
+    ///
+    /// `shift` is how many rows the screen scrolled out from under us, which
+    /// is how many rows the terminal lost in height. A terminal that gets
+    /// shorter drops rows off the top and carries everything else up with
+    /// them, so the live area is no longer where it was last drawn, and
+    /// clearing from the old row would leave a copy of it stranded above.
+    fn rebuild(&mut self, height: u16, shift: u16) -> io::Result<()> {
+        let top = self.live_top(shift);
+        // Cleared from the row this works out for itself, not through
+        // ratatui, whose own idea of where the live area starts is the one
+        // the shift exists to correct.
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, top),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        )?;
+        self.terminal = open_terminal(height)?;
+        self.height = height;
+        self.size = self.terminal.size()?;
+        Ok(())
+    }
+
+    /// Which row the live area starts on now, which after a resize is not
+    /// the row it was drawn on.
+    ///
+    /// A terminal that rewraps its lines when it changes width moves
+    /// everything below the rewrapped ones. Widen a terminal and the header
+    /// above the board takes fewer rows, so the board rides up; narrow it
+    /// and the board rides down. Nothing announces that. What can be asked
+    /// is where the cursor is: it is parked on the area's first row after
+    /// every draw, and a terminal carries the cursor with its line through a
+    /// resize, which is what keeps a shell prompt under your hands.
+    ///
+    /// The lower of the two answers wins. `shift` -- the rows the terminal
+    /// lost in height -- is what a screen that only scrolled has moved by,
+    /// and a terminal that rewraps without moving the cursor would otherwise
+    /// have its old rows left behind, which is the one outcome worth paying
+    /// a clipped header line to avoid.
+    fn live_top(&mut self, shift: u16) -> u16 {
+        let believed = self.terminal.get_frame().area().y.saturating_sub(shift);
+        cursor::position().map_or(believed, |(_, row)| row.min(believed))
+    }
+
+    /// Grow the live area to `height` rows. It never shrinks: a row that
+    /// finishes leaves a blank row under the footer until the pass ends,
+    /// which costs nothing to look at, where rebuilding the viewport on every
+    /// finish would cost a cursor query and a clear each time.
+    pub fn ensure_height(&mut self, height: u16) -> io::Result<()> {
+        if height <= self.height {
+            return Ok(());
+        }
+        self.rebuild(height, 0)
+    }
+
+    /// A permanent line above the live area. It scrolls away with the rest
+    /// of the output, which is what a finished review's result line is for.
+    pub fn println(&mut self, line: Line<'static>) -> io::Result<()> {
+        self.terminal.insert_before(1, |buf| line.render(buf.area, buf))
+    }
+
+    /// Draw the live area: one line per row, top to bottom, the rest blank.
+    /// Ratatui diffs against the last frame, so a tick that changed one
+    /// spinner cell writes one spinner cell.
+    ///
+    /// A terminal that changed size is rebuilt here first, rather than left
+    /// to ratatui's own resize. Ratatui clears the whole screen whenever the
+    /// terminal gets narrower and starts the viewport again at the top row,
+    /// which takes the header, the finished reviews and everything else on
+    /// screen with it. Rebuilding first leaves ratatui nothing to notice.
+    pub fn draw(&mut self, lines: &[Line<'static>]) -> io::Result<()> {
+        let size = self.terminal.size()?;
+        if size != self.size {
+            // A shorter terminal takes rows off the top and carries the live
+            // area up with them; a narrower one leaves it where it was.
+            let shift = self.size.height.saturating_sub(size.height);
+            // Never ask for more rows than the terminal has left.
+            let height = self.height.min(size.height.max(1));
+            self.rebuild(height, shift)?;
+        }
+        self.terminal.draw(|frame| {
+            let area = frame.area();
+            for (i, line) in lines.iter().enumerate().take(area.height as usize) {
+                let row = Rect { x: area.x, y: area.y + i as u16, width: area.width, height: 1 };
+                frame.render_widget(line, row);
+            }
+        })?;
+        // Park the cursor on the live area's first row, so that whatever the
+        // terminal does to its lines next, `live_top` can ask where they
+        // went. It is hidden, so it shows nothing wherever it rests.
+        let top = self.terminal.get_frame().area().y;
+        execute!(io::stdout(), cursor::MoveTo(0, top))?;
+        Ok(())
+    }
+
+    /// Every key and resize that arrived since the last call. Read here, on
+    /// the caller's thread, for the reason in the module comment.
+    pub fn events(&self) -> Vec<Event> {
+        let mut out = Vec::new();
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            match event::read() {
+                Ok(e) => out.push(e),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// Give the terminal back, with the cursor on the row the live area
+    /// started on, so whatever prints next lands where the board was.
+    pub fn close(self) {
+        drop(self);
+    }
+}
+
+/// Every path out restores the terminal: `close`, a `?` that drops the `Ui`
+/// holding this, and the interrupt path that tears the board down before it
+/// prints. A panic is the panic hook's job.
+impl Drop for Board {
+    fn drop(&mut self) {
+        let top = self.terminal.get_frame().area().y;
+        let _ = self.terminal.clear();
+        let _ = execute!(io::stdout(), cursor::MoveTo(0, top));
+        restore_terminal();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn the_keys_that_stop_a_pass() {
+        assert_eq!(key_to_action(press(KeyCode::Char('c'), KeyModifiers::CONTROL)), Some(Action::Stop));
+        assert_eq!(key_to_action(press(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Stop));
+        // A plain c is not an interrupt, and a shifted q is not a quit.
+        assert_eq!(key_to_action(press(KeyCode::Char('c'), KeyModifiers::NONE)), None);
+        assert_eq!(key_to_action(press(KeyCode::Char('q'), KeyModifiers::SHIFT)), None);
+    }
+
+    #[test]
+    fn the_keys_that_show_details() {
+        assert_eq!(key_to_action(press(KeyCode::Char(' '), KeyModifiers::NONE)), Some(Action::ToggleAll));
+        assert_eq!(key_to_action(press(KeyCode::Enter, KeyModifiers::NONE)), Some(Action::ToggleAll));
+        assert_eq!(key_to_action(press(KeyCode::Char('1'), KeyModifiers::NONE)), Some(Action::Toggle(1)));
+        assert_eq!(key_to_action(press(KeyCode::Char('9'), KeyModifiers::NONE)), Some(Action::Toggle(9)));
+        assert_eq!(key_to_action(press(KeyCode::Char('0'), KeyModifiers::NONE)), None);
+        assert_eq!(key_to_action(press(KeyCode::Esc, KeyModifiers::NONE)), Some(Action::Collapse));
+        // A modifier on a letter is some other binding, not this one.
+        assert_eq!(key_to_action(press(KeyCode::Char(' '), KeyModifiers::ALT)), None);
+        assert_eq!(key_to_action(press(KeyCode::Char('x'), KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn a_key_release_does_nothing() {
+        let mut release = press(KeyCode::Char('q'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(key_to_action(release), None);
+    }
+}
